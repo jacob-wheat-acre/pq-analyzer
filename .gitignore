@@ -1,0 +1,28 @@
+# Generated output — contains site-specific data
+pq_output/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+import_error.log
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Virtual environments
+venv/
+.venv/
+env/

@@ -1,0 +1,15 @@
+# pq_analyzer.py requirements
+# Install with: pip install -r pq_analyzer_requirements.txt
+
+pandas>=1.5
+numpy>=1.22
+matplotlib>=3.5
+python-docx>=0.8.11
+Pillow>=9.0
+
+# Optional: general PQDIF library for non-Pronto .pqd files
+# pqdifpy
+
+# Optional but recommended:
+# rapidfuzz       # faster fuzzy channel-name matching (pip install rapidfuzz)
+# scipy           # future: statistical analysis extensions
