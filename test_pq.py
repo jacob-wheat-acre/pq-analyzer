@@ -176,43 +176,6 @@ class TestTDDClass:
         assert _tdd_class(1500.0) == "≥ 1000"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Neutral harmonic block formula
-#    H_n = 415 + (n-1)  →  verified against the named constants on ProntoAdapter
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestNeutralHarmonicBlock:
-    """The In AAC block starts at channel 415; formula is H_n = 415 + (n-1)."""
-
-    _BLOCK_START = 415
-
-    def _expected(self, order: int) -> int:
-        return self._BLOCK_START + (order - 1)
-
-    def test_h3(self):
-        assert ProntoAdapter._V2_CH_H3_IN_AAC == self._expected(3)   # 417
-
-    def test_h5(self):
-        assert ProntoAdapter._V2_CH_H5_IN_AAC == self._expected(5)   # 419
-
-    def test_h7(self):
-        assert ProntoAdapter._V2_CH_H7_IN_AAC == self._expected(7)   # 421
-
-    def test_h9(self):
-        assert ProntoAdapter._V2_CH_H9_IN_AAC == self._expected(9)   # 423
-
-    def test_h11(self):
-        assert ProntoAdapter._V2_CH_H11_IN_AAC == self._expected(11) # 425
-
-    def test_h13(self):
-        assert ProntoAdapter._V2_CH_H13_IN_AAC == self._expected(13) # 427
-
-    def test_spacing_is_2(self):
-        """Consecutive even-index entries separate odd harmonic orders by 2."""
-        assert ProntoAdapter._V2_CH_H5_IN_AAC - ProntoAdapter._V2_CH_H3_IN_AAC == 2
-        assert ProntoAdapter._V2_CH_H7_IN_AAC - ProntoAdapter._V2_CH_H5_IN_AAC == 2
-        assert ProntoAdapter._V2_CH_H13_IN_AAC - ProntoAdapter._V2_CH_H11_IN_AAC == 2
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. ChannelMapper — tag-based resolution

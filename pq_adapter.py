@@ -495,110 +495,24 @@ class ProntoAdapter:
     _O0_IC_BLOCK  = 313  # Ic fundamental (A)
 
     # ── new-format (v2): 30+ obs records, pointer-chain channel structure ─────
-    # Internal structure of the "Interval (avg)" obs record:
-    #   3-phase:    label 46 chars → channel count at byte 220, entry table at 224
-    #   split-phase: label 36 chars → channel count at byte 208, entry table at 212
-    #   entry+20: u32 absolute offset of channel block start in obs body
+    # Channels are discovered by reading DataSource labels and mapping them through
+    # the ChannelInstances table in the Interval (avg) obs body.
+    # entry+20: u32 absolute offset of channel block start in obs body
     # Each channel block:
     #   +_V2_TS_REL:  u32 count + count×f64 timestamps (dedup every other)
     #   +data_rel:    u32 count + count×f64 measurements (dedup every other)
     #   data_rel = _V2_TS_REL + 4 + ts_count_raw×8 + 32  (computed dynamically)
-    _V2_ENTRY_START   = 224   # 3-phase: first channel entry byte in interval obs body
-    _V2_ENTRY_SIZE    = 28    # bytes per channel entry
-    _V2_BODY_OFF_REL  = 20    # offset within entry of abs channel-block u32
-    _V2_TS_REL        = 180   # rel to channel block: timestamp count+data
+    _V2_ENTRY_SIZE   = 28    # bytes per channel entry in the ChannelInstances table
+    _V2_BODY_OFF_REL = 20    # offset within each entry of the abs channel-block pointer
+    _V2_TS_REL       = 180   # offset from channel block start to timestamp count+data
 
-    # v2 3-phase channel indices in the "Interval (avg)" obs record
-    # (identified by value-signature analysis on Pronto 7-day export)
-    _V2_CH_W       =   3   # real power (W)
-    _V2_CH_VAR     =   4   # reactive power (VAR)
-    _V2_CH_VA      =   5   # apparent power (VA)
-    _V2_CH_PF      =   6   # power factor
-    _V2_CH_FREQ    =   7   # frequency (Hz)
-    _V2_CH_IA      =  13   # Ia RMS (A)
-    _V2_CH_THDIA   =  14   # THD Ia (%)
-    _V2_CH_IB      =  23   # Ib RMS (A)
-    _V2_CH_THDIB   =  24   # THD Ib (%)
-    _V2_CH_IC      =  33   # Ic RMS (A)
-    _V2_CH_THDIC   =  34   # THD Ic (%)
-    _V2_CH_VAN     =  58   # Van RMS (V)
-    _V2_CH_THDVAN  =  59   # THD Van (%)
-    _V2_CH_IN      = 109   # In RMS (A)
-    _V2_CH_THDIN   = 110   # THD In (%)
-    _V2_CH_VBN     = 160   # Vbn RMS (V)
-    _V2_CH_THDVBN  = 161   # THD Vbn (%)
-    _V2_CH_VCN     = 262   # Vcn RMS (V)
-    _V2_CH_THDVCN  = 263   # THD Vcn (%)
-    # v2 individual harmonic channels — stored as % of fundamental; multiply by I_phase/100 → Amps
-    _V2_CH_H3_IA   =  15   # H3 Ia (% of fundamental)
-    _V2_CH_H5_IA   =  16
-    _V2_CH_H7_IA   =  17
-    _V2_CH_H3_IB   =  25
-    _V2_CH_H5_IB   =  26
-    _V2_CH_H7_IB   =  27
-    _V2_CH_H3_IC   =  35
-    _V2_CH_H5_IC   =  36
-    _V2_CH_H7_IC   =  37
-    # v2 individual harmonic Aac block — H9/H11/H13 for each phase current (absolute Amps).
-    # Layout: 8 blocks of 51 entries starting at entry 58. Entry index = block_start + (H_order - 1).
-    # Ia block starts at entry 109 (C=116); Ib at 211 (C=218); Ic at 313 (C=320).
-    # Even-order entries (H2, H4, H8…) store fixed nominal constants (near-zero for 3-phase loads).
-    # Confirmed: H3_Ia at entry 111 = 3.2 A (r_ia +0.74, ratio ÷H3 = 1.00 ✓).
-    _V2_CH_H9_IA_AAC  = 117   # H9 Ia  in Aac (A) — median 0.5 A (~0.8 % of Ia_RMS)
-    _V2_CH_H11_IA_AAC = 119   # H11 Ia in Aac (A) — median 0.6 A (~1.0 %)
-    _V2_CH_H13_IA_AAC = 121   # H13 Ia in Aac (A) — median 0.5 A (~0.8 %)
-    _V2_CH_H9_IB_AAC  = 219   # H9 Ib  in Aac (A) — median 0.6 A
-    _V2_CH_H11_IB_AAC = 221   # H11 Ib in Aac (A) — median 0.7 A
-    _V2_CH_H13_IB_AAC = 223   # H13 Ib in Aac (A) — median 0.5 A
-    _V2_CH_H9_IC_AAC  = 321   # H9 Ic  in Aac (A) — median 0.1 A
-    _V2_CH_H11_IC_AAC = 323   # H11 Ic in Aac (A) — median 0.5 A
-    _V2_CH_H13_IC_AAC = 325   # H13 Ic in Aac (A) — median 0.6 A
-    # H15/H17/H19/H23/H25 — Aac block extension; formula H_n = block_start + (n-1)
-    _V2_CH_H15_IA_AAC = 123   # H15 Ia (A)
-    _V2_CH_H17_IA_AAC = 125   # H17 Ia (A)
-    _V2_CH_H19_IA_AAC = 127   # H19 Ia (A)
-    _V2_CH_H23_IA_AAC = 131   # H23 Ia (A)
-    _V2_CH_H25_IA_AAC = 133   # H25 Ia (A)
-    _V2_CH_H15_IB_AAC = 225
-    _V2_CH_H17_IB_AAC = 227
-    _V2_CH_H19_IB_AAC = 229
-    _V2_CH_H23_IB_AAC = 233
-    _V2_CH_H25_IB_AAC = 235
-    _V2_CH_H15_IC_AAC = 327
-    _V2_CH_H17_IC_AAC = 329
-    _V2_CH_H19_IC_AAC = 331
-    _V2_CH_H23_IC_AAC = 335
-    _V2_CH_H25_IC_AAC = 337
-    # Per-order voltage harmonics — absolute Volts from Aac block; H_n = block_start + (n-1)
-    # Van block: start=58 → H3=60, H5=62, H7=64, H11=68, H13=70
-    _V2_CH_H3_VAN_AAC  =  60
-    _V2_CH_H5_VAN_AAC  =  62
-    _V2_CH_H7_VAN_AAC  =  64
-    _V2_CH_H11_VAN_AAC =  68
-    _V2_CH_H13_VAN_AAC =  70
-    # Vbn block: start=160
-    _V2_CH_H3_VBN_AAC  = 162
-    _V2_CH_H5_VBN_AAC  = 164
-    _V2_CH_H7_VBN_AAC  = 166
-    _V2_CH_H11_VBN_AAC = 170
-    _V2_CH_H13_VBN_AAC = 172
-    # Vcn block: start=262
-    _V2_CH_H3_VCN_AAC  = 264
-    _V2_CH_H5_VCN_AAC  = 266
-    _V2_CH_H7_VCN_AAC  = 268
-    _V2_CH_H11_VCN_AAC = 272
-    _V2_CH_H13_VCN_AAC = 274
-    _V2_CH_KFACTOR =   2   # transformer K-factor (measured, includes all harmonic orders)
-    _V2_CH_PST_VAN =   0   # Flicker PST Van (short-term severity, dimensionless)
-    _V2_CH_PLT_VAN =   1   # Flicker PLT Van (long-term severity, dimensionless)
-    # Neutral current harmonic block (In) — Block 8; start=415; H_n = 415 + (n-1)
-    # Zero-sequence triplens (H3, H9) add arithmetically from all 3 phases in neutral
-    _V2_CH_H3_IN_AAC  = 417
-    _V2_CH_H5_IN_AAC  = 419
-    _V2_CH_H7_IN_AAC  = 421
-    _V2_CH_H9_IN_AAC  = 423
-    _V2_CH_H11_IN_AAC = 425
-    _V2_CH_H13_IN_AAC = 427
+    # ── PQDIF element tag GUIDs (first 4 bytes, little-endian) ───────────────
+    # Used by _pqdif_elements / _build_label_map for DataSource label discovery.
+    _TAG_DATASOURCE  = 0x89738619   # DataSource record type
+    _ELEM_CHAN_DEFS  = 0xB48D858D   # ChannelDefinitions collection in DataSource
+    _ELEM_CHAN_LABEL = 0xB48D8590   # channel label string in each ChannelDefinition
+    _ELEM_CHAN_INSTS = 0x3D786F91   # ChannelInstances collection in obs body
+    _ELEM_DS_IDX     = 0xB48D858F   # DS channel index (inline u32) in ChannelInstance
 
     # v2 "Variable Adaptive" obs record — 29-channel layout confirmed from Pronto viewer.
     # Entry table order follows VIEWER GROUP ORDER (not C-number order):
@@ -643,22 +557,6 @@ class ProntoAdapter:
     _ADAP_CH_THD_IC  = 27   # THD Ic in absolute Aac
     # entry 28: unknown (~192 A, n=19346; possibly Ia+Ib+Ic vector sum or peak)
 
-    # v2 split-phase (120/240 V single-phase) channel indices
-    # (identified by value-signature and correlation analysis on Pronto single-phase export)
-    _V2_SP_ENTRY_START = 212  # entry table start for 36-char obs label
-    _V2_SP_CH_W        =   0  # real power (W)
-    _V2_SP_CH_PF       =   3  # power factor
-    _V2_SP_CH_FREQ     =   4  # frequency (Hz)
-    _V2_SP_CH_THDIA    =   5  # THD Ia (%)
-    _V2_SP_CH_THDIB    =  15  # THD Ib (%)
-    _V2_SP_CH_VAN      =  42  # Van RMS (V) — L1-N
-    _V2_SP_CH_THDVAN   =  43  # THD Van (%)
-    _V2_SP_CH_IA       =  93  # Ia fundamental RMS (A) — L1 current
-    _V2_SP_CH_VBN      = 144  # Vbn RMS (V) — L2-N
-    _V2_SP_CH_THDVBN   = 145  # THD Vbn (%)
-    _V2_SP_CH_IB       = 195  # Ib fundamental RMS (A) — L2 current
-    _V2_SP_CH_IN       = 297  # In neutral current RMS (A)
-
     def __init__(self, filepath):
         self.filepath = Path(filepath)
         self._raw_channels: List[RawChannelInfo] = []
@@ -695,7 +593,7 @@ class ProntoAdapter:
             # Covers both the original v2 format (30+ obs) and the newer Pronto-to-PQDIF
             # export format (~26 obs records).  The old proprietary format has exactly 3
             # obs records, so >= 4 safely routes all export-format files here.
-            self._load_v2(obs_recs)
+            self._load_v2(obs_recs, recs)
             return
 
         if len(obs_recs) < 2:
@@ -797,8 +695,103 @@ class ProntoAdapter:
         )
         return n, ts
 
-    def _load_v2(self, obs_recs: List[Dict]) -> None:
-        """Load new Pronto format: 30+ obs records with pointer-chain channel structure."""
+    @staticmethod
+    def _pqdif_elements(body: bytes, col_off: int) -> List[Dict]:
+        """Parse a PQDIF element-list: [u32 count][count × 28-byte elements].
+        Each element: 16-byte GUID (first 4 bytes used as key), 4-byte type,
+        4-byte offset, 4-byte size. Zero-size scalars store value inline in offset."""
+        if col_off + 4 > len(body):
+            return []
+        count = struct.unpack_from('<I', body, col_off)[0]
+        if count > 100_000:
+            return []
+        out: List[Dict] = []
+        for i in range(count):
+            base = col_off + 4 + i * 28
+            if base + 28 > len(body):
+                break
+            out.append({
+                'guid4': struct.unpack_from('<I', body, base)[0],
+                'type':  struct.unpack_from('<I', body, base + 16)[0],
+                'off':   struct.unpack_from('<I', body, base + 20)[0],
+                'sz':    struct.unpack_from('<I', body, base + 24)[0],
+            })
+        return out
+
+    def _build_label_map(self, all_recs: List[Dict], obs_body: bytes) -> Dict[str, int]:
+        """Build {label → obs_ci} from DataSource channel names and ChannelInstances.
+        Labels decoded with latin-1 to preserve all byte values (CP1253 phi=0xF8)."""
+        ds_body: Optional[bytes] = None
+        for r in all_recs:
+            if r['tag'] == 0x89738619:
+                try:
+                    ds_body = zlib.decompress(r['raw'])
+                except zlib.error:
+                    ds_body = r['raw']
+                break
+        if ds_body is None:
+            return {}
+
+        ds_top = self._pqdif_elements(ds_body, 0)
+        cd_off: Optional[int] = None
+        for e in ds_top:
+            if e['guid4'] == 0xB48D858D:
+                cd_off = e['off']
+                break
+        if cd_off is None:
+            return {}
+
+        ds_label: Dict[int, str] = {}
+        for ds_ci, e in enumerate(self._pqdif_elements(ds_body, cd_off)):
+            if e['type'] != 1:
+                continue
+            for s in self._pqdif_elements(ds_body, e['off']):
+                if s['guid4'] == 0xB48D8590 and s['sz'] > 4:
+                    raw = ds_body[s['off'] + 4 : s['off'] + s['sz']]
+                    lbl = raw.rstrip(b'\x00').decode('latin-1').strip()
+                    if lbl:
+                        ds_label[ds_ci] = lbl
+                    break
+
+        obs_top = self._pqdif_elements(obs_body, 0)
+        ci_off: Optional[int] = None
+        for e in obs_top:
+            if e['guid4'] == 0x3D786F91:
+                ci_off = e['off']
+                break
+        if ci_off is None:
+            return {}
+
+        label_map: Dict[str, int] = {}
+        for obs_ci, e in enumerate(self._pqdif_elements(obs_body, ci_off)):
+            if e['type'] != 1:
+                continue
+            for s in self._pqdif_elements(obs_body, e['off']):
+                if s['guid4'] == 0xB48D858F:
+                    ds_ci = s['off']   # DS channel index stored inline in offset field
+                    lbl = ds_label.get(ds_ci)
+                    if lbl:
+                        label_map[lbl] = obs_ci
+                    break
+
+        return label_map
+
+    def _load_v2(self, obs_recs: List[Dict], all_recs: List[Dict]) -> None:
+        """Load new Pronto format using DataSource label-based channel discovery.
+
+        Channel layout is derived by reading the DataSource record (which contains
+        516 named channel definitions) and mapping each ChannelInstance in the
+        Interval (avg) obs body to its DataSource label.  This replaces the old
+        approach of hardcoded positional indices (which were firmware-specific).
+
+        Key findings from binary analysis of Pronto PQDIF files:
+          - Power labels use CP1253 encoding: the phi character (φ) is byte 0xF8,
+            decoded here with latin-1 as '\\xf8'.
+          - 'THD Ia (I1)' / 'Hrms Ia' DS labels have swapped meanings in the
+            Pronto exporter firmware; THD is computed here from the harmonic block.
+          - 'Harm 1 of Ia' (obs_ci=109 on Watkins) is the I1 fundamental in Amps,
+            consistent with measured apparent power (VA/3/Vln).
+        """
         interval_body: Optional[bytes] = None
         for rec in obs_recs:
             try:
@@ -818,11 +811,6 @@ class ProntoAdapter:
         base_date = self._parse_v2_date(obs_recs)
 
         # ── Dynamic entry_start: read label_length from bytes 144-147 ────────
-        # The obs body packs: [144-147] label_length (u32, incl. null),
-        # [148..148+label_length] label string, padded to 4-byte boundary,
-        # then a 28-byte fixed header block, then the channel entry table.
-        # Different meter firmware / topology produce different label lengths,
-        # so this must be computed from the file rather than hardcoded.
         label_length = struct.unpack_from('<I', interval_body, 144)[0]
         if not (1 <= label_length <= 512):
             raise ValueError(
@@ -831,12 +819,7 @@ class ProntoAdapter:
             )
         entry_start = 148 + ((label_length + 3) & ~3) + 28
 
-        # Topology: split-phase services have shorter obs labels than 3-phase.
-        # Known values on Watkins-format meters: split-phase=36, 3-phase=46.
-        is_split_phase = label_length < 44
-
-        # ── Dynamic DATA_REL: derived from timestamp block size ───────────────
-        # data_rel = TS_REL + 4 (count field) + ts_count_raw × 8 (data) + 32 (gap)
+        # ── Dynamic DATA_REL ────────────────────────────────────────────────
         pos0 = entry_start + self._V2_BODY_OFF_REL
         if pos0 + 4 > len(interval_body):
             raise ValueError(
@@ -868,7 +851,7 @@ class ProntoAdapter:
             vals = raw[0::2]
             return vals[np.isfinite(vals)]
 
-        # Timestamps from channel 0
+        # ── Timestamps from channel 0 ───────────────────────────────────────
         ts_raw = np.frombuffer(
             interval_body[ts_abs + 4 : ts_abs + 4 + ts_count_raw * 8], dtype='<f8'
         )
@@ -886,203 +869,99 @@ class ProntoAdapter:
                 return np.pad(arr, (0, n - len(arr)), constant_values=np.nan)
             return arr[:n]
 
-        if is_split_phase:
-            ch_defs = [
-                (0,  'Van RMS',        'voltage',           'rms',         'an',      'V'  ),
-                (1,  'Vbn RMS',        'voltage',           'rms',         'bn',      'V'  ),
-                (2,  'Ia RMS',         'current',           'rms',         'an',      'A'  ),
-                (3,  'Ib RMS',         'current',           'rms',         'bn',      'A'  ),
-                (4,  'In RMS',         'current',           'rms',         'neutral', 'A'  ),
-                (5,  'Real Power',     'watts',             'watts',       'total',   'W'  ),
-                (6,  'Power Factor',   'powerfactor',       'powerfactor', 'total',   ''   ),
-                (7,  'THD Ia',         'currentharmonics',  'thd',         'an',      '%'  ),
-                (8,  'THD Ib',         'currentharmonics',  'thd',         'bn',      '%'  ),
-                (9,  'THD Van',        'voltageharmonics',  'thd',         'an',      '%'  ),
-                (10, 'THD Vbn',        'voltageharmonics',  'thd',         'bn',      '%'  ),
-            ]
-            arrays = [
-                pad(read_v2(self._V2_SP_CH_VAN)),
-                pad(read_v2(self._V2_SP_CH_VBN)),
-                pad(read_v2(self._V2_SP_CH_IA)),
-                pad(read_v2(self._V2_SP_CH_IB)),
-                pad(read_v2(self._V2_SP_CH_IN)),
-                pad(read_v2(self._V2_SP_CH_W)),
-                pad(read_v2(self._V2_SP_CH_PF)),
-                pad(read_v2(self._V2_SP_CH_THDIA)),
-                pad(read_v2(self._V2_SP_CH_THDIB)),
-                pad(read_v2(self._V2_SP_CH_THDVAN)),
-                pad(read_v2(self._V2_SP_CH_THDVBN)),
-            ]
-        else:
-            ch_defs = [
-                (0,  'Van RMS',        'voltage',           'rms',         'an',      'V'  ),
-                (1,  'Vbn RMS',        'voltage',           'rms',         'bn',      'V'  ),
-                (2,  'Vcn RMS',        'voltage',           'rms',         'cn',      'V'  ),
-                (3,  'Ia RMS',         'current',           'rms',         'an',      'A'  ),
-                (4,  'Ib RMS',         'current',           'rms',         'bn',      'A'  ),
-                (5,  'Ic RMS',         'current',           'rms',         'cn',      'A'  ),
-                (6,  'Real Power',     'watts',             'watts',       'total',   'W'  ),
-                (7,  'Reactive Power', 'power',             'reactive',    'total',   'VAR'),
-                (8,  'Power Factor',   'powerfactor',       'powerfactor', 'total',   ''   ),
-                (9,  'THD Ia',         'currentharmonics',  'thd',         'an',      '%'  ),
-                (10, 'In RMS',         'current',           'rms',         'neutral', 'A'  ),
-                (11, 'THD Ib',         'currentharmonics',  'thd',         'bn',      '%'  ),
-                (12, 'THD Ic',         'currentharmonics',  'thd',         'cn',      '%'  ),
-                (13, 'THD Van',        'voltageharmonics',  'thd',         'an',      '%'  ),
-                (14, 'THD Vbn',        'voltageharmonics',  'thd',         'bn',      '%'  ),
-                (15, 'THD Vcn',        'voltageharmonics',  'thd',         'cn',      '%'  ),
-                # Individual harmonic currents H3/H5/H7 — meter stores % of fundamental;
-                # converted to Amps here so check_individual_harmonics() works unchanged.
-                (16, 'H3 Current A',   'currentharmonics',  'h3',          'an',      'A'  ),
-                (17, 'H5 Current A',   'currentharmonics',  'h5',          'an',      'A'  ),
-                (18, 'H7 Current A',   'currentharmonics',  'h7',          'an',      'A'  ),
-                (19, 'H3 Current B',   'currentharmonics',  'h3',          'bn',      'A'  ),
-                (20, 'H5 Current B',   'currentharmonics',  'h5',          'bn',      'A'  ),
-                (21, 'H7 Current B',   'currentharmonics',  'h7',          'bn',      'A'  ),
-                (22, 'H3 Current C',   'currentharmonics',  'h3',          'cn',      'A'  ),
-                (23, 'H5 Current C',   'currentharmonics',  'h5',          'cn',      'A'  ),
-                (24, 'H7 Current C',   'currentharmonics',  'h7',          'cn',      'A'  ),
-                # H9/H11/H13 individual harmonics — read directly from Aac block (already in Amps)
-                (28, 'H9 Current A',   'currentharmonics',  'h9',          'an',      'A'  ),
-                (29, 'H11 Current A',  'currentharmonics',  'h11',         'an',      'A'  ),
-                (30, 'H13 Current A',  'currentharmonics',  'h13',         'an',      'A'  ),
-                (31, 'H9 Current B',   'currentharmonics',  'h9',          'bn',      'A'  ),
-                (32, 'H11 Current B',  'currentharmonics',  'h11',         'bn',      'A'  ),
-                (33, 'H13 Current B',  'currentharmonics',  'h13',         'bn',      'A'  ),
-                (34, 'H9 Current C',   'currentharmonics',  'h9',          'cn',      'A'  ),
-                (35, 'H11 Current C',  'currentharmonics',  'h11',         'cn',      'A'  ),
-                (36, 'H13 Current C',  'currentharmonics',  'h13',         'cn',      'A'  ),
-                # H15/H17/H19/H23/H25 — higher-order current harmonics from Aac block (Amps)
-                (37, 'H15 Current A',  'currentharmonics',  'h15',         'an',      'A'  ),
-                (38, 'H17 Current A',  'currentharmonics',  'h17',         'an',      'A'  ),
-                (39, 'H19 Current A',  'currentharmonics',  'h19',         'an',      'A'  ),
-                (40, 'H23 Current A',  'currentharmonics',  'h23',         'an',      'A'  ),
-                (41, 'H25 Current A',  'currentharmonics',  'h25',         'an',      'A'  ),
-                (42, 'H15 Current B',  'currentharmonics',  'h15',         'bn',      'A'  ),
-                (43, 'H17 Current B',  'currentharmonics',  'h17',         'bn',      'A'  ),
-                (44, 'H19 Current B',  'currentharmonics',  'h19',         'bn',      'A'  ),
-                (45, 'H23 Current B',  'currentharmonics',  'h23',         'bn',      'A'  ),
-                (46, 'H25 Current B',  'currentharmonics',  'h25',         'bn',      'A'  ),
-                (47, 'H15 Current C',  'currentharmonics',  'h15',         'cn',      'A'  ),
-                (48, 'H17 Current C',  'currentharmonics',  'h17',         'cn',      'A'  ),
-                (49, 'H19 Current C',  'currentharmonics',  'h19',         'cn',      'A'  ),
-                (50, 'H23 Current C',  'currentharmonics',  'h23',         'cn',      'A'  ),
-                (51, 'H25 Current C',  'currentharmonics',  'h25',         'cn',      'A'  ),
-                # Per-order voltage harmonics — absolute Volts from Aac block
-                (52, 'H3 Voltage A',   'voltageharmonics',  'h3',          'an',      'V'  ),
-                (53, 'H5 Voltage A',   'voltageharmonics',  'h5',          'an',      'V'  ),
-                (54, 'H7 Voltage A',   'voltageharmonics',  'h7',          'an',      'V'  ),
-                (55, 'H11 Voltage A',  'voltageharmonics',  'h11',         'an',      'V'  ),
-                (56, 'H13 Voltage A',  'voltageharmonics',  'h13',         'an',      'V'  ),
-                (57, 'H3 Voltage B',   'voltageharmonics',  'h3',          'bn',      'V'  ),
-                (58, 'H5 Voltage B',   'voltageharmonics',  'h5',          'bn',      'V'  ),
-                (59, 'H7 Voltage B',   'voltageharmonics',  'h7',          'bn',      'V'  ),
-                (60, 'H11 Voltage B',  'voltageharmonics',  'h11',         'bn',      'V'  ),
-                (61, 'H13 Voltage B',  'voltageharmonics',  'h13',         'bn',      'V'  ),
-                (62, 'H3 Voltage C',   'voltageharmonics',  'h3',          'cn',      'V'  ),
-                (63, 'H5 Voltage C',   'voltageharmonics',  'h5',          'cn',      'V'  ),
-                (64, 'H7 Voltage C',   'voltageharmonics',  'h7',          'cn',      'V'  ),
-                (65, 'H11 Voltage C',  'voltageharmonics',  'h11',         'cn',      'V'  ),
-                (66, 'H13 Voltage C',  'voltageharmonics',  'h13',         'cn',      'V'  ),
-                # Meter-measured K-factor and IEC flicker
-                (25, 'K-Factor',       'kfactor',           'kfactor',     'total',   ''   ),
-                (26, 'Flicker PST',    'flicker',           'pst',         'an',      ''   ),
-                (27, 'Flicker PLT',    'flicker',           'plt',         'an',      ''   ),
-                # Neutral current harmonics — In block (start=415); triplens diagnose SMPS/VFD loads
-                (67, 'H3 Current N',   'currentharmonics',  'h3',          'neutral', 'A'  ),
-                (68, 'H5 Current N',   'currentharmonics',  'h5',          'neutral', 'A'  ),
-                (69, 'H7 Current N',   'currentharmonics',  'h7',          'neutral', 'A'  ),
-                (70, 'H9 Current N',   'currentharmonics',  'h9',          'neutral', 'A'  ),
-                (71, 'H11 Current N',  'currentharmonics',  'h11',         'neutral', 'A'  ),
-                (72, 'H13 Current N',  'currentharmonics',  'h13',         'neutral', 'A'  ),
-            ]
-            ia_arr = pad(read_v2(self._V2_CH_IA))
-            ib_arr = pad(read_v2(self._V2_CH_IB))
-            ic_arr = pad(read_v2(self._V2_CH_IC))
+        # ── Label-based channel discovery ───────────────────────────────────
+        label_map = self._build_label_map(all_recs, interval_body)
+        if len(label_map) < 5:
+            log.warning(
+                "ProntoAdapter v2: label map has only %d entries — "
+                "DataSource record may be missing or unreadable.",
+                len(label_map),
+            )
 
-            def _harm_amps(h_pct_ci, i_rms_arr):
-                h_pct = pad(read_v2(h_pct_ci))
-                return h_pct / 100.0 * i_rms_arr
+        # Split-phase detection: no 'Harm 1 of Vcn' → no C phase
+        is_split_phase = 'Harm 1 of Vcn' not in label_map
 
-            arrays = [
-                pad(read_v2(self._V2_CH_VAN)),
-                pad(read_v2(self._V2_CH_VBN)),
-                pad(read_v2(self._V2_CH_VCN)),
-                ia_arr,
-                ib_arr,
-                ic_arr,
-                pad(read_v2(self._V2_CH_W)),
-                pad(read_v2(self._V2_CH_VAR)),
-                pad(read_v2(self._V2_CH_PF)),
-                pad(read_v2(self._V2_CH_THDIA)),
-                pad(read_v2(self._V2_CH_IN)),
-                pad(read_v2(self._V2_CH_THDIB)),
-                pad(read_v2(self._V2_CH_THDIC)),
-                pad(read_v2(self._V2_CH_THDVAN)),
-                pad(read_v2(self._V2_CH_THDVBN)),
-                pad(read_v2(self._V2_CH_THDVCN)),
-                _harm_amps(self._V2_CH_H3_IA, ia_arr),
-                _harm_amps(self._V2_CH_H5_IA, ia_arr),
-                _harm_amps(self._V2_CH_H7_IA, ia_arr),
-                _harm_amps(self._V2_CH_H3_IB, ib_arr),
-                _harm_amps(self._V2_CH_H5_IB, ib_arr),
-                _harm_amps(self._V2_CH_H7_IB, ib_arr),
-                _harm_amps(self._V2_CH_H3_IC, ic_arr),
-                _harm_amps(self._V2_CH_H5_IC, ic_arr),
-                _harm_amps(self._V2_CH_H7_IC, ic_arr),
-                # H9/H11/H13 — read directly from Aac block (already in Amps)
-                pad(read_v2(self._V2_CH_H9_IA_AAC)),
-                pad(read_v2(self._V2_CH_H11_IA_AAC)),
-                pad(read_v2(self._V2_CH_H13_IA_AAC)),
-                pad(read_v2(self._V2_CH_H9_IB_AAC)),
-                pad(read_v2(self._V2_CH_H11_IB_AAC)),
-                pad(read_v2(self._V2_CH_H13_IB_AAC)),
-                pad(read_v2(self._V2_CH_H9_IC_AAC)),
-                pad(read_v2(self._V2_CH_H11_IC_AAC)),
-                pad(read_v2(self._V2_CH_H13_IC_AAC)),
-                # H15/H17/H19/H23/H25 — higher-order current harmonics
-                pad(read_v2(self._V2_CH_H15_IA_AAC)),
-                pad(read_v2(self._V2_CH_H17_IA_AAC)),
-                pad(read_v2(self._V2_CH_H19_IA_AAC)),
-                pad(read_v2(self._V2_CH_H23_IA_AAC)),
-                pad(read_v2(self._V2_CH_H25_IA_AAC)),
-                pad(read_v2(self._V2_CH_H15_IB_AAC)),
-                pad(read_v2(self._V2_CH_H17_IB_AAC)),
-                pad(read_v2(self._V2_CH_H19_IB_AAC)),
-                pad(read_v2(self._V2_CH_H23_IB_AAC)),
-                pad(read_v2(self._V2_CH_H25_IB_AAC)),
-                pad(read_v2(self._V2_CH_H15_IC_AAC)),
-                pad(read_v2(self._V2_CH_H17_IC_AAC)),
-                pad(read_v2(self._V2_CH_H19_IC_AAC)),
-                pad(read_v2(self._V2_CH_H23_IC_AAC)),
-                pad(read_v2(self._V2_CH_H25_IC_AAC)),
-                # Per-order voltage harmonics — absolute Volts from Aac block
-                pad(read_v2(self._V2_CH_H3_VAN_AAC)),
-                pad(read_v2(self._V2_CH_H5_VAN_AAC)),
-                pad(read_v2(self._V2_CH_H7_VAN_AAC)),
-                pad(read_v2(self._V2_CH_H11_VAN_AAC)),
-                pad(read_v2(self._V2_CH_H13_VAN_AAC)),
-                pad(read_v2(self._V2_CH_H3_VBN_AAC)),
-                pad(read_v2(self._V2_CH_H5_VBN_AAC)),
-                pad(read_v2(self._V2_CH_H7_VBN_AAC)),
-                pad(read_v2(self._V2_CH_H11_VBN_AAC)),
-                pad(read_v2(self._V2_CH_H13_VBN_AAC)),
-                pad(read_v2(self._V2_CH_H3_VCN_AAC)),
-                pad(read_v2(self._V2_CH_H5_VCN_AAC)),
-                pad(read_v2(self._V2_CH_H7_VCN_AAC)),
-                pad(read_v2(self._V2_CH_H11_VCN_AAC)),
-                pad(read_v2(self._V2_CH_H13_VCN_AAC)),
-                pad(read_v2(self._V2_CH_KFACTOR)),
-                pad(read_v2(self._V2_CH_PST_VAN)),
-                pad(read_v2(self._V2_CH_PLT_VAN)),
-                # Neutral current harmonics — In block
-                pad(read_v2(self._V2_CH_H3_IN_AAC)),
-                pad(read_v2(self._V2_CH_H5_IN_AAC)),
-                pad(read_v2(self._V2_CH_H7_IN_AAC)),
-                pad(read_v2(self._V2_CH_H9_IN_AAC)),
-                pad(read_v2(self._V2_CH_H11_IN_AAC)),
-                pad(read_v2(self._V2_CH_H13_IN_AAC)),
-            ]
+        # ── Build channel list from label map ───────────────────────────────
+        ch_defs: List[Tuple] = []
+        arrays:  List[np.ndarray] = []
+        local_idx = 0
+
+        def add(human: str, qt: str, qm: str, phase: str,
+                unit: str, arr: np.ndarray) -> None:
+            nonlocal local_idx
+            ch_defs.append((local_idx, human, qt, qm, phase, unit))
+            arrays.append(arr)
+            local_idx += 1
+
+        def rv(ci: Optional[int]) -> np.ndarray:
+            return pad(read_v2(ci)) if ci is not None else np.full(n, np.nan)
+
+        # Direct single-label → channel mappings.
+        # Power labels: Pronto firmware stores the phi symbol as CP1253 byte 0xF8;
+        # we decode all DS labels with latin-1 so 0xF8 → '\xf8' in both label and pattern.
+        _DIRECT: List[Tuple[str, str, str, str, str, str]] = [
+            ('Harm 1 of Van',         'Van RMS',      'voltage',          'rms',         'an',      'V'  ),
+            ('Harm 1 of Vbn',         'Vbn RMS',      'voltage',          'rms',         'bn',      'V'  ),
+            ('Harm 1 of Vcn',         'Vcn RMS',      'voltage',          'rms',         'cn',      'V'  ),
+            ('Harm 1 of Vne',         'Vne RMS',      'voltage',          'rms',         'neutral', 'V'  ),
+            ('Harm 1 of Ia',          'Ia RMS',       'current',          'rms',         'an',      'A'  ),
+            ('Harm 1 of Ib',          'Ib RMS',       'current',          'rms',         'bn',      'A'  ),
+            ('Harm 1 of Ic',          'Ic RMS',       'current',          'rms',         'cn',      'A'  ),
+            ('Harm 1 of In',          'In RMS',       'current',          'rms',         'neutral', 'A'  ),
+            ('3\xf8 4w Real Power',   'Real Power',   'watts',            'watts',       'total',   'W'  ),
+            ('3\xf8 4w VA Reactive',  'React. Power', 'power',            'reactive',    'total',   'VAR'),
+            ('3\xf8 4w Power Factor', 'Power Factor', 'powerfactor',      'powerfactor', 'total',   ''   ),
+            ('THD Van (V1)',           'THD Van',      'voltageharmonics', 'thd',         'an',      '%'  ),
+            ('THD Vbn (V2)',           'THD Vbn',      'voltageharmonics', 'thd',         'bn',      '%'  ),
+            ('THD Vcn (V3)',           'THD Vcn',      'voltageharmonics', 'thd',         'cn',      '%'  ),
+            ('K-Factor Ia',           'K-Factor',     'kfactor',          'kfactor',     'total',   ''   ),
+            ('Flicker PST Van (V1)',   'Flicker PST',  'flicker',          'pst',         'an',      ''   ),
+            ('Flicker PLT Van (V1)',   'Flicker PLT',  'flicker',          'plt',         'an',      ''   ),
+        ]
+        for ds_lbl, human, qt, qm, phase, unit in _DIRECT:
+            ci = label_map.get(ds_lbl)
+            if ci is not None:
+                add(human, qt, qm, phase, unit, rv(ci))
+
+        # Per-order harmonic channels — load all available orders H2-H50,
+        # cache for THD computation, then add standard reporting orders to output.
+        _HARM_BLOCKS: List[Tuple[str, str, str, str, Tuple[int, ...]]] = [
+            ('Van', 'voltageharmonics', 'an',      'V', (3, 5, 7, 11, 13)  ),
+            ('Vbn', 'voltageharmonics', 'bn',      'V', (3, 5, 7, 11, 13)  ),
+            ('Vcn', 'voltageharmonics', 'cn',      'V', (3, 5, 7, 11, 13)  ),
+            ('Ia',  'currentharmonics', 'an',      'A', _H519_ORDERS        ),
+            ('Ib',  'currentharmonics', 'bn',      'A', _H519_ORDERS        ),
+            ('Ic',  'currentharmonics', 'cn',      'A', _H519_ORDERS        ),
+            ('In',  'currentharmonics', 'neutral', 'A', (3, 5, 7, 9, 11, 13)),
+        ]
+        _harm: Dict[Tuple[str, int], np.ndarray] = {}
+
+        for ph_key, qt, phase, unit, report_orders in _HARM_BLOCKS:
+            for h in range(2, 51):
+                ci = label_map.get(f'Harm {h} of {ph_key}')
+                if ci is not None:
+                    _harm[(ph_key, h)] = rv(ci)
+            for h in report_orders:
+                arr = _harm.get((ph_key, h))
+                if arr is not None:
+                    add(f'H{h} {ph_key}', qt, f'h{h}', phase, unit, arr)
+
+        # Computed THD for current: sqrt(ΣHn²) / H1 × 100 %.
+        # The Pronto DS label 'THD Ia (I1)' actually stores a total-current aggregate
+        # (not THD%) due to a firmware label error; compute from the harmonic block.
+        for ph_key, phase in (('Ia', 'an'), ('Ib', 'bn'), ('Ic', 'cn')):
+            h1_ci = label_map.get(f'Harm 1 of {ph_key}')
+            if h1_ci is None:
+                continue
+            h1 = rv(h1_ci)
+            harm_sq = [_harm[(ph_key, h)] ** 2
+                       for h in range(2, 51) if (ph_key, h) in _harm]
+            if not harm_sq:
+                continue
+            h1_safe = np.where(h1 > 0.01, h1, np.nan)
+            thd_arr = np.sqrt(sum(harm_sq)) / h1_safe * 100.0
+            _THD_LABELS = {'an': 'THD Ia', 'bn': 'THD Ib', 'cn': 'THD Ic', 'neutral': 'THD In'}
+            add(_THD_LABELS[phase], 'currentharmonics', 'thd', phase, '%', thd_arr)
 
         self._raw_channels = [
             RawChannelInfo(idx, label, qt, qm, phase, unit)
@@ -1091,9 +970,9 @@ class ProntoAdapter:
         self._obs_data = {cd[0]: arr for cd, arr in zip(ch_defs, arrays)}
 
         dt_min = round(float(np.median(np.diff(ts_secs))) / 60) if n >= 2 else 5
-        topo = "split-phase" if is_split_phase else "3-phase"
+        topo = 'split-phase' if is_split_phase else '3-phase'
         log.info(
-            "ProntoAdapter v2 (%s): loaded %d channels, %d %d-min intervals (%s → %s)",
+            "ProntoAdapter v2 (%s, label-map): %d channels, %d %d-min intervals (%s → %s)",
             topo, len(self._raw_channels), n, dt_min,
             pd.Timestamp(self._obs_ts[0]).strftime('%Y-%m-%d %H:%M') if n else '–',
             pd.Timestamp(self._obs_ts[-1]).strftime('%Y-%m-%d %H:%M') if n else '–',
