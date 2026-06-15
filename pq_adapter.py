@@ -817,20 +817,41 @@ class ProntoAdapter:
 
         base_date = self._parse_v2_date(obs_recs)
 
-        # ── Detect topology from obs label length ─────────────────────────────
-        # 3-phase obs labels are 46 chars; split-phase labels are 36 chars.
-        # The label length determines where the channel entry table starts.
-        idx = 148
-        while idx < 220 and 0x20 <= interval_body[idx] < 0x7F:
-            idx += 1
-        is_split_phase = (idx - 148) < 44
-        entry_start = self._V2_SP_ENTRY_START if is_split_phase else self._V2_ENTRY_START
+        # ── Dynamic entry_start: read label_length from bytes 144-147 ────────
+        # The obs body packs: [144-147] label_length (u32, incl. null),
+        # [148..148+label_length] label string, padded to 4-byte boundary,
+        # then a 28-byte fixed header block, then the channel entry table.
+        # Different meter firmware / topology produce different label lengths,
+        # so this must be computed from the file rather than hardcoded.
+        label_length = struct.unpack_from('<I', interval_body, 144)[0]
+        if not (1 <= label_length <= 512):
+            raise ValueError(
+                f"ProntoAdapter v2: unexpected label_length {label_length} in "
+                "'Interval (avg)' obs body — unsupported Pronto PQDIF format."
+            )
+        entry_start = 148 + ((label_length + 3) & ~3) + 28
+
+        # Topology: split-phase services have shorter obs labels than 3-phase.
+        # Known values on Watkins-format meters: split-phase=36, 3-phase=46.
+        is_split_phase = label_length < 44
 
         # ── Dynamic DATA_REL: derived from timestamp block size ───────────────
         # data_rel = TS_REL + 4 (count field) + ts_count_raw × 8 (data) + 32 (gap)
         pos0 = entry_start + self._V2_BODY_OFF_REL
+        if pos0 + 4 > len(interval_body):
+            raise ValueError(
+                f"ProntoAdapter v2: entry_start={entry_start} + body_off="
+                f"{self._V2_BODY_OFF_REL} exceeds body length {len(interval_body)}."
+            )
         ch0_abs = struct.unpack_from('<I', interval_body, pos0)[0]
         ts_abs = ch0_abs + self._V2_TS_REL
+        if ts_abs + 4 > len(interval_body):
+            raise ValueError(
+                f"ProntoAdapter v2: ch0 pointer {ch0_abs} + TS_REL {self._V2_TS_REL} "
+                f"= {ts_abs} exceeds body length {len(interval_body)}. "
+                f"label_length={label_length}, entry_start={entry_start}. "
+                "File may use an unsupported Pronto firmware version."
+            )
         ts_count_raw = struct.unpack_from('<I', interval_body, ts_abs)[0]
         data_rel = self._V2_TS_REL + 4 + ts_count_raw * 8 + 32
 
