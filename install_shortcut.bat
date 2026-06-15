@@ -9,13 +9,7 @@ set "BAT_FILE=%TOOL_DIR%PQ Analyzer.bat"
 set "SHORTCUT=%USERPROFILE%\Desktop\PQ Analyzer.lnk"
 
 :: Use PowerShell to create a proper .lnk shortcut
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ws = New-Object -ComObject WScript.Shell; ^
-   $sc = $ws.CreateShortcut('%SHORTCUT%'); ^
-   $sc.TargetPath = '%BAT_FILE%'; ^
-   $sc.WorkingDirectory = '%TOOL_DIR%'; ^
-   $sc.Description = 'PQ Analyzer — Power Quality Analysis Tool'; ^
-   $sc.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('%SHORTCUT%'); $sc.TargetPath = '%BAT_FILE%'; $sc.WorkingDirectory = '%TOOL_DIR%'; $sc.Description = 'PQ Analyzer - Power Quality Analysis Tool'; $sc.Save()"
 
 if exist "%SHORTCUT%" (
     echo.
