@@ -61,6 +61,7 @@ from pq_plots import (
     plot_thd,
     plot_summary,
     plot_harmonic_spectrum,
+    plot_itic,
 )
 
 logging.basicConfig(
@@ -266,6 +267,7 @@ def main():
         plot_thd(df, thd_result, thresh, outdir=outdir)
         plot_summary(df, imb_result, outdir=outdir)
         plot_harmonic_spectrum(df, thresh, outdir=outdir)
+        plot_itic(event_result["events"], thresh, outdir=outdir)
         log.info("All plots saved to %s/", outdir)
 
     # ── Word report ───────────────────────────────────────────────────────────

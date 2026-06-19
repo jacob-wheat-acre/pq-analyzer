@@ -1001,6 +1001,29 @@ class PQApp(tk.Tk):
                   "https://webstore.ansi.org/search#q=C84.1&t=All")
         txt.insert("end", "\n\n")
 
+        txt.insert("end", "  ITI (CBEMA) Curve Application Note — Voltage Tolerance Envelope\n", "h2")
+        txt.insert("end",
+                   "  Published by the Information Technology Industry Council (ITIC), 2000.\n"
+                   "  Defines the voltage tolerance envelope that information technology\n"
+                   "  equipment must be able to ride through without disruption:\n"
+                   "\n"
+                   "    Duration < 20 ms    Any voltage (interruption acceptable)\n"
+                   "    20 ms – 500 ms      ≥ 70 % of nominal\n"
+                   "    500 ms – 10 s       ≥ 80 % of nominal\n"
+                   "    > 10 s (steady)     ≥ 90 % of nominal  (aligns with ANSI C84.1 Range A)\n"
+                   "\n"
+                   "    Overvoltage limits: 110 % steady · 120 % up to 500 ms ·\n"
+                   "                        140 % up to 20 ms · 200 % up to 3 ms · 500 % spikes\n"
+                   "\n"
+                   "  Superseded the CBEMA curve, which was originally referenced in\n"
+                   "  ANSI/IEEE 446-1987 (Emergency and Standby Power Systems).\n"
+                   "  IEEE 1159-2019 references the ITIC curve as the standard voltage\n"
+                   "  tolerance boundary for power quality event classification.\n"
+                   "  Applicable to 120 V nominal (120/208 V and 120/240 V, 60 Hz systems).\n", "body")
+        txt.insert("end", "  Curve document at ", "note")
+        _add_link("itic.org ↗", "https://www.itic.org/technical-activities/tech-committees/power-quality")
+        txt.insert("end", "\n\n")
+
         # ── PSCo Tariff Reference ──────────────────────────────────────────
         section("PSCo Electric Tariff — PQ Requirements")
 

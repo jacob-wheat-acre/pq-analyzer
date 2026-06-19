@@ -63,54 +63,71 @@ CANONICAL = [
 ]
 
 # ── PQDIF tag dictionaries ────────────────────────────────────────────────────
-# PQDIF encodes channel identity with three structured tags:
-#   quantity_type     : what physical quantity is measured (Voltage, Current …)
-#   quantity_measured : how it is measured (RMS, Average, THD …)
-#   phase             : which conductor (AN, BN, CN, TOTAL …)
+# PQDIF encodes channel identity with three fields (gemstone naming in parens):
 #
-# These are more reliable than device-assigned text labels.
-# The values below are the string representations pqdifpy exposes; your version
-# may use different casing or an enum — see _normalise_tag() below.
+#   quantity_type  (QuantityMeasured, uint32)
+#       The physical quantity: Voltage, Current, Power … pqdifpy exposes this
+#       on the ChannelDefinition as cd.quantity_type (attribute name varies by
+#       library).  In the gemstone model this is QuantityMeasuredIDTag.
+#
+#   quantity_measured  (QuantityCharacteristic, GUID)
+#       How the quantity is represented: RMS, THD, Peak, FlkrPST …  Lives on
+#       the SeriesDefinition (sd.quantity_measured in pqdifpy).  gemstone calls
+#       this QuantityCharacteristicIDTag.  Not to be confused with gemstone's
+#       QuantityTypeIDTag (WaveForm / ValueLog / Phasor …) which describes the
+#       data shape and is NOT used for channel identity matching here.
+#
+#   phase  (Phase, uint32 enum)
+#       Which conductor: AN=1, BN=2, CN=3, NG=4, Net=9, Total=13 …  pqdifpy
+#       returns the enum name lowercased, e.g. "an", "ng", "total".
+#
+# The sets below list every normalised string we accept for each field.
+# See _normalise_tag() for how raw enums / GUIDs are converted to strings.
 
 _TAG_MAP: Dict[str, Dict[str, Set[str]]] = {
-    #  canonical        quantity_type          quantity_measured    phase
+    #  canonical        quantity_type (QuantityMeasured)    quantity_measured (QuantityCharacteristic)    phase
     "voltage_a":      {"qt": {"voltage"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"an", "a", "phase_a"}},
     "voltage_b":      {"qt": {"voltage"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"bn", "b", "phase_b"}},
     "voltage_c":      {"qt": {"voltage"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"cn", "c", "phase_c"}},
     "current_a":      {"qt": {"current"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"an", "a", "phase_a"}},
     "current_b":      {"qt": {"current"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"bn", "b", "phase_b"}},
     "current_c":      {"qt": {"current"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"cn", "c", "phase_c"}},
-    "power_real":     {"qt": {"power", "watts"}, "qm": {"real", "watts", "active", "p"}, "ph": {"total", "three_phase", "net", "aggregate", ""}},
-    "power_reactive": {"qt": {"power"},          "qm": {"reactive", "var", "q"},          "ph": {"total", "three_phase", "net", "aggregate", ""}},
-    "power_factor":   {"qt": {"power", "powerfactor"}, "qm": {"powerfactor", "pf", "factor"}, "ph": {"total", "three_phase", "net", "aggregate", ""}},
-    "thd_voltage_a":  {"qt": {"voltage", "voltageharmonics", "harmonics"}, "qm": {"thd", "totalharmdist", "thdpercent"}, "ph": {"an", "a", "phase_a"}},
-    "thd_voltage_b":  {"qt": {"voltage", "voltageharmonics", "harmonics"}, "qm": {"thd", "totalharmdist", "thdpercent"}, "ph": {"bn", "b", "phase_b"}},
-    "thd_voltage_c":  {"qt": {"voltage", "voltageharmonics", "harmonics"}, "qm": {"thd", "totalharmdist", "thdpercent"}, "ph": {"cn", "c", "phase_c"}},
-    "thd_current_a":  {"qt": {"current", "currentharmonics", "harmonics"}, "qm": {"thd", "totalharmdist", "thdpercent"}, "ph": {"an", "a", "phase_a"}},
-    "thd_current_b":  {"qt": {"current", "currentharmonics", "harmonics"}, "qm": {"thd", "totalharmdist", "thdpercent"}, "ph": {"bn", "b", "phase_b"}},
-    "thd_current_c":  {"qt": {"current", "currentharmonics", "harmonics"}, "qm": {"thd", "totalharmdist", "thdpercent"}, "ph": {"cn", "c", "phase_c"}},
-    "current_neutral":{"qt": {"current"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"neutral", "n", "in", "i4", "phase_n"}},
-    # Individual harmonic currents — one entry per order × phase
-    **{f"h{h}_current_a": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}"}, "ph": {"an","a","phase_a"}}
+    # Phase.Total=13, Phase.Net=9, Phase.Residual=8; "three_phase"/"aggregate" are not PQDIF enum values
+    "power_real":     {"qt": {"power", "watts"}, "qm": {"real", "watts", "active", "p"}, "ph": {"total", "net", "residual", ""}},
+    "power_reactive": {"qt": {"power"},          "qm": {"reactive", "var", "q"},          "ph": {"total", "net", "residual", ""}},
+    "power_factor":   {"qt": {"power", "powerfactor"}, "qm": {"powerfactor", "pf", "factor"}, "ph": {"total", "net", "residual", ""}},
+    # THD: TotalTHD = % of fundamental; TotalTHDRMS = % of total RMS — both accepted
+    "thd_voltage_a":  {"qt": {"voltage", "voltageharmonics", "harmonics"}, "qm": {"thd", "totalthd", "totalthdrms", "totalharmdist", "thdpercent"}, "ph": {"an", "a", "phase_a"}},
+    "thd_voltage_b":  {"qt": {"voltage", "voltageharmonics", "harmonics"}, "qm": {"thd", "totalthd", "totalthdrms", "totalharmdist", "thdpercent"}, "ph": {"bn", "b", "phase_b"}},
+    "thd_voltage_c":  {"qt": {"voltage", "voltageharmonics", "harmonics"}, "qm": {"thd", "totalthd", "totalthdrms", "totalharmdist", "thdpercent"}, "ph": {"cn", "c", "phase_c"}},
+    "thd_current_a":  {"qt": {"current", "currentharmonics", "harmonics"}, "qm": {"thd", "totalthd", "totalthdrms", "totalharmdist", "thdpercent"}, "ph": {"an", "a", "phase_a"}},
+    "thd_current_b":  {"qt": {"current", "currentharmonics", "harmonics"}, "qm": {"thd", "totalthd", "totalthdrms", "totalharmdist", "thdpercent"}, "ph": {"bn", "b", "phase_b"}},
+    "thd_current_c":  {"qt": {"current", "currentharmonics", "harmonics"}, "qm": {"thd", "totalthd", "totalthdrms", "totalharmdist", "thdpercent"}, "ph": {"cn", "c", "phase_c"}},
+    # Phase.NG=4 (neutral-to-ground); "neutral" retained for ProntoAdapter internal strings
+    "current_neutral":{"qt": {"current"},       "qm": {"rms", "average", "rmsvalue"},  "ph": {"ng", "neutral", "n", "in", "i4", "phase_n"}},
+    # Individual harmonic currents — one entry per order × phase.
+    # Note: standard PQDIF files use QuantityCharacteristic.Spectra with SeriesNominalQuantity
+    # for the harmonic order; the h{n}/harmonic{n} strings below match Pronto label-derived channels.
+    **{f"h{h}_current_a": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"an","a","phase_a"}}
        for h in _H519_ORDERS},
-    **{f"h{h}_current_b": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}"}, "ph": {"bn","b","phase_b"}}
+    **{f"h{h}_current_b": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"bn","b","phase_b"}}
        for h in _H519_ORDERS},
-    **{f"h{h}_current_c": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}"}, "ph": {"cn","c","phase_c"}}
+    **{f"h{h}_current_c": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"cn","c","phase_c"}}
        for h in _H519_ORDERS},
-    **{f"h{h}_current_neutral": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}"}, "ph": {"neutral","n","in","i4","phase_n"}}
+    **{f"h{h}_current_neutral": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"ng","neutral","n","in","i4","phase_n"}}
        for h in (3, 5, 7, 9, 11, 13)},
     # Individual harmonic voltages
-    **{f"h{h}_voltage_a": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}"}, "ph": {"an","a","phase_a"}}
+    **{f"h{h}_voltage_a": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"an","a","phase_a"}}
        for h in (3, 5, 7, 11, 13)},
-    **{f"h{h}_voltage_b": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}"}, "ph": {"bn","b","phase_b"}}
+    **{f"h{h}_voltage_b": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"bn","b","phase_b"}}
        for h in (3, 5, 7, 11, 13)},
-    **{f"h{h}_voltage_c": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}"}, "ph": {"cn","c","phase_c"}}
+    **{f"h{h}_voltage_c": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"cn","c","phase_c"}}
        for h in (3, 5, 7, 11, 13)},
-    # Transformer K-factor (measured by meter, includes all harmonic orders)
-    "kfactor_meter": {"qt": {"kfactor"}, "qm": {"kfactor"},   "ph": {"total", "net", "aggregate", ""}},
-    # Flicker severity indices
-    "flicker_pst":   {"qt": {"flicker"}, "qm": {"pst"},       "ph": {"an", "a", "phase_a"}},
-    "flicker_plt":   {"qt": {"flicker"}, "qm": {"plt"},       "ph": {"an", "a", "phase_a"}},
+    # Transformer K-factor
+    "kfactor_meter": {"qt": {"kfactor"}, "qm": {"kfactor"},        "ph": {"total", "net", "residual", ""}},
+    # Flicker: FlkrPST / FlkrPLT are QuantityCharacteristic GUIDs → normalised to "flkrpst"/"flkrplt"
+    "flicker_pst":   {"qt": {"flicker", "voltage"}, "qm": {"pst", "flkrpst"}, "ph": {"an", "a", "phase_a", "total", "net", ""}},
+    "flicker_plt":   {"qt": {"flicker", "voltage"}, "qm": {"plt", "flkrplt"}, "ph": {"an", "a", "phase_a", "total", "net", ""}},
 }
 
 # ── Fuzzy name patterns (fallback when tags are absent or non-standard) ───────
@@ -155,12 +172,46 @@ def _normalise_tag(value) -> str:
         return str(value.name).lower().replace(" ", "_")
     # If it's a UUID
     s = str(value).lower().strip("{}")
+    # Two separate GUID spaces can appear here depending on which tag pqdifpy
+    # returns as a raw UUID rather than an enum:
+    #
+    #   QuantityTypeID (on ChannelDefinition) — describes the DATA SHAPE.
+    #   QuantityCharacteristicID (on SeriesDefinition) — describes HOW MEASURED.
+    #
+    # Source: gemstone/pqdif QuantityType.cs and QuantityCharacteristic.cs
     _GUID_NAMES = {
-        "67f6af80-f753-11cf-9d89-0080c72e70a3": "voltage",
-        "67f6af81-f753-11cf-9d89-0080c72e70a3": "current",
-        "67f6af8b-f753-11cf-9d89-0080c72e70a3": "power",
-        "67f6af85-f753-11cf-9d89-0080c72e70a3": "energy",
-        # Add more GUIDs here if needed — use --list-channels to find them
+        # ── QuantityType (data shape) ──────────────────────────────────────
+        "67f6af80-f753-11cf-9d89-0080c72e70a3": "waveform",     # Point-on-wave
+        "67f6af82-f753-11cf-9d89-0080c72e70a3": "valuelog",     # Time-logged averages (most interval data)
+        "67f6af81-f753-11cf-9d89-0080c72e70a3": "phasor",       # Time-domain phasor
+        "67f6af85-f753-11cf-9d89-0080c72e70a3": "response",     # Frequency-domain
+        "67f6af83-f753-11cf-9d89-0080c72e70a3": "flash",
+        "67f6af87-f753-11cf-9d89-0080c72e70a3": "histogram",
+        "67f6af88-f753-11cf-9d89-0080c72e70a3": "histogram3d",
+        "67f6af89-f753-11cf-9d89-0080c72e70a3": "cpf",
+        "67f6af8a-f753-11cf-9d89-0080c72e70a3": "xy",
+        "67f6af8b-f753-11cf-9d89-0080c72e70a3": "magdur",       # Magnitude+duration (sag/swell event records)
+        "67f6af8c-f753-11cf-9d89-0080c72e70a3": "xyz",
+        "67f6af8d-f753-11cf-9d89-0080c72e70a3": "magdurtime",
+        "67f6af8e-f753-11cf-9d89-0080c72e70a3": "magdurcount",
+        # ── QuantityCharacteristic (how measured) ──────────────────────────
+        "a6b31ae5-b451-11d1-ae17-0060083a2628": "rms",
+        "a6b31ae2-b451-11d1-ae17-0060083a2628": "peak",
+        "a6b31adc-b451-11d1-ae17-0060083a2628": "hrms",
+        "a6b31add-b451-11d1-ae17-0060083a2628": "instantaneous",
+        "a6b31ae9-b451-11d1-ae17-0060083a2628": "spectra",
+        "07ef68af-9ff5-11d2-b30b-006008b37183": "frequency",
+        "a6b31aec-b451-11d1-ae17-0060083a2628": "totalthd",     # THD normalised to fundamental
+        "f3d216e0-2aa5-11d5-a4b3-444553540000": "totalthdrms",  # THD normalised to RMS
+        "a6b31ad4-b451-11d1-ae17-0060083a2628": "eventhd",
+        "a6b31ae0-b451-11d1-ae17-0060083a2628": "oddthd",
+        "a6b31ae7-b451-11d1-ae17-0060083a2628": "s0s1",         # Zero-sequence unbalance
+        "a6b31ae8-b451-11d1-ae17-0060083a2628": "s2s1",         # Negative-sequence unbalance
+        "515bf320-71ca-11d4-a4b3-444553540000": "flkrpst",      # IEC flicker Pst
+        "515bf321-71ca-11d4-a4b3-444553540000": "flkrplt",      # IEC flicker Plt
+        "8786ca11-9113-11d3-b930-0050da2b1f4d": "kfactor",      # Transformer K-factor
+        "f3d216e7-2aa5-11d5-a4b3-444553540000": "tdd",          # Total demand distortion
+        "07ef68a0-9ff5-11d2-b30b-006008b37183": "rmsdemand",
     }
     if s in _GUID_NAMES:
         return _GUID_NAMES[s]

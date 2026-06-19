@@ -279,3 +279,121 @@ def plot_harmonic_spectrum(
     else:
         plt.show()
     plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ITIC CURVE
+# Reference: "ITI (CBEMA) Curve Application Note," Information Technology
+# Industry Council (ITIC), 2000.  Superseded the CBEMA curve originally
+# referenced in ANSI/IEEE 446-1987.  Referenced by IEEE 1159-2019 as the
+# standard voltage tolerance envelope for information technology equipment.
+# Applicable to 120 V nominal (120/208 V and 120/240 V, 60 Hz systems).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Step-function boundary lines (duplicate x-values create vertical segments)
+_ITIC_UPPER_MS_STEP  = np.array([0.001, 1,   1,   3,   3,   20,  20,  500, 500, 1e6])
+_ITIC_UPPER_PCT_STEP = np.array([500,   500, 200, 200, 140, 140, 120, 120, 110, 110])
+_ITIC_LOWER_MS_STEP  = np.array([0.001, 20,  20,  500, 500, 1e4, 1e4, 1e6])
+_ITIC_LOWER_PCT_STEP = np.array([0,     0,   70,  70,  80,  80,  90,  90 ])
+
+
+def _itic_upper_v(x: np.ndarray) -> np.ndarray:
+    """ITIC upper boundary (% nominal) at each duration x (ms)."""
+    r = np.full_like(x, 110.0, dtype=float)
+    r[x < 500] = 120.0
+    r[x < 20]  = 140.0
+    r[x < 3]   = 200.0
+    r[x < 1]   = 500.0
+    return r
+
+
+def _itic_lower_v(x: np.ndarray) -> np.ndarray:
+    """ITIC lower boundary (% nominal) at each duration x (ms)."""
+    r = np.full_like(x, 90.0, dtype=float)
+    r[x < 10000] = 80.0
+    r[x < 500]   = 70.0
+    r[x < 20]    = 0.0
+    return r
+
+
+def plot_itic(
+    events: pd.DataFrame,
+    thresh: Thresholds,
+    outdir: Optional[Path] = None,
+) -> None:
+    """ITIC voltage tolerance curve with sag/swell events plotted as (duration, magnitude) points.
+
+    Requires event records with duration_ms populated — available from adaptive
+    (cycle-level) data but not from 5-minute interval averages.
+    """
+    vol_events = (
+        events[events["type"].isin(["voltage_sag", "voltage_swell"])].copy()
+        if events is not None and not events.empty
+        else pd.DataFrame()
+    )
+    has_duration = (
+        not vol_events.empty
+        and "duration_ms" in vol_events.columns
+        and vol_events["duration_ms"].notna().any()
+    )
+    if not has_duration:
+        log.warning(
+            "ITIC plot requires event-level duration data (adaptive/waveform records). "
+            "Not available from 5-minute interval averages — skipping."
+        )
+        return
+
+    vol_events = vol_events.dropna(subset=["duration_ms", "value_v"])
+    nominal = thresh.nominal_voltage
+    vol_events["pct"] = vol_events["value_v"] / nominal * 100.0
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    x_fill = np.logspace(-3, 5, 2000)
+    upper  = _itic_upper_v(x_fill)
+    lower  = _itic_lower_v(x_fill)
+
+    ax.fill_between(x_fill, upper, 600,  color="#ff9999", alpha=0.45, linewidth=0)
+    ax.fill_between(x_fill, 0,    lower, color="#ff9999", alpha=0.45, linewidth=0,
+                    label="ITIC prohibited zone")
+    ax.fill_between(x_fill, lower, upper, color="#d4edda", alpha=0.40, linewidth=0,
+                    label="ITIC no-disruption zone")
+
+    ax.plot(_ITIC_UPPER_MS_STEP, _ITIC_UPPER_PCT_STEP, "r-", lw=1.5)
+    ax.plot(_ITIC_LOWER_MS_STEP, _ITIC_LOWER_PCT_STEP, "r-", lw=1.5, label="ITIC boundary")
+    ax.axhline(100, color="#666666", ls=":", lw=0.8, alpha=0.7, label="100% nominal")
+
+    phase_colors = {"A": "#2196F3", "B": "#FF9800", "C": "#4CAF50"}
+    for phase, color in phase_colors.items():
+        s = vol_events[(vol_events["type"] == "voltage_sag")    & (vol_events["phase"] == phase)]
+        if not s.empty:
+            ax.scatter(s["duration_ms"], s["pct"], marker="v", color=color, s=60,
+                       zorder=5, edgecolors="white", linewidths=0.5,
+                       label=f"Sag Ph-{phase} (n={len(s)})")
+        sw = vol_events[(vol_events["type"] == "voltage_swell") & (vol_events["phase"] == phase)]
+        if not sw.empty:
+            ax.scatter(sw["duration_ms"], sw["pct"], marker="^", color=color, s=60,
+                       zorder=5, edgecolors="white", linewidths=0.5,
+                       label=f"Swell Ph-{phase} (n={len(sw)})")
+
+    ax.set_xscale("log")
+    ax.set_xlim(0.001, 1e5)
+    ax.set_ylim(0, 600)
+    ax.set_xlabel("Duration (ms)")
+    ax.set_ylabel("Voltage (% of nominal)")
+    ax.set_title(
+        "ITIC Voltage Tolerance Curve\n"
+        "ITI (CBEMA) Curve Application Note, ITIC 2000  ·  Referenced in IEEE 1159-2019"
+    )
+    ax.legend(loc="upper left", fontsize=8, ncol=2, framealpha=0.85)
+    ax.grid(True, which="both", ls=":", alpha=0.35)
+
+    x_ticks = [0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000, 100000]
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(["0.001", "0.01", "0.1", "1", "10", "100", "1 s", "10 s", "100 s"])
+
+    fig.tight_layout()
+    outpath = (outdir or Path(".")) / "itic_curve.png"
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("ITIC curve plot saved → %s", outpath)

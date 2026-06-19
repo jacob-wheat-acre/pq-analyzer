@@ -923,14 +923,42 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
             if vcol not in adf.columns:
                 continue
             s = adf[vcol].dropna()
+            s_vals  = s.values
+            s_idx   = s.index
+            pos_map = {ts: i for i, ts in enumerate(s_idx)}
+            sample_ms = (
+                (s_idx[1] - s_idx[0]).total_seconds() * 1000
+                if len(s_idx) > 1 else 16.7
+            )
+
             sag_starts   = s[(s < sag_thresh)   & (s.shift(1) >= sag_thresh)].index
             swell_starts = s[(s > swell_thresh)  & (s.shift(1) <= swell_thresh)].index
+
             for ts in sag_starts:
-                events.append({"timestamp": ts, "type": "voltage_sag",   "phase": phase,
-                               "value_v": float(s.loc[ts])})
+                loc = pos_map[ts]
+                end = loc
+                while end + 1 < len(s_vals) and s_vals[end + 1] < sag_thresh:
+                    end += 1
+                events.append({
+                    "timestamp":   ts,
+                    "type":        "voltage_sag",
+                    "phase":       phase,
+                    "value_v":     float(np.min(s_vals[loc: end + 1])),
+                    "duration_ms": (s_idx[end] - ts).total_seconds() * 1000 + sample_ms,
+                })
+
             for ts in swell_starts:
-                events.append({"timestamp": ts, "type": "voltage_swell", "phase": phase,
-                               "value_v": float(s.loc[ts])})
+                loc = pos_map[ts]
+                end = loc
+                while end + 1 < len(s_vals) and s_vals[end + 1] > swell_thresh:
+                    end += 1
+                events.append({
+                    "timestamp":   ts,
+                    "type":        "voltage_swell",
+                    "phase":       phase,
+                    "value_v":     float(np.max(s_vals[loc: end + 1])),
+                    "duration_ms": (s_idx[end] - ts).total_seconds() * 1000 + sample_ms,
+                })
             diffs = s.diff().abs()
             for ts in diffs[diffs > delta_v].index:
                 events.append({"timestamp": ts, "type": "voltage_spike", "phase": phase,
