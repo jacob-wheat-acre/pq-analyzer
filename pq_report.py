@@ -108,6 +108,7 @@ def generate_report(
     stat_result: dict,
     event_result: dict,
     thresh: Thresholds,
+    neutral_health_result: Optional[dict] = None,
 ) -> dict:
     """Compile all analysis results into a structured summary dictionary."""
     df = ds.df
@@ -141,6 +142,7 @@ def generate_report(
         "harmonic_sources":             source_harm_result,
         "harmonic_statistics":          stat_result,
         "events":                       event_result,
+        "neutral_health":               neutral_health_result or {"available": False, "reason": "not run"},
         "pass_fail": {
             "transformer_loading":    transformer_pass,
             "voltage":                volt_result["total_pct_out_of_bounds"] == 0
@@ -161,6 +163,10 @@ def generate_report(
                                       if curr_imb_result["available"] else None,
             "harmonic_statistics":    stat_result.get("overall_pass")
                                       if stat_result.get("available") else None,
+            "neutral_health":         (
+                (neutral_health_result or {}).get("severity") in ("normal", "caution")
+                if (neutral_health_result or {}).get("available") else None
+            ),
         },
     }
     return report
@@ -347,6 +353,25 @@ def print_report(report: dict) -> None:
             ratio_s = f"{od['z_ratio']:.2f}×" if od["z_ratio"] is not None else "   n/a"
             corr_s  = f"{od['corr']:.2f}"     if od["corr"]    is not None else "   n/a"
             print(f"  H{h:<5}  {od['z_ohm']:>8.4f}  {ratio_s:>8}  {corr_s:>10}  {od['attribution']}")
+
+    # ── Neutral health ────────────────────────────────────────────────────────
+    nh = report.get("neutral_health", {})
+    if nh.get("available"):
+        print(f"\n{sep}")
+        print("  NEUTRAL HEALTH (split-phase)")
+        sev = nh["severity"].upper()
+        print(
+            f"  Severity: {sev}  |  "
+            f"L1+L2 sum={nh['sum_mean_v']:.1f} V (std {nh['sum_std_v']:.2f} V)  |  "
+            f"Leg corr r={nh['leg_correlation']:.3f}  |  "
+            f"Asym={nh['asym_mean_v']:.1f} V ({nh['asym_pct']:.1f}%)"
+        )
+        if nh.get("vne_available"):
+            print(f"  Vne: max={nh['vne_max_v']:.2f} V  mean={nh['vne_mean_v']:.2f} V")
+        if nh.get("coincident_events"):
+            print(f"  Coincident opposing sag/swell events: {nh['coincident_events']}")
+        for f_txt in nh.get("findings", []):
+            print(f"  • {f_txt}")
 
     # ── Root cause analysis ───────────────────────────────────────────────────
     print(f"\n{sep}")

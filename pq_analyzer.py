@@ -48,6 +48,7 @@ from pq_analysis import (
     check_harmonic_sources,
     check_harmonic_statistics,
     detect_events,
+    check_neutral_health,
     analyze_root_causes,
 )
 from pq_report import (
@@ -62,6 +63,7 @@ from pq_plots import (
     plot_summary,
     plot_harmonic_spectrum,
     plot_itic,
+    plot_neutral_health,
 )
 
 logging.basicConfig(
@@ -244,6 +246,7 @@ def main():
     source_harm_result  = check_harmonic_sources(df, thresh)
     stat_result         = check_harmonic_statistics(df, thresh)
     event_result        = detect_events(ds, thresh)
+    neutral_health_result = check_neutral_health(ds, thresh)
 
     # ── Compile report ────────────────────────────────────────────────────────
     report = generate_report(
@@ -251,6 +254,7 @@ def main():
         imb_result, curr_imb_result, demand_result,
         harm_result, volt_harm_result, neutral_harm_result,
         source_harm_result, stat_result, event_result, thresh,
+        neutral_health_result=neutral_health_result,
     )
     report["root_causes"] = analyze_root_causes(report, ds, thresh)
 
@@ -268,6 +272,7 @@ def main():
         plot_summary(df, imb_result, outdir=outdir)
         plot_harmonic_spectrum(df, thresh, outdir=outdir)
         plot_itic(event_result["events"], thresh, outdir=outdir)
+        plot_neutral_health(ds, neutral_health_result, thresh, outdir=outdir)
         log.info("All plots saved to %s/", outdir)
 
     # ── Word report ───────────────────────────────────────────────────────────

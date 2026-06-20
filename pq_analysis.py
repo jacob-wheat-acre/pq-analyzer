@@ -1036,6 +1036,185 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 8a. NEUTRAL HEALTH  (split-phase open-neutral detection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
+    """
+    Assess split-phase neutral integrity. Only meaningful for split-phase topology.
+
+    Combines four independent indicators:
+    - Voltage sum stability  : Van + Vbn should hold near 240 V
+    - Cross-leg correlation  : healthy legs track together (r > 0.8);
+                               open neutral causes opposition (r → −1)
+    - Neutral-to-earth Vne   : elevated Vne indicates neutral impedance
+    - Coincident opposing events: one leg sags while the other swells
+    """
+    topology = ds.meta.get("topology", "unknown")
+    if topology != "split-phase":
+        return {"available": False, "reason": "not split-phase topology"}
+
+    df = ds.df
+    if "voltage_a" not in df.columns or "voltage_b" not in df.columns:
+        return {
+            "available": False,
+            "reason": "split-phase topology but missing L1 or L2 voltage channel",
+        }
+
+    va = df["voltage_a"].dropna()
+    vb = df["voltage_b"].dropna()
+    aligned = pd.concat([va, vb], axis=1, join="inner").dropna()
+    if len(aligned) < 2:
+        return {"available": False, "reason": "insufficient overlapping voltage samples"}
+
+    va_a = aligned["voltage_a"]
+    vb_a = aligned["voltage_b"]
+    nom  = thresh.nominal_voltage
+
+    # ── 1. Voltage sum ────────────────────────────────────────────────────────
+    vsum     = va_a + vb_a
+    sum_mean = float(vsum.mean())
+    sum_std  = float(vsum.std())
+
+    # ── 2. Cross-leg Pearson correlation ─────────────────────────────────────
+    leg_corr = float(va_a.corr(vb_a))
+
+    # ── 3. Voltage asymmetry |L1 − L2| ───────────────────────────────────────
+    asym      = (va_a - vb_a).abs()
+    asym_mean = float(asym.mean())
+    asym_max  = float(asym.max())
+    asym_pct  = asym_mean / nom * 100 if nom > 0 else 0.0
+
+    # ── 4. Neutral-to-earth voltage ───────────────────────────────────────────
+    vne_available = False
+    vne_mean      = 0.0
+    vne_max       = 0.0
+    if ds.has_adaptive and ds.adaptive_df is not None and "vne_v" in ds.adaptive_df.columns:
+        vne_raw = ds.adaptive_df["vne_v"].dropna().abs()
+        if len(vne_raw) > 0:
+            vne_mean      = float(vne_raw.mean())
+            vne_max       = float(vne_raw.max())
+            vne_available = True
+
+    # ── 5. Coincident opposing sag/swell ──────────────────────────────────────
+    n_coincident = 0
+    if ds.has_adaptive and ds.adaptive_df is not None:
+        adf = ds.adaptive_df
+        if "van_v" in adf.columns and "vbn_v" in adf.columns:
+            both = pd.concat(
+                [adf["van_v"].dropna(), adf["vbn_v"].dropna()], axis=1, join="inner"
+            ).dropna()
+            if len(both) > 0:
+                sag_thr   = nom * 0.90
+                swell_thr = nom * 1.10
+                n_coincident = int(
+                    (
+                        ((both["van_v"] < sag_thr) & (both["vbn_v"] > swell_thr)) |
+                        ((both["vbn_v"] < sag_thr) & (both["van_v"] > swell_thr))
+                    ).sum()
+                )
+
+    # ── Severity ──────────────────────────────────────────────────────────────
+    if n_coincident >= 3 or (vne_available and vne_max > 5.0) or leg_corr < -0.3:
+        severity = "critical"
+    elif n_coincident >= 1 or (vne_available and vne_max > 2.0) or leg_corr < 0.0 or sum_std > 5.0:
+        severity = "warning"
+    elif (vne_available and vne_max > 0.5) or leg_corr < 0.5 or sum_std > 2.0 or asym_pct > 3.0:
+        severity = "caution"
+    else:
+        severity = "normal"
+
+    # ── Plain-language findings ────────────────────────────────────────────────
+    findings: List[str] = []
+
+    if n_coincident >= 1:
+        s = "s" if n_coincident > 1 else ""
+        findings.append(
+            f"Detected {n_coincident} coincident opposing sag/swell event{s}: "
+            f"one leg below {nom * 0.90:.0f} V while the other exceeded {nom * 1.10:.0f} V "
+            "simultaneously. This is a hallmark signature of an open or high-resistance neutral."
+        )
+
+    if vne_available:
+        if vne_max > 5.0:
+            findings.append(
+                f"Neutral-to-earth voltage reached {vne_max:.1f} V (mean {vne_mean:.1f} V). "
+                "Above 2 V indicates significant neutral impedance; above 5 V is a safety hazard — "
+                "investigate immediately."
+            )
+        elif vne_max > 2.0:
+            findings.append(
+                f"Neutral-to-earth voltage elevated: max {vne_max:.1f} V, mean {vne_mean:.1f} V. "
+                "Investigate neutral conductor connections and the grounding electrode system."
+            )
+        elif vne_max > 0.5:
+            findings.append(
+                f"Neutral-to-earth voltage mildly elevated: max {vne_max:.1f} V (normal < 0.5 V). "
+                "Monitor and investigate if increasing."
+            )
+        else:
+            findings.append(f"Neutral-to-earth voltage is normal (max {vne_max:.2f} V).")
+
+    if leg_corr < 0.0:
+        findings.append(
+            f"Cross-leg voltage correlation is negative (r = {leg_corr:.3f}). "
+            "When L1 rises, L2 falls — a strong indicator of the neutral floating between legs."
+        )
+    elif leg_corr < 0.5:
+        findings.append(
+            f"Cross-leg voltage correlation is weak (r = {leg_corr:.3f}; healthy > 0.80). "
+            "Legs are not tracking the source together — investigate neutral continuity."
+        )
+
+    if sum_std > 3.0:
+        findings.append(
+            f"Voltage sum (L1 + L2) is unstable: mean {sum_mean:.1f} V, std {sum_std:.1f} V. "
+            "A solid neutral holds L1 + L2 near 240 V with std < 1 V."
+        )
+    elif sum_std > 1.0:
+        findings.append(
+            f"Voltage sum (L1 + L2) shows moderate variation: "
+            f"mean {sum_mean:.1f} V, std {sum_std:.2f} V."
+        )
+
+    if asym_pct > 5.0:
+        findings.append(
+            f"Sustained voltage asymmetry: mean |L1 − L2| = {asym_mean:.1f} V "
+            f"({asym_pct:.1f}% of nominal), max {asym_max:.1f} V. "
+            "Investigate load balance and neutral continuity."
+        )
+    elif asym_pct > 2.0:
+        findings.append(
+            f"Moderate voltage asymmetry: mean |L1 − L2| = {asym_mean:.1f} V "
+            f"({asym_pct:.1f}% of nominal)."
+        )
+
+    if not findings:
+        findings.append(
+            f"Neutral appears healthy: L1 + L2 = {sum_mean:.1f} V (std {sum_std:.2f} V), "
+            f"leg correlation r = {leg_corr:.3f}, asymmetry {asym_mean:.1f} V ({asym_pct:.1f}%)."
+        )
+
+    return {
+        "available":         True,
+        "topology":          "split-phase",
+        "sample_count":      len(aligned),
+        "sum_mean_v":        round(sum_mean, 2),
+        "sum_std_v":         round(sum_std, 3),
+        "leg_correlation":   round(leg_corr, 3),
+        "asym_mean_v":       round(asym_mean, 2),
+        "asym_max_v":        round(asym_max, 2),
+        "asym_pct":          round(asym_pct, 2),
+        "vne_available":     vne_available,
+        "vne_mean_v":        round(vne_mean, 2),
+        "vne_max_v":         round(vne_max, 2),
+        "coincident_events": n_coincident,
+        "severity":          severity,
+        "findings":          findings,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8b. ROOT CAUSE ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1548,6 +1727,65 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
             "evidence":       {"mean_pf":     round(pf_mean, 4),
                                "mean_q_kvar": round(q_mean, 1),
                                "kvar_needed": round(kvar_needed, 0)},
+        })
+
+    # ── Neutral health — open/high-resistance neutral ────────────────────────
+    nh = report.get("neutral_health", {})
+    if nh.get("available") and nh.get("severity") in ("warning", "critical"):
+        sev         = nh["severity"]
+        n_coinc     = nh.get("coincident_events", 0)
+        leg_r       = nh.get("leg_correlation", 1.0)
+        sum_std     = nh.get("sum_std_v", 0.0)
+        vne_max     = nh.get("vne_max_v", 0.0)
+        vne_avail   = nh.get("vne_available", False)
+
+        # Build the finding text from whichever indicators triggered
+        evidence_parts: List[str] = []
+        if n_coinc >= 1:
+            evidence_parts.append(
+                f"{n_coinc} coincident opposing sag/swell event{'s' if n_coinc > 1 else ''}"
+            )
+        if vne_avail and vne_max > 0.5:
+            evidence_parts.append(f"Vne max {vne_max:.1f} V")
+        if leg_r < 0.5:
+            evidence_parts.append(f"leg correlation r = {leg_r:.3f}")
+        if sum_std > 2.0:
+            evidence_parts.append(f"L1+L2 sum std = {sum_std:.1f} V")
+
+        findings.append({
+            "category":       "voltage",
+            "severity":       sev,
+            "title":          "Open or high-resistance neutral suspected",
+            "finding":        (
+                "Split-phase neutral health indicators point to a compromised neutral: "
+                + "; ".join(evidence_parts) + ". "
+                "Voltage is redistributing between legs through the neutral impedance."
+            ),
+            "cause":          (
+                "An open or high-resistance neutral causes the two 120 V legs to float relative "
+                "to each other. Heavily loaded legs pull voltage below 120 V while the lightly "
+                "loaded leg rises — voltage redistribution proportional to the load imbalance. "
+                "Common causes: loose neutral wire at meter socket, corroded split-bolt connector, "
+                "failed utility neutral splice, or broken neutral conductor."
+            ),
+            "responsibility": "utility",
+            "recommendation": (
+                "Inspect and tighten all neutral connections from the meter socket through the "
+                "service entrance to the main panel. Check for corrosion at split-bolt connectors "
+                "and wire nut splices. Measure neutral-to-ground voltage at the panel — > 1 V "
+                "under load confirms neutral resistance. If the service neutral is overhead, "
+                "inspect the drip loop and weatherhead connection. File a trouble call with "
+                "Xcel Energy to inspect the utility secondary and meter socket neutral lug."
+            ),
+            "confidence":     "high" if n_coinc >= 2 or (vne_avail and vne_max > 2.0) else "medium",
+            "evidence":       {
+                "severity":          sev,
+                "coincident_events": n_coinc,
+                "leg_correlation":   leg_r,
+                "sum_std_v":         sum_std,
+                "vne_max_v":         vne_max if vne_avail else None,
+                "asym_mean_v":       nh.get("asym_mean_v"),
+            },
         })
 
     # ── Transformer loading — harmonic derating concern ───────────────────────

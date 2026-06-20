@@ -397,3 +397,118 @@ def plot_itic(
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
     log.info("ITIC curve plot saved → %s", outpath)
+
+
+def plot_neutral_health(
+    ds,
+    neutral_result: dict,
+    thresh: Thresholds,
+    outdir: Optional[Path] = None,
+) -> None:
+    """Four-panel neutral health plot for split-phase services."""
+    if not neutral_result.get("available"):
+        return
+
+    df = ds.df
+    if "voltage_a" not in df.columns or "voltage_b" not in df.columns:
+        log.warning("plot_neutral_health: voltage_a/voltage_b not in dataset.")
+        return
+
+    va = df["voltage_a"].dropna()
+    vb = df["voltage_b"].dropna()
+    aligned = pd.concat([va, vb], axis=1, join="inner").dropna()
+    if aligned.empty:
+        return
+
+    has_vne = (
+        neutral_result.get("vne_available")
+        and ds.has_adaptive
+        and ds.adaptive_df is not None
+        and "vne_v" in ds.adaptive_df.columns
+    )
+    n_rows = 4 if has_vne else 3
+    nom    = thresh.nominal_voltage
+
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 3.5 * n_rows), sharex=False)
+
+    # ── Panel 0: L1 and L2 voltage ────────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(aligned.index, aligned["voltage_a"],
+            color="#2196F3", lw=0.8, label="L1-N (voltage_a)")
+    ax.plot(aligned.index, aligned["voltage_b"],
+            color="#FF9800", lw=0.8, label="L2-N (voltage_b)")
+    vmin = nom * (1 - thresh.volt_tolerance)
+    vmax = nom * (1 + thresh.volt_tolerance)
+    ax.axhline(vmin, color="red", ls="--", lw=0.8, alpha=0.7, label=f"ANSI lower ({vmin:.1f} V)")
+    ax.axhline(vmax, color="red", ls="--", lw=0.8, alpha=0.7, label=f"ANSI upper ({vmax:.1f} V)")
+    ax.set_ylabel("Voltage (V)")
+    ax.set_title("L1-N and L2-N Voltages")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+    # ── Panel 1: Voltage sum (L1 + L2) ───────────────────────────────────────
+    ax = axes[1]
+    vsum     = aligned["voltage_a"] + aligned["voltage_b"]
+    exp_sum  = nom * 2
+    ax.plot(vsum.index, vsum, color="#9C27B0", lw=0.8, label="L1 + L2 sum")
+    ax.axhline(exp_sum, color="green", ls="--", lw=1.0, alpha=0.7,
+               label=f"Expected {exp_sum:.0f} V")
+    ax.axhspan(exp_sum * 0.97, exp_sum * 1.03, alpha=0.08, color="green", label="±3% band")
+    sum_std = neutral_result.get("sum_std_v", 0.0)
+    ax.set_ylabel("L1 + L2 (V)")
+    ax.set_title(f"Voltage Sum Stability  [std = {sum_std:.2f} V]")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+    # ── Panel 2: Voltage asymmetry |L1 − L2| ─────────────────────────────────
+    ax = axes[2]
+    asym     = (aligned["voltage_a"] - aligned["voltage_b"]).abs()
+    asym_pct = neutral_result.get("asym_pct", 0.0)
+    ax.plot(asym.index, asym, color="#F44336", lw=0.8, label="|L1 − L2|")
+    ax.axhline(nom * 0.02, color="orange", ls="--", lw=0.8,
+               label=f"2% ({nom * 0.02:.1f} V)")
+    ax.axhline(nom * 0.05, color="red",    ls="--", lw=0.8,
+               label=f"5% ({nom * 0.05:.1f} V)")
+    ax.set_ylabel("|L1 − L2| (V)")
+    ax.set_title(
+        f"Leg Asymmetry  "
+        f"[mean = {neutral_result.get('asym_mean_v', 0):.1f} V  ({asym_pct:.1f}% of nominal)]"
+    )
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+    # ── Panel 3 (optional): Neutral-to-earth Vne ─────────────────────────────
+    if has_vne:
+        ax = axes[3]
+        vne = ds.adaptive_df["vne_v"].dropna().abs()
+        ax.plot(vne.index, vne, color="#607D8B", lw=0.8, label="Vne (neutral-to-earth)")
+        ax.axhline(0.5, color="goldenrod", ls="--", lw=0.8, label="0.5 V caution")
+        ax.axhline(2.0, color="orange",    ls="--", lw=0.8, label="2.0 V warning")
+        ax.axhline(5.0, color="red",       ls="--", lw=0.8, label="5.0 V critical")
+        ax.set_ylabel("Vne (V)")
+        ax.set_title(
+            f"Neutral-to-Earth Voltage  "
+            f"[max = {neutral_result.get('vne_max_v', 0):.2f} V]"
+        )
+        ax.legend(fontsize=8, loc="upper right")
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+    sev_colors = {"normal": "green", "caution": "goldenrod",
+                  "warning": "orange", "critical": "red"}
+    sev = neutral_result.get("severity", "unknown")
+    fig.suptitle(
+        f"Neutral Health Assessment — Severity: {sev.upper()}",
+        fontsize=11, fontweight="bold",
+        color=sev_colors.get(sev, "black"),
+    )
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    outpath = (outdir or Path(".")) / "neutral_health.png"
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("Neutral health plot saved → %s", outpath)
