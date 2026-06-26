@@ -815,6 +815,7 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
     dem      = report["demand"]
     tdd_info = thd.get("tdd_info", {})
     c_thd    = thd["current"]
+    is_split = "voltage_c" not in report.get("file_summary", {}).get("channels", [])
 
     _section_heading(doc, "Harmonics (IEEE 519-2022)")
     if tdd_info:
@@ -964,13 +965,22 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
         acc = nh.get("accumulation_factor")
         t_pct = nh.get("triplen_pct", 0.0)
         acc_str = f"{acc:.1f}×" if acc is not None else "n/a (phase harmonics not available)"
-        doc.add_paragraph(
-            f"Triplens (H3, H9, H15) are zero-sequence harmonics that add arithmetically in a "
-            f"4-wire wye neutral. Triplen content: {t_pct:.0f}% of total neutral harmonic current. "
-            f"Accumulation factor (H3-neutral ÷ mean H3-phase): {acc_str}. "
-            f"Factor > 3 indicates resonance amplification; factor ≈ 3 indicates full accumulation "
-            f"from balanced single-phase loads on all three phases."
-        )
+        if is_split:
+            doc.add_paragraph(
+                f"In a single-phase 3-wire (split-phase) service, the neutral carries the difference "
+                f"current between L1 and L2, not the sum of zero-sequence currents from three phases. "
+                f"Neutral harmonic content here reflects load imbalance between legs rather than "
+                f"triplen accumulation. Triplen content: {t_pct:.0f}% of total neutral harmonic current. "
+                f"Accumulation factor (H3-neutral ÷ mean H3-phase): {acc_str}."
+            )
+        else:
+            doc.add_paragraph(
+                f"Triplens (H3, H9, H15) are zero-sequence harmonics that add arithmetically in a "
+                f"4-wire wye neutral. Triplen content: {t_pct:.0f}% of total neutral harmonic current. "
+                f"Accumulation factor (H3-neutral ÷ mean H3-phase): {acc_str}. "
+                f"Factor > 3 indicates resonance amplification; factor ≈ 3 indicates full accumulation "
+                f"from balanced single-phase loads on all three phases."
+            )
 
         nh_tbl = doc.add_table(rows=1, cols=4)
         nh_tbl.style = 'Table Grid'
@@ -1272,6 +1282,97 @@ def _word_flicker(doc, report, df) -> None:
         doc.add_paragraph()
 
 
+def _word_neutral_health(doc, report, thresh) -> None:
+    nh = report.get("neutral_health", {})
+    if not nh.get("available"):
+        return
+
+    _section_heading(doc, "Neutral Integrity Assessment")
+
+    sev = nh.get("severity", "normal")
+    sev_colors = {
+        "critical": _FAIL_CLR,
+        "warning":  RGBColor(0xCC, 0x66, 0x00),
+        "caution":  RGBColor(0xCC, 0x99, 0x00),
+        "normal":   _PASS_CLR,
+    }
+    sev_labels = {
+        "critical": "CRITICAL — Open or High-Resistance Neutral Suspected",
+        "warning":  "WARNING — Neutral Integrity Concern",
+        "caution":  "CAUTION — Neutral Anomaly Detected",
+        "normal":   "NORMAL — Neutral Appears Healthy",
+    }
+    sev_p = doc.add_paragraph()
+    _bold(sev_p, sev_labels.get(sev, sev.upper()),
+          color=sev_colors.get(sev, _XE_BLUE), size_pt=11)
+
+    indicators = [
+        ("L1 + L2 Sum (mean / std)",
+         f"{nh['sum_mean_v']:.1f} V / {nh['sum_std_v']:.2f} V",
+         "Healthy: ~240 V, std < 1 V"),
+        ("L1–L2 Correlation (Pearson r)",
+         f"{nh['leg_correlation']:.3f}",
+         "Healthy: r > 0.80; open neutral → r ≈ −1"),
+        ("Voltage Asymmetry |L1 − L2|",
+         f"{nh['asym_mean_v']:.1f} V mean, {nh['asym_max_v']:.1f} V max ({nh['asym_pct']:.1f}%)",
+         "Healthy: < 2% of nominal"),
+        ("Coincident Opposing Events",
+         str(nh["coincident_events"]),
+         "Healthy: 0"),
+    ]
+    if nh.get("vne_available"):
+        indicators.append((
+            "Neutral-to-Earth Voltage (Vne)",
+            f"{nh['vne_mean_v']:.2f} V mean, {nh['vne_max_v']:.2f} V max",
+            "Healthy: < 0.5 V; > 5 V is safety hazard",
+        ))
+
+    tbl = doc.add_table(rows=1, cols=3)
+    tbl.style = "Table Grid"
+    _set_col_widths(tbl, [3.0, 3.0, 3.5])
+    for cell, hdr_txt in zip(tbl.rows[0].cells, ["Indicator", "Measured", "Benchmark"]):
+        _cell_shade(cell, "E8F1FA")
+        cell.paragraphs[0].add_run(hdr_txt).bold = True
+        cell.paragraphs[0].runs[0].font.size = Pt(9)
+    for ind, val, bench in indicators:
+        cells = tbl.add_row().cells
+        cells[0].paragraphs[0].add_run(ind).font.size = Pt(9)
+        cells[1].paragraphs[0].add_run(val).font.size = Pt(9)
+        cells[2].paragraphs[0].add_run(bench).font.size = Pt(9)
+
+    doc.add_paragraph()
+
+    for finding in nh.get("findings", []):
+        p = doc.add_paragraph(style="List Bullet")
+        p.add_run(finding).font.size = Pt(10)
+
+    if sev in ("critical", "warning"):
+        doc.add_paragraph()
+        rec_p = doc.add_paragraph()
+        rec_p.paragraph_format.left_indent = Cm(0.5)
+        rec_run = rec_p.add_run("Recommendation:  ")
+        rec_run.bold = True
+        rec_run.font.size = Pt(10)
+        if sev == "critical":
+            rec_text = (
+                "An open or high-resistance neutral is a safety emergency. This can cause "
+                "severe overvoltage on the lightly-loaded leg (potentially exceeding 200 V on "
+                "a 120 V circuit), damaging appliances and posing shock and fire hazards. "
+                "Contact Xcel Energy immediately to inspect the service neutral from the "
+                "transformer secondary to the meter socket. Schedule a same-day inspection."
+            )
+        else:
+            rec_text = (
+                "Investigate the service neutral for loose connections, corrosion, or "
+                "undersized conductors. Check neutral bar connections in the main panel and "
+                "the meter socket lug. Xcel Energy should inspect the transformer secondary "
+                "neutral and service drop. Re-measure after any repairs to confirm resolution."
+            )
+        rec_p.add_run(rec_text).font.size = Pt(10)
+
+    doc.add_paragraph()
+
+
 def _word_imbalance(doc, report, thresh) -> None:
     imb = report["voltage_imbalance"]
     ci  = report["current_imbalance"]
@@ -1551,6 +1652,7 @@ def generate_word_report(
     _word_harmonics(doc, report, thresh, df, outdir)
     _word_flicker(doc, report, df)
     _word_imbalance(doc, report, thresh)
+    _word_neutral_health(doc, report, thresh)
     _word_events(doc, report)
     _word_rca(doc, report, thresh)
     _word_signoff(doc, engineer_name, engineer_title, engineer_phone, engineer_email,

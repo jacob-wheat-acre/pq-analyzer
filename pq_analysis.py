@@ -1531,6 +1531,38 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                         f" The site draws {abs(kvar_mean):.1f} kVAR leading — "
                         "capacitor banks are likely present and are a probable resonance source."
                     )
+            if thresh.customer_class == "r":
+                res_cause = (
+                    "Parallel resonance forms when feeder or service-entrance inductance resonates "
+                    "with capacitance on the distribution system (utility PF correction banks, "
+                    "neighbor's capacitors, or cable charging capacitance). Residential customers "
+                    "do not typically own capacitor banks, so this resonance originates on the "
+                    f"utility side of the meter.{cap_note}"
+                )
+                res_rec = (
+                    "Contact the Xcel Energy distribution engineering team to investigate whether "
+                    "feeder capacitor banks or line-side PF correction equipment are creating a "
+                    f"resonance at {', '.join(str(h * 60) for h in sorted(resonant))} Hz. "
+                    "A harmonic impedance frequency sweep at the service entrance will confirm "
+                    "the resonant frequency and identify the source."
+                )
+                res_responsibility = "utility"
+            else:
+                res_cause = (
+                    "Parallel resonance forms when the system (transformer + feeder) inductance "
+                    "resonates with power factor correction or harmonic filter capacitors. "
+                    "At the resonant order, even small harmonic currents produce large "
+                    f"harmonic voltages, amplifying both V_h and I_h at that order.{cap_note}"
+                )
+                res_rec = (
+                    "Commission a harmonic impedance frequency sweep to confirm the resonant "
+                    f"frequency (target: {', '.join(str(h * 60) for h in sorted(resonant))} Hz). "
+                    "Detune existing capacitor banks by adding series reactors (typically 5–7% "
+                    "of bank kVAR), or switch to a harmonic filter bank tuned below H5 (282 Hz). "
+                    "Until resolved, do not add more capacitors without a harmonic study."
+                )
+                res_responsibility = "shared"
+
             findings.append({
                 "category":       "harmonics",
                 "severity":       "warning",
@@ -1541,20 +1573,9 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                     "This signature is consistent with a parallel LC resonance between system "
                     "inductance and capacitor banks at that harmonic frequency."
                 ),
-                "cause":          (
-                    "Parallel resonance forms when the system (transformer + feeder) inductance "
-                    "resonates with power factor correction or harmonic filter capacitors. "
-                    "At the resonant order, even small harmonic currents produce large "
-                    f"harmonic voltages, amplifying both V_h and I_h at that order.{cap_note}"
-                ),
-                "responsibility": "shared",
-                "recommendation": (
-                    "Commission a harmonic impedance frequency sweep to confirm the resonant "
-                    f"frequency (target: {', '.join(str(h * 60) for h in sorted(resonant))} Hz). "
-                    "Detune existing capacitor banks by adding series reactors (typically 5–7% "
-                    "of bank kVAR), or switch to a harmonic filter bank tuned below H5 (282 Hz). "
-                    "Until resolved, do not add more capacitors without a harmonic study."
-                ),
+                "cause":          res_cause,
+                "responsibility": res_responsibility,
+                "recommendation": res_rec,
                 "confidence":     "medium",
                 "evidence":       z_evidence,
             })
