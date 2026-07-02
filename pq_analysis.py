@@ -175,17 +175,27 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
             metric = "tdd"
         else:
             worst  = df[i_thd_cols].max(axis=1).dropna()
+            # Filter out light-load intervals: at < 10% of peak demand the THD%
+            # denominator (I₁) approaches zero and produces meaningless large values.
+            # IEEE 519-2022 §2.1 specifies evaluation at maximum demand conditions.
+            light_load_filtered = False
+            if il_amps and il_amps > 0 and i_cols:
+                load_mask = df[i_cols].max(axis=1).reindex(worst.index).fillna(0) >= il_amps * 0.10
+                if load_mask.any():
+                    worst = worst[load_mask]
+                    light_load_filtered = True
             metric = "thd"
 
         exceed = worst > current_limit
         result["current"] = {
-            "available":        True,
-            "metric":           metric,
-            "limit_pct":        current_limit,
-            "max_thd_pct":      float(worst.max()),
-            "mean_thd_pct":     float(worst.mean()),
-            "pct_exceeding":    float(exceed.mean() * 100),
-            "violation_timestamps": worst.index[exceed].tolist(),
+            "available":              True,
+            "metric":                 metric,
+            "limit_pct":              current_limit,
+            "max_thd_pct":            float(worst.max()),
+            "mean_thd_pct":           float(worst.mean()),
+            "pct_exceeding":          float(exceed.mean() * 100),
+            "light_load_filtered":    light_load_filtered if not use_tdd else False,
+            "violation_timestamps":   worst.index[exceed].tolist(),
         }
         result["available"] = True
 

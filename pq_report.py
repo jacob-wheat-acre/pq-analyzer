@@ -249,8 +249,9 @@ def print_report(report: dict) -> None:
             print(f"  {label}: no data")
             continue
         sym = "PASS" if td["pct_exceeding"] == 0 else "FAIL"
+        ll_tag = "  [light-load intervals excluded]" if td.get("light_load_filtered") else ""
         print(f"  {label}: max={td['max_thd_pct']:.2f}%  mean={td['mean_thd_pct']:.2f}%  "
-              f"limit={td['limit_pct']:.1f}%  exceed={td['pct_exceeding']:.2f}%  [{sym}]")
+              f"limit={td['limit_pct']:.1f}%  exceed={td['pct_exceeding']:.2f}%  [{sym}]{ll_tag}")
         if key == "current" and "peak_max_tdd_pct" in td:
             pk_sym = "PASS" if td["peak_pct_exceeding"] == 0 else "FAIL"
             print(f"  {label} (peak within interval): max={td['peak_max_tdd_pct']:.2f}%  "
@@ -834,12 +835,16 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
                 f"Maximum {metric} was {c_thd['max_thd_pct']:.2f}%, mean {c_thd['mean_thd_pct']:.2f}%."
             )
         else:
+            ll_note = (
+                " Light-load intervals (< 10% of peak demand) are excluded per IEEE 519-2022 §2.1 "
+                "evaluation-at-maximum-demand-conditions guidance."
+                if c_thd.get("light_load_filtered") else ""
+            )
             _body(doc,
                 f"Current {metric} exceeded the {c_thd['limit_pct']:.1f}% limit during "
                 f"{c_thd['pct_exceeding']:.1f}% of the recording "
-                f"(max {c_thd['max_thd_pct']:.2f}%, mean {c_thd['mean_thd_pct']:.2f}%). "
-                "This is the customer's responsibility to correct. Common sources include VFDs, "
-                "UPS systems, switched-mode power supplies, and arc furnaces. "
+                f"(max {c_thd['max_thd_pct']:.2f}%, mean {c_thd['mean_thd_pct']:.2f}%).{ll_note} "
+                "Common sources include VFDs, UPS systems, switched-mode power supplies, and arc furnaces. "
                 "Mitigation options include passive harmonic filters, active front-end drives, "
                 "or 12-pulse converter topologies."
             )
