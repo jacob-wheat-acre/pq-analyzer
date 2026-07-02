@@ -797,11 +797,28 @@ def _word_voltage(doc, report) -> None:
             )
         else:
             for ph, v in volt["phases"].items():
-                if v["pct_out_of_bounds"] > 0:
+                pct_over  = v.get("pct_over",  0.0)
+                pct_under = v.get("pct_under", 0.0)
+                if v["pct_out_of_bounds"] == 0:
                     _body(doc,
-                        f"Phase {ph.upper()}: {v['pct_out_of_bounds']:.2f}% of intervals were outside the "
-                        f"acceptable range ({rng[0]:.1f}–{rng[1]:.1f} V). "
-                        f"Min {v['min_v']:.1f} V, mean {v['mean_v']:.1f} V, max {v['max_v']:.1f} V.{_ext_note}"
+                        f"Phase {ph.upper()}: within ANSI C84.1 Range A ({rng[0]:.1f}–{rng[1]:.1f} V) "
+                        f"for the entire recording. Min {v['min_v']:.1f} V, mean {v['mean_v']:.1f} V, "
+                        f"max {v['max_v']:.1f} V.{_ext_note}"
+                    )
+                else:
+                    if pct_over > 0 and pct_under > 0:
+                        direction = (
+                            f"{pct_over:.2f}% of intervals above the upper limit ({rng[1]:.1f} V) "
+                            f"and {pct_under:.2f}% below the lower limit ({rng[0]:.1f} V)"
+                        )
+                    elif pct_over > 0:
+                        direction = f"{pct_over:.2f}% of intervals above the upper limit ({rng[1]:.1f} V)"
+                    else:
+                        direction = f"{pct_under:.2f}% of intervals below the lower limit ({rng[0]:.1f} V)"
+                    _body(doc,
+                        f"Phase {ph.upper()}: {direction}. "
+                        f"Min {v['min_v']:.1f} V, mean {v['mean_v']:.1f} V, max {v['max_v']:.1f} V "
+                        f"(ANSI C84.1 Range A: {rng[0]:.1f}–{rng[1]:.1f} V).{_ext_note}"
                     )
     doc.add_paragraph()
 
