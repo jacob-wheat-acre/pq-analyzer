@@ -884,26 +884,29 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
 
     # Individual harmonic table (if available)
     if ih.get("available"):
+        _ph_keys   = ("a", "b") if is_split else ("a", "b", "c")
+        _ph_names  = (("a", "L1"), ("b", "L2")) if is_split else (("a", "Phase A"), ("b", "Phase B"), ("c", "Phase C"))
+        _n_cols    = 2 + len(_ph_keys)
+        _col_w     = [2.0] + [4.5 if is_split else 3.5] * len(_ph_keys) + [3.5]
         doc.add_paragraph()
         ih_hdr = doc.add_paragraph()
         _bold(ih_hdr, "Individual Harmonic Current Summary (% of IL)", size_pt=10)
-        harm_tbl = doc.add_table(rows=1, cols=5)
+        harm_tbl = doc.add_table(rows=1, cols=_n_cols)
         harm_tbl.style = 'Table Grid'
-        _set_col_widths(harm_tbl, [2.0, 3.5, 3.5, 3.5, 3.5])
-        for cell, text in zip(harm_tbl.rows[0].cells,
-                               ["Order", "Phase A (%IL)", "Phase B (%IL)", "Phase C (%IL)", "Limit (%IL)"]):
+        _set_col_widths(harm_tbl, _col_w)
+        _ih_hdrs = ["Order"] + [f"{nm} (%IL)" for _, nm in _ph_names] + ["Limit (%IL)"]
+        for cell, text in zip(harm_tbl.rows[0].cells, _ih_hdrs):
             _cell_shade(cell, "E8F1FA")
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
         for h in _H519_ORDERS:
-            # Skip orders where no phase has data
-            if not any(ih["phases"].get(ph, {}).get(h) for ph in ("a", "b", "c")):
+            if not any(ih["phases"].get(ph, {}).get(h) for ph in _ph_keys):
                 continue
             row_cells = harm_tbl.add_row().cells
             row_cells[0].paragraphs[0].add_run(f"H{h}").font.size = Pt(9)
             limit_shown = False
             any_fail = False
-            for j, ph in enumerate(("a", "b", "c")):
+            for j, ph in enumerate(_ph_keys):
                 r = ih["phases"].get(ph, {}).get(h)
                 if r:
                     txt = f"{r['max_pct_il']:.2f}"
@@ -914,7 +917,7 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
                         run.font.color.rgb = _FAIL_CLR
                         any_fail = True
                     if not limit_shown:
-                        row_cells[4].paragraphs[0].add_run(f"{r['limit_pct_il']:.1f}").font.size = Pt(9)
+                        row_cells[_n_cols-1].paragraphs[0].add_run(f"{r['limit_pct_il']:.1f}").font.size = Pt(9)
                         limit_shown = True
             if any_fail:
                 for cell in row_cells:
@@ -922,6 +925,10 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
 
     # ── Individual voltage harmonic table ─────────────────────────────────────
     if ivh.get("available"):
+        _vph_keys  = ("a", "b") if is_split else ("a", "b", "c")
+        _vph_names = (("a", "L1"), ("b", "L2")) if is_split else (("a", "Phase A"), ("b", "Phase B"), ("c", "Phase C"))
+        _vn_cols   = 2 + len(_vph_keys)
+        _vcol_w    = [2.0] + [4.5 if is_split else 3.5] * len(_vph_keys) + [3.5]
         doc.add_paragraph()
         ivh_hdr = doc.add_paragraph()
         _bold(ivh_hdr, "Individual Harmonic Voltage Summary (% of nominal)", size_pt=10)
@@ -929,22 +936,22 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
             f"Limit: 5.0% of nominal ({thresh.nominal_voltage:.0f} V) per IEEE 519-2022 Table 1 "
             f"(bus voltage < 1 kV). Values are absolute Volts converted to % of nominal."
         )
-        volt_harm_tbl = doc.add_table(rows=1, cols=5)
+        volt_harm_tbl = doc.add_table(rows=1, cols=_vn_cols)
         volt_harm_tbl.style = 'Table Grid'
-        _set_col_widths(volt_harm_tbl, [2.0, 3.5, 3.5, 3.5, 3.5])
-        for cell, text in zip(volt_harm_tbl.rows[0].cells,
-                               ["Order", "Phase A (%nom)", "Phase B (%nom)", "Phase C (%nom)", "Limit (%nom)"]):
+        _set_col_widths(volt_harm_tbl, _vcol_w)
+        _ivh_hdrs = ["Order"] + [f"{nm} (%nom)" for _, nm in _vph_names] + ["Limit (%nom)"]
+        for cell, text in zip(volt_harm_tbl.rows[0].cells, _ivh_hdrs):
             _cell_shade(cell, "E8F1FA")
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
         for h in (3, 5, 7, 11, 13):
-            if not any(ivh["phases"].get(ph, {}).get(h) for ph in ("a", "b", "c")):
+            if not any(ivh["phases"].get(ph, {}).get(h) for ph in _vph_keys):
                 continue
             row_cells = volt_harm_tbl.add_row().cells
             row_cells[0].paragraphs[0].add_run(f"H{h}").font.size = Pt(9)
             limit_shown = False
             any_fail = False
-            for j, ph in enumerate(("a", "b", "c")):
+            for j, ph in enumerate(_vph_keys):
                 r = ivh["phases"].get(ph, {}).get(h)
                 if r:
                     txt = f"{r['max_pct_nom']:.2f}"
@@ -955,7 +962,7 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
                         run.font.color.rgb = _FAIL_CLR
                         any_fail = True
                     if not limit_shown:
-                        row_cells[4].paragraphs[0].add_run(f"{r['limit_pct']:.1f}").font.size = Pt(9)
+                        row_cells[_vn_cols-1].paragraphs[0].add_run(f"{r['limit_pct']:.1f}").font.size = Pt(9)
                         limit_shown = True
             if any_fail:
                 for cell in row_cells:
@@ -1077,7 +1084,7 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
 
         ph_cols = [ph for ph in ("a", "b", "c")
                    if any(ph in hs["weekly"].get(k, {}) for k in hs["weekly"])]
-        ph_labels = {"a": "Phase A", "b": "Phase B", "c": "Phase C"}
+        ph_labels = {"a": "L1", "b": "L2"} if is_split else {"a": "Phase A", "b": "Phase B", "c": "Phase C"}
         stat_orders = [("h3", "H3"), ("h5", "H5"), ("h7", "H7"),
                        ("h9", "H9"), ("h11", "H11"), ("h13", "H13"),
                        ("h17", "H17"), ("h19", "H19"), ("h23", "H23"), ("h25", "H25"),
