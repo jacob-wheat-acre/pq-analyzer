@@ -80,15 +80,71 @@ log = logging.getLogger("pq_analyzer")
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="PQDIF Power Quality Analyzer",
+        description="PQDIF Power Quality Analyzer — PSCo electric service compliance tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python pq_analyzer.py site.pqd --nominal 120
-  python pq_analyzer.py site.pqd --nominal 277 --resample 1min --outdir ./results
-  python pq_analyzer.py site.pqd --list-channels
-  python pq_analyzer.py --demo
-        """,
+STANDARDS APPLIED
+  Voltage       ANSI C84.1 Range A  (nominal ± volt-tol, default ±5%)
+  Current THD   IEEE 519-2022 TDD when --isc is provided; raw interval THD
+                fallback otherwise (light-load intervals < 10% of peak demand
+                are automatically excluded to prevent divide-by-zero blowup)
+  Power factor  PSCo Tariff R73 (Schedules C/SG, ≥ 0.90 lag) / R121 (PG)
+  Flicker       IEC 61000-3-3  (Pst ≤ 1.0, Plt ≤ 0.65)
+  Imbalance     NEMA MG1 / IEEE 112  (voltage ≤ 3%, current ≤ 10%)
+  Neutral       Split-phase only: L1+L2 sum stability, cross-leg Pearson r,
+                Vne, and coincident opposing sag/swell event detection
+
+CUSTOMER CLASSES  (--customer-class)
+  r    Residential       120 V split-phase      No PF tariff; open-neutral check active
+  c    Small Commercial  120/208 V 3-phase      Tariff R73 Schedule C
+  sg   C&I Secondary     277/480 V 3-phase      Tariff R73 Schedule SG  [default]
+  pg   C&I Primary       13,200+ V 3-phase      Tariff R121 Schedule PG
+
+IEEE 519-2022 TDD  (--isc, --transformer-kva, --service-type)
+  TDD(t) = THD%(t) × I(t) / IL   where IL = peak demand current in recording.
+  ISC/IL ratio selects the per-Table-2 TDD class limit (5 / 8 / 12 / 15 / 20%):
+
+    ISC/IL < 20   →  5%     ISC/IL < 100  → 12%     ISC/IL ≥ 1000 → 20%
+    ISC/IL < 50   →  8%     ISC/IL < 1000 → 15%
+
+  Provide --isc directly, or auto-look up from the PSCo Blue Book:
+    --transformer-kva 500 --service-type 3ph-padmount
+  Service types: 1ph-padmount, 3ph-padmount, 1ph-overhead, 3ph-overhead,
+                 network, spot-network
+
+TOPOLOGY  (--topology)
+  auto          Inferred from loaded channels: no Vcn → split-phase (default)
+  split-phase   Force single-phase 3-wire; activates neutral integrity section
+  3ph-wye       Force three-phase 4-wire
+
+OUTPUT
+  Plots (.png)  Voltage, THD, summary, harmonic spectrum, ITIC, neutral health
+  CSV           Per-interval data export alongside the plots
+  Word (.docx)  Full engineering response letter; requires --report flag
+
+EXAMPLES
+  Residential — 120 V split-phase, open-neutral check, Word report:
+    python3 pq_analyzer.py site.pqd --nominal 120 --customer-class r --report \\
+      --site-name "123 Main St" --engineer "J. Smith" --engineer-title "Area Engineer"
+
+  Small commercial — Blue Book ISC auto-lookup, 150 kVA padmount:
+    python3 pq_analyzer.py site.pqd --nominal 120 --customer-class c \\
+      --transformer-kva 150 --service-type 3ph-padmount --report
+
+  C&I Secondary — 480 V, manual ISC, transformer loading check:
+    python3 pq_analyzer.py site.pqd --nominal 277 --customer-class sg \\
+      --isc 10000 --transformer-kva 1000 --report
+
+  C&I Primary — 13.2 kV, typical 5 kA fault current:
+    python3 pq_analyzer.py site.pqd --nominal 13200 --customer-class pg \\
+      --isc 5000 --report
+
+  Debug channel mapping (use before analysis if channels are missing):
+    python3 pq_analyzer.py site.pqd --list-channels
+
+  Demo mode (synthetic data, no file required):
+    python3 pq_analyzer.py --demo --nominal 277 --customer-class sg
+""",
     )
     p.add_argument("filepath", nargs="?", help="Path to .pqd PQDIF file")
     p.add_argument("--demo",          action="store_true", help="Run with synthetic demo data")
