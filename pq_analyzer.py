@@ -20,6 +20,7 @@ from pathlib import Path
 
 # ── Re-export symbols that run.py imports from this module ───────────────────
 from pq_constants import (
+    __version__,
     Thresholds,
     _BLUE_BOOK_ISC,
     _SERVICE_TYPE_LABEL,
@@ -80,7 +81,7 @@ log = logging.getLogger("pq_analyzer")
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="PQDIF Power Quality Analyzer — PSCo electric service compliance tool",
+        description=f"PQDIF Power Quality Analyzer v{__version__} — PSCo electric service compliance tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 STANDARDS APPLIED
@@ -146,6 +147,7 @@ EXAMPLES
     python3 pq_analyzer.py --demo --nominal 277 --customer-class sg
 """,
     )
+    p.add_argument("--version", action="version", version=f"pq-analyzer {__version__}")
     p.add_argument("filepath", nargs="?", help="Path to .pqd PQDIF file")
     p.add_argument("--demo",          action="store_true", help="Run with synthetic demo data")
     p.add_argument("--list-channels", action="store_true", help="Print all channels and exit")

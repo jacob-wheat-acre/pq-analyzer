@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from pq_constants import (
+    __version__,
     Thresholds,
     _H519_ORDERS,
     _SERVICE_TYPE_LABEL,
@@ -176,7 +177,7 @@ def print_report(report: dict) -> None:
     """Print a human-readable summary to stdout."""
     sep = "─" * 60
     print(f"\n{'═'*60}")
-    print("  POWER QUALITY ANALYSIS SUMMARY")
+    print(f"  POWER QUALITY ANALYSIS SUMMARY  (pq-analyzer v{__version__})")
     print(f"{'═'*60}")
     fs = report["file_summary"]
     print(f"  Period : {fs['start_time']}  →  {fs['end_time']}")
@@ -1647,11 +1648,20 @@ def generate_word_report(
     df: Optional[pd.DataFrame] = ds.df if ds is not None else None
     doc = _DocxDocument()
 
+    import datetime
     for section in doc.sections:
         section.top_margin    = Cm(2.0)
         section.bottom_margin = Cm(2.0)
         section.left_margin   = Cm(2.5)
         section.right_margin  = Cm(2.5)
+        footer_para = section.footer.paragraphs[0]
+        footer_para.clear()
+        footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = footer_para.add_run(
+            f"pq-analyzer v{__version__}  |  Generated {datetime.date.today()}"
+        )
+        run.font.size = Pt(8)
+        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
 
     fs         = report["file_summary"]
     nominal_v  = thresh.nominal_voltage
