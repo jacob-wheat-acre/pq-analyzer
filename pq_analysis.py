@@ -1932,8 +1932,10 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
     if "transformer" in dem and ih.get("available") and il_amps > 0:
         tx      = dem["transformer"]
         pct_tx  = tx.get("pct_nameplate", 0)
-        # Prefer meter-measured K-factor (includes all H1-H51) over estimated value
-        if "kfactor_meter" in df.columns:
+        # Prefer meter-measured K-factor (includes all H1-H51) over estimated value --
+        # but only when the channel actually has valid data, otherwise fall through
+        # to the estimated branch instead of silently losing this finding to a NaN.
+        if "kfactor_meter" in df.columns and df["kfactor_meter"].notna().any():
             k_factor = float(df["kfactor_meter"].median())
             k_source = "meter"
         else:

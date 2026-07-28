@@ -1299,7 +1299,11 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
         ).runs[0].font.size = Pt(8)
 
     spec_img = outdir / "harmonic_spectrum.png"
-    has_kfactor = df is not None and "kfactor_meter" in df.columns
+    has_kfactor = (
+        df is not None
+        and "kfactor_meter" in df.columns
+        and df["kfactor_meter"].notna().any()
+    )
     if spec_img.exists() or has_kfactor:
         _section_heading(doc, "Spectrum & Transformer Impact", level=2)
 
