@@ -889,11 +889,33 @@ class ProntoAdapter:
         ts_count_raw = struct.unpack_from('<I', interval_body, ts_abs)[0]
         data_rel = self._V2_TS_REL + 4 + ts_count_raw * 8 + 32
 
+        # Structural diagnostics only -- byte offsets and counts, never any
+        # measured value. If every channel on a file comes back empty (see the
+        # all-columns-NaN guard in extract_dataframe), these are the numbers
+        # that pin down where the per-file layout assumption broke: data_rel is
+        # computed once here and reused for every channel via read_v2() below,
+        # so a wrong value here explains a total (not per-channel) failure.
+        log.info(
+            "ProntoAdapter v2 structure: label_length=%d entry_start=%d ch0_abs=%d "
+            "ts_abs=%d ts_count_raw=%d data_rel=%d body_len=%d",
+            label_length, entry_start, ch0_abs, ts_abs, ts_count_raw, data_rel,
+            len(interval_body),
+        )
+
+        _logged_channels: Set[int] = set()
+
         def read_v2(ci: int) -> np.ndarray:
             pos = entry_start + ci * self._V2_ENTRY_SIZE + self._V2_BODY_OFF_REL
             ch_abs = struct.unpack_from('<I', interval_body, pos)[0]
             data_abs = ch_abs + data_rel
             count = struct.unpack_from('<I', interval_body, data_abs)[0]
+            if ci < 5 and ci not in _logged_channels:
+                _logged_channels.add(ci)
+                log.info(
+                    "ProntoAdapter v2 channel %d: ch_abs=%d data_abs=%d count=%d "
+                    "(valid range is 1-15000; outside that -> treated as empty)",
+                    ci, ch_abs, data_abs, count,
+                )
             if count == 0 or count > 15_000:
                 return np.array([np.nan])
             raw = np.frombuffer(
@@ -1712,4 +1734,25 @@ def extract_dataframe(
         df.index[0] if len(df) else "–",
         df.index[-1] if len(df) else "–",
     )
+
+    # Channel labels can resolve correctly (so they show up as "matched" above)
+    # while the underlying binary data pointer for every single channel is
+    # broken for this file -- e.g. a per-file offset the adapter computes once
+    # and reuses for every channel lookup. That produces a DataFrame with the
+    # right shape and column names but zero real data anywhere, which would
+    # otherwise sail through as a "successful" analysis with N/A everywhere
+    # and no indication that nothing was actually read. Fail loudly instead.
+    if len(df.columns) > 0:
+        empty_cols = [c for c in df.columns if df[c].notna().sum() == 0]
+        frac_empty = len(empty_cols) / len(df.columns)
+        if frac_empty >= 0.9:
+            raise ValueError(
+                f"{len(empty_cols)}/{len(df.columns)} matched channels have zero valid "
+                "samples -- channel labels resolved correctly but no underlying data was "
+                "read for any of them. This points at a per-file binary offset the adapter "
+                "computed incorrectly for this specific file's export format, not a missing "
+                "or corrupt individual channel. Re-export this file if possible, or report it "
+                "as a new Pronto format variant needing adapter support."
+            )
+
     return df
