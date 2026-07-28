@@ -915,12 +915,34 @@ class ProntoAdapter:
             # filtering on ci itself never fires. This is what should have been
             # logged last time.
             if _logged_call_count[0] < 5:
+                first_call = _logged_call_count[0] == 0
                 _logged_call_count[0] += 1
                 log.info(
                     "ProntoAdapter v2 channel ci=%d: ch_abs=%d data_abs=%d count=%d "
                     "(valid range is 1-15000; outside that -> treated as empty)",
                     ci, ch_abs, data_abs, count,
                 )
+                if first_call:
+                    # data_abs is landing on a duplicate of ts_count_raw instead of
+                    # this channel's own value-count field -- the gap formula is off
+                    # by some fixed number of bytes. Search nearby 4-byte-aligned
+                    # positions for a value that looks like a real value-count
+                    # (close to the known row count) rather than guess at the
+                    # correct constant. Byte offsets and small integers only --
+                    # never any measured reading.
+                    window = 1200
+                    lo = max(0, data_abs - window)
+                    hi = min(len(interval_body) - 4, data_abs + window)
+                    candidates = []
+                    for off in range(lo, hi + 1, 4):
+                        v = struct.unpack_from('<I', interval_body, off)[0]
+                        if 1 <= v <= 25_000:
+                            candidates.append((off - data_abs, v))
+                    log.info(
+                        "ProntoAdapter v2 window scan around ci=%d data_abs (±%d bytes, "
+                        "4-byte aligned), plausible count-like values found: %s",
+                        ci, window, candidates,
+                    )
             if count == 0 or count > 15_000:
                 return np.array([np.nan])
             raw = np.frombuffer(
