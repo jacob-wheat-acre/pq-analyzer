@@ -515,6 +515,83 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
     }
 
 
+def check_spectral_shape(df: pd.DataFrame, thresh: Thresholds, source_harm: dict) -> dict:
+    """Single-visit classification: does the measured voltage harmonic spectrum look
+    like broadband, multi-source injection (elevated and flat across many orders) or
+    a narrowband condition (concentrated at one or two orders)?
+
+    IMPORTANT: this classifies the spectral *shape* of this one recording. It is not
+    a trend measurement and does not claim distortion is "rising" over time -- that
+    would require comparing this result against repeat visits to the same site over
+    months or years, which is out of scope here.
+
+    Two conditions must both hold to classify as "broadband_consistent":
+      1. Elevation: mean voltage THD is a meaningful fraction of the IEEE 519 limit
+         (thresh.spectral_elevation_ratio), not just noise-level distortion.
+      2. Flatness: the per-order voltage harmonic spectrum (H3, H5, H7, H11, H13) has
+         a low coefficient of variation (thresh.spectral_flatness_cv) -- no single
+         order dominates.
+
+    Never returns "broadband_consistent" when check_harmonic_sources already flagged
+    a resonance_suspect order at this site -- the two checks are complementary
+    (narrowband vs. broadband explanations), not competing votes on the same finding.
+    """
+    _ORDERS = (3, 5, 7, 11, 13)
+    v_cols_by_order = {
+        h: [c for c in (f"h{h}_voltage_a", f"h{h}_voltage_b", f"h{h}_voltage_c") if c in df.columns]
+        for h in _ORDERS
+    }
+    available_orders = [h for h in _ORDERS if v_cols_by_order[h]]
+    if len(available_orders) < 3:
+        return {
+            "available": False,
+            "error": "Need at least 3 harmonic voltage orders for spectral shape classification.",
+        }
+
+    order_means = {h: float(df[v_cols_by_order[h]].values.mean()) for h in available_orders}
+    spectrum = np.array([order_means[h] for h in available_orders])
+    if not np.isfinite(spectrum).all() or spectrum.mean() <= 0:
+        return {"available": False, "error": "No measurable harmonic voltage content."}
+
+    cv = float(np.std(spectrum) / np.mean(spectrum))
+
+    thd_v_cols = [c for c in ("thd_voltage_a", "thd_voltage_b", "thd_voltage_c") if c in df.columns]
+    if not thd_v_cols:
+        return {"available": False, "error": "No thd_voltage channel available for elevation check."}
+    mean_vthd_pct = float(df[thd_v_cols].values.mean())
+    elevation_ratio = (
+        round(mean_vthd_pct / thresh.thd_voltage_limit, 2) if thresh.thd_voltage_limit else None
+    )
+
+    is_elevated  = elevation_ratio is not None and elevation_ratio >= thresh.spectral_elevation_ratio
+    is_flat      = cv < thresh.spectral_flatness_cv
+    has_resonance = bool(source_harm.get("available") and source_harm.get("resonant_orders"))
+
+    if has_resonance:
+        classification = "resonance_present"
+    elif is_elevated and is_flat:
+        classification = "broadband_consistent"
+    elif is_elevated and not is_flat:
+        classification = "elevated_uneven"
+    else:
+        classification = "not_elevated"
+
+    return {
+        "available":        True,
+        "mean_vthd_pct":    round(mean_vthd_pct, 2),
+        "elevation_ratio":  elevation_ratio,
+        "flatness_cv":      round(cv, 3),
+        "order_means_v":    {h: round(order_means[h], 3) for h in available_orders},
+        "classification":   classification,
+        "note": (
+            "Single-visit spectral-shape classification, not a measured trend. "
+            "'broadband_consistent' means this recording's shape is consistent with many "
+            "small distributed sources (DER, EV chargers, LED drivers, etc.) rather than "
+            "one dominant order -- it is not evidence that distortion is increasing over time."
+        ),
+    }
+
+
 def check_individual_voltage_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """IEEE 519-2022 Table 1 per-order voltage harmonic check.
 
@@ -743,6 +820,14 @@ def check_voltage_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
         }
 
     vdf = df[v_cols].dropna()
+    if vdf.empty:
+        return {
+            "available":            False,
+            "error":                "No intervals with all voltage phases present simultaneously.",
+            "pct_exceeding":        None,
+            "violation_timestamps": pd.DatetimeIndex([]),
+        }
+
     avg  = vdf.mean(axis=1)
     dev  = (vdf.subtract(avg, axis=0)).abs().max(axis=1)
     imbalance = np.where(avg > 0, dev / avg * 100, np.nan)
@@ -778,6 +863,14 @@ def check_current_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
         }
 
     idf = df[i_cols].dropna()
+    if idf.empty:
+        return {
+            "available":            False,
+            "error":                "No intervals with all current phases present simultaneously.",
+            "pct_exceeding":        None,
+            "violation_timestamps": pd.DatetimeIndex([]),
+        }
+
     avg = idf.mean(axis=1)
     dev = idf.subtract(avg, axis=0).abs().max(axis=1)
     # Skip rows where average current is negligible (avoids divide-near-zero noise)
@@ -797,14 +890,20 @@ def check_current_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
 
     if "current_neutral" in df.columns:
         In = df["current_neutral"].dropna()
-        avg_phase = avg.reindex(In.index)
-        in_pct = np.where(avg_phase > 1.0, In.values / avg_phase.values * 100, np.nan)
-        result["neutral_current"] = {
-            "mean_amps":            round(float(In.mean()), 1),
-            "max_amps":             round(float(In.max()), 1),
-            "mean_pct_of_phase":    round(float(np.nanmean(in_pct)), 1),
-            "max_pct_of_phase":     round(float(np.nanmax(in_pct)), 1),
-        }
+        if not In.empty:
+            avg_phase = avg.reindex(In.index)
+            in_pct = np.where(avg_phase > 1.0, In.values / avg_phase.values * 100, np.nan)
+            # Only report phase-relative neutral stats when at least one interval
+            # had a valid (non-negligible) phase average to compute a % against —
+            # downstream consumers assume these fields are always real floats,
+            # never None, whenever "neutral_current" is present at all.
+            if np.isfinite(in_pct).any():
+                result["neutral_current"] = {
+                    "mean_amps":            round(float(In.mean()), 1),
+                    "max_amps":             round(float(In.max()), 1),
+                    "mean_pct_of_phase":    round(float(np.nanmean(in_pct)), 1),
+                    "max_pct_of_phase":     round(float(np.nanmax(in_pct)), 1),
+                }
 
     return result
 
@@ -1342,14 +1441,24 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float) -> List[dict]:
         if sim < 0.75:
             break
         conf = "high" if sim >= 0.95 else ("medium" if sim >= 0.85 else "low")
+        # Only the top match restates the full measured spectrum -- the runner-up
+        # candidates are scored against that same spectrum, so repeating it verbatim
+        # in every finding just triplicates the same block of text in the report.
+        if rank == 0:
+            finding_text = (
+                f"Spectral similarity {sim:.0%}. Measured spectrum: {spectrum_str}. "
+                f"H5/H7={h5_h7:.2f}, H3/H5={h3_h5:.2f}, H5 variability (CV)={h5_cv:.2f}."
+            )
+        else:
+            finding_text = (
+                f"Spectral similarity {sim:.0%} against the same measured spectrum "
+                f"reported in the best-match finding above."
+            )
         findings.append({
             "category":       "harmonics",
             "severity":       "info",
             "title":          f"{rank_labels[rank]}: {sig['title']}",
-            "finding":        (
-                f"Spectral similarity {sim:.0%}. Measured spectrum: {spectrum_str}. "
-                f"H5/H7={h5_h7:.2f}, H3/H5={h3_h5:.2f}, H5 variability (CV)={h5_cv:.2f}."
-            ),
+            "finding":        finding_text,
             "cause":          sig["cause"],
             "responsibility": sig["responsibility"],
             "recommendation": sig["recommendation"],
@@ -1512,9 +1621,9 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "category":       "imbalance",
                 "severity":       "warning" if in_pct > 20 else "info",
                 "title":          "Elevated neutral current",
-                "finding":        (f"Mean neutral current {nc['mean_amps']:.1f} A "
-                                   f"({in_pct:.1f}% of phase average). "
-                                   f"Peak {nc['max_amps']:.1f} A ({in_max:.1f}%)."),
+                "finding":        (f"Neutral current averages {in_pct:.1f}% of phase current, "
+                                   f"peaking at {in_max:.1f}% (see Voltage and Current Imbalance "
+                                   f"above for measured amps)."),
                 "cause":          cause_text,
                 "responsibility": "customer",
                 "recommendation": rec_text,

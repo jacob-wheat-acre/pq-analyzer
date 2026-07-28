@@ -21,6 +21,10 @@ class Thresholds:
     isc_source: Optional[str] = None     # human-readable note on how ISC was determined
     transformer_kva: Optional[float] = None  # service transformer nameplate (kVA)
     customer_class: str = "sg"            # "r" | "c" | "sg" | "pg"  (PSCo tariff schedules)
+    # Spectral-shape ("broadband vs. resonance") classifier -- heuristic starting
+    # points, not yet empirically validated across many sites. See check_spectral_shape().
+    spectral_elevation_ratio: float = 0.4  # mean VTHD / thd_voltage_limit above this = "elevated"
+    spectral_flatness_cv: float = 0.6      # per-order spectrum CV below this = "flat" (broadband-like)
 
 
 # IEEE 519-2022 Table 2: TDD limits indexed by ISC/IL ratio

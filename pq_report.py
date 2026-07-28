@@ -110,6 +110,7 @@ def generate_report(
     event_result: dict,
     thresh: Thresholds,
     neutral_health_result: Optional[dict] = None,
+    spectral_shape_result: Optional[dict] = None,
 ) -> dict:
     """Compile all analysis results into a structured summary dictionary."""
     df = ds.df
@@ -141,6 +142,7 @@ def generate_report(
         "individual_voltage_harmonics": volt_harm_result,
         "neutral_harmonics":            neutral_harm_result,
         "harmonic_sources":             source_harm_result,
+        "spectral_shape":               spectral_shape_result or {"available": False},
         "harmonic_statistics":          stat_result,
         "events":                       event_result,
         "neutral_health":               neutral_health_result or {"available": False, "reason": "not run"},
@@ -356,6 +358,22 @@ def print_report(report: dict) -> None:
             corr_s  = f"{od['corr']:.2f}"     if od["corr"]    is not None else "   n/a"
             print(f"  H{h:<5}  {od['z_ohm']:>8.4f}  {ratio_s:>8}  {corr_s:>10}  {od['attribution']}")
 
+    # ── Spectral shape (broadband vs. resonance classification) ───────────────
+    ss = report.get("spectral_shape", {})
+    if ss.get("available"):
+        print(f"\n{sep}")
+        print("  SPECTRAL SHAPE (single-visit classification, not a trend)")
+        class_labels = {
+            "broadband_consistent": "Broadband-consistent (elevated, flat across orders)",
+            "resonance_present":    "Resonance present (see source attribution above)",
+            "elevated_uneven":      "Elevated but concentrated (no order flagged resonant)",
+            "not_elevated":         "Not meaningfully elevated",
+        }
+        cls = ss.get("classification")
+        print(f"  Classification: {class_labels.get(cls, cls)}")
+        print(f"  Mean VTHD: {ss['mean_vthd_pct']:.2f}%  |  Elevation ratio: {ss['elevation_ratio']}  |  "
+              f"Flatness CV: {ss['flatness_cv']}")
+
     # ── Neutral health ────────────────────────────────────────────────────────
     nh = report.get("neutral_health", {})
     if nh.get("available"):
@@ -470,13 +488,46 @@ def export_results(
 # 8c. WORD REPORT GENERATOR — private section helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _section_heading(doc, title: str) -> None:
-    p = doc.add_paragraph()
-    _bold(p, title, color=_XE_BLUE, size_pt=11)
+def _section_heading(doc, title: str, level: int = 1):
+    """Real Word heading (level 1 or 2) so Word's navigation pane and an
+    auto-generated table of contents both work — not just a bolded paragraph."""
+    heading = doc.add_heading(title, level=level)
+    for run in heading.runs:
+        run.font.color.rgb = _XE_BLUE if level == 1 else _XE_LBLUE
+    return heading
 
 
 def _body(doc, text: str) -> None:
     doc.add_paragraph(text)
+
+
+def _add_toc(doc) -> None:
+    """Insert a TOC field (levels 1-2) that Word populates automatically on open."""
+    _section_heading(doc, "Table of Contents", level=1)
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    fld_begin = OxmlElement('w:fldChar')
+    fld_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText')
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = 'TOC \\o "1-2" \\h \\z \\u'
+    fld_sep = OxmlElement('w:fldChar')
+    fld_sep.set(qn('w:fldCharType'), 'separate')
+    placeholder = OxmlElement('w:t')
+    placeholder.text = "Right-click and choose \"Update Field\" to generate the table of contents."
+    fld_end = OxmlElement('w:fldChar')
+    fld_end.set(qn('w:fldCharType'), 'end')
+    for el in (fld_begin, instr, fld_sep, placeholder, fld_end):
+        run._r.append(el)
+
+    # Force Word to prompt/auto-refresh all fields (including this TOC) on open,
+    # so the reader doesn't have to manually right-click → Update Field.
+    settings_el = doc.settings.element
+    update_fields = OxmlElement('w:updateFields')
+    update_fields.set(qn('w:val'), 'true')
+    settings_el.append(update_fields)
+
+    doc.add_page_break()
 
 
 def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, substation,
@@ -527,8 +578,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     hs   = report.get("harmonic_statistics", {})
     tdd_info = thd.get("tdd_info", {})
 
-    hdr_p = doc.add_paragraph()
-    _bold(hdr_p, "Compliance Summary", color=_XE_BLUE, size_pt=12)
+    _section_heading(doc, "Compliance Summary", level=1)
 
     tbl = doc.add_table(rows=1, cols=3)
     tbl.style = 'Table Grid'
@@ -830,13 +880,15 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
     ivh      = report.get("individual_voltage_harmonics", {})
     nh       = report.get("neutral_harmonics", {})
     sh       = report.get("harmonic_sources", {})
+    ss       = report.get("spectral_shape", {})
     hs       = report.get("harmonic_statistics", {})
     dem      = report["demand"]
     tdd_info = thd.get("tdd_info", {})
     c_thd    = thd["current"]
     is_split = "voltage_c" not in report.get("file_summary", {}).get("channels", [])
 
-    _section_heading(doc, "Harmonics (IEEE 519-2022)")
+    _section_heading(doc, "Harmonics (IEEE 519-2022)", level=1)
+    _section_heading(doc, "Compliance", level=2)
     if tdd_info:
         _body(doc,
             f"The available short-circuit current at the point of delivery is {tdd_info['isc_amps']:,.0f} A "
@@ -986,6 +1038,9 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
                 for cell in row_cells:
                     _cell_shade(cell, "FFF0F0")
 
+    if nh.get("available") or sh.get("available") or ss.get("available"):
+        _section_heading(doc, "Source Diagnostics", level=2)
+
     # ── Neutral harmonic content (informational) ──────────────────────────────
     if nh.get("available"):
         doc.add_paragraph()
@@ -1086,11 +1141,29 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
                 for cell in row_cells:
                     _cell_shade(cell, "FFF0F0")
 
+    # ── Spectral shape (broadband vs. resonance classification) ───────────────
+    if ss.get("available"):
+        doc.add_paragraph()
+        ss_hdr = doc.add_paragraph()
+        _bold(ss_hdr, "Spectral Shape Classification", size_pt=10)
+        class_labels = {
+            "broadband_consistent": "Broadband-consistent — elevated and flat across orders",
+            "resonance_present":    "Resonance present — see Harmonic Source Attribution above",
+            "elevated_uneven":      "Elevated but concentrated — no order flagged as resonant",
+            "not_elevated":         "Not meaningfully elevated",
+        }
+        cls = ss.get("classification")
+        elev_ratio = ss.get("elevation_ratio")
+        elev_str = f"{elev_ratio:.0%} of the {thresh.thd_voltage_limit:.0f}% IEEE 519 limit" if elev_ratio is not None else "limit not configured"
+        doc.add_paragraph(
+            f"{class_labels.get(cls, cls)}. Mean voltage THD {ss['mean_vthd_pct']:.2f}% "
+            f"({elev_str}), per-order spectrum coefficient of variation {ss['flatness_cv']:.2f}. "
+            f"{ss['note']}"
+        )
+
     # ── IEEE 519-2022 Clause 5 statistical compliance tables ──────────────────
     if hs.get("available"):
-        doc.add_paragraph()
-        _bold(doc.add_paragraph(),
-              "Statistical Harmonic Compliance — IEEE 519-2022 Clause 5", size_pt=10)
+        _section_heading(doc, "Statistical Compliance (IEEE 519-2022 Clause 5)", level=2)
         doc.add_paragraph(
             f"Percentiles computed over the {hs['period_days']:.1f}-day recording period "
             f"(ISC/IL = {hs['isc_il_ratio']:.0f}, class {hs['isc_class']}). "
@@ -1225,18 +1298,20 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
             "that may not capture sub-minute harmonic peaks."
         ).runs[0].font.size = Pt(8)
 
-    # Harmonic spectrum chart
     spec_img = outdir / "harmonic_spectrum.png"
+    has_kfactor = df is not None and "kfactor_meter" in df.columns
+    if spec_img.exists() or has_kfactor:
+        _section_heading(doc, "Spectrum & Transformer Impact", level=2)
+
+    # Harmonic spectrum chart
     if spec_img.exists():
-        doc.add_paragraph()
         ih_chart_hdr = doc.add_paragraph()
         _bold(ih_chart_hdr, "Current Harmonic Spectrum (Median over Recording Period)", size_pt=10)
         doc.add_picture(str(spec_img), width=Cm(15))
 
     # K-factor section
-    if df is not None and "kfactor_meter" in df.columns:
+    if has_kfactor:
         doc.add_paragraph()
-        _section_heading(doc, "Transformer K-Factor")
         kf_med  = float(df["kfactor_meter"].median())
         kf_max  = float(df["kfactor_meter"].max())
         kf_min  = float(df["kfactor_meter"].min())
@@ -1683,6 +1758,8 @@ def generate_word_report(
         "standard. Sections where the standard is not met are discussed in detail."
     )
     doc.add_paragraph()
+
+    _add_toc(doc)
 
     _word_compliance_table(doc, report, thresh, df)
     _word_demand(doc, report, thresh)

@@ -71,6 +71,7 @@ try:
         check_individual_voltage_harmonics,
         check_neutral_harmonics,
         check_harmonic_sources,
+        check_spectral_shape,
         check_harmonic_statistics,
         detect_events,
         analyze_root_causes,
@@ -770,7 +771,8 @@ class PQApp(tk.Tk):
         harm_result         = check_individual_harmonics(df, thresh)
         volt_harm_result    = check_individual_voltage_harmonics(df, thresh)
         neutral_harm_result = check_neutral_harmonics(df, thresh)
-        source_harm_result  = check_harmonic_sources(df, thresh)
+        source_harm_result   = check_harmonic_sources(df, thresh)
+        spectral_shape_result = check_spectral_shape(df, thresh, source_harm_result)
         stat_result         = check_harmonic_statistics(df, thresh)
         event_result        = detect_events(ds, thresh)
 
@@ -779,6 +781,7 @@ class PQApp(tk.Tk):
             imb_result, curr_imb_result, demand_result,
             harm_result, volt_harm_result, neutral_harm_result,
             source_harm_result, stat_result, event_result, thresh,
+            spectral_shape_result=spectral_shape_result,
         )
         report["root_causes"] = analyze_root_causes(report, ds, thresh)
 
