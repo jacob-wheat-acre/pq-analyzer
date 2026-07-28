@@ -59,6 +59,7 @@ def check_voltage_compliance(
         "nominal_v":              thresh.nominal_voltage,
         "range_v":                (vmin, vmax),
         "phases":                 {},
+        "phases_missing_data":    [],
         "violation_timestamps":   pd.DatetimeIndex([]),
     }
 
@@ -66,7 +67,13 @@ def check_voltage_compliance(
     for col in v_cols:
         if col not in df.columns:
             continue
-        s    = df[col].dropna()
+        s = df[col].dropna()
+        if s.empty:
+            # Column present but no usable samples -- don't silently fold this
+            # phase into "no violations found" (it means "not measured", not
+            # "compliant"). Track it so the report can say so explicitly.
+            result["phases_missing_data"].append(col)
+            continue
         smin = df[f"{col}_min"].reindex(s.index).fillna(s)  if f"{col}_min"  in df.columns else s
         smax = df[f"{col}_peak"].reindex(s.index).fillna(s) if f"{col}_peak" in df.columns else s
         under = smin < vmin
@@ -82,6 +89,15 @@ def check_voltage_compliance(
             "mean_v":            float(s.mean()),
             "used_interval_extremes": smin is not s,
         }
+
+    if not result["phases"]:
+        # Every phase came back empty -- there's nothing to report a pass/fail on.
+        # available=False (not True) so pass_fail correctly resolves to None/N/A
+        # instead of a comparison against None silently reading as "failed".
+        result["available"] = False
+        result["error"] = "Voltage channels present but no phase had usable samples."
+        result["total_pct_out_of_bounds"] = None
+        return result
 
     result["violation_timestamps"] = df.index[all_violations]
     result["total_pct_out_of_bounds"] = float(all_violations.mean() * 100)
@@ -144,16 +160,22 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                   if c in df.columns]
     if v_thd_cols:
         worst = df[v_thd_cols].max(axis=1).dropna()
-        exceed = worst > thresh.thd_voltage_limit
-        result["voltage"] = {
-            "available":        True,
-            "limit_pct":        thresh.thd_voltage_limit,
-            "max_thd_pct":      float(worst.max()),
-            "mean_thd_pct":     float(worst.mean()),
-            "pct_exceeding":    float(exceed.mean() * 100),
-            "violation_timestamps": worst.index[exceed].tolist(),
-        }
-        result["available"] = True
+        if worst.empty:
+            result["voltage"] = {
+                "available": False,
+                "error": "Voltage THD channel(s) present but no usable samples.",
+            }
+        else:
+            exceed = worst > thresh.thd_voltage_limit
+            result["voltage"] = {
+                "available":        True,
+                "limit_pct":        thresh.thd_voltage_limit,
+                "max_thd_pct":      float(worst.max()),
+                "mean_thd_pct":     float(worst.mean()),
+                "pct_exceeding":    float(exceed.mean() * 100),
+                "violation_timestamps": worst.index[exceed].tolist(),
+            }
+            result["available"] = True
 
     # ── Current TDD (or THD fallback) ─────────────────────────────────────────
     i_thd_cols = [c for c in ["thd_current_a", "thd_current_b", "thd_current_c"]
@@ -186,36 +208,43 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                     light_load_filtered = True
             metric = "thd"
 
-        exceed = worst > current_limit
-        result["current"] = {
-            "available":              True,
-            "metric":                 metric,
-            "limit_pct":              current_limit,
-            "max_thd_pct":            float(worst.max()),
-            "mean_thd_pct":           float(worst.mean()),
-            "pct_exceeding":          float(exceed.mean() * 100),
-            "light_load_filtered":    light_load_filtered if not use_tdd else False,
-            "violation_timestamps":   worst.index[exceed].tolist(),
-        }
-        result["available"] = True
+        if worst.empty:
+            result["current"] = {
+                "available": False,
+                "error": "Current THD/TDD channel(s) present but no usable samples.",
+            }
+        else:
+            exceed = worst > current_limit
+            result["current"] = {
+                "available":              True,
+                "metric":                 metric,
+                "limit_pct":              current_limit,
+                "max_thd_pct":            float(worst.max()),
+                "mean_thd_pct":           float(worst.mean()),
+                "pct_exceeding":          float(exceed.mean() * 100),
+                "light_load_filtered":    light_load_filtered if not use_tdd else False,
+                "violation_timestamps":   worst.index[exceed].tolist(),
+            }
+            result["available"] = True
 
-        # Peak TDD — uses per-interval maximum THD from obs[24] if available
-        pk_thd_cols = [f"{c}_peak" for c in i_thd_cols if f"{c}_peak" in df.columns]
-        if pk_thd_cols and use_tdd and il_amps:
-            pk_tdd_series: List[pd.Series] = []
-            for col in pk_thd_cols:
-                base_col = col.replace("_peak", "")
-                phase    = base_col[-1]
-                i_col    = f"current_{phase}"
-                aligned  = df[[col, i_col]].dropna() if i_col in df.columns else None
-                if aligned is not None and len(aligned):
-                    pk_tdd_series.append(aligned[col] * aligned[i_col] / il_amps)
-                else:
-                    pk_tdd_series.append(df[col].dropna())
-            pk_worst  = pd.concat(pk_tdd_series, axis=1).max(axis=1).dropna()
-            pk_exceed = pk_worst > current_limit
-            result["current"]["peak_max_tdd_pct"]   = round(float(pk_worst.max()), 2)
-            result["current"]["peak_pct_exceeding"] = round(float(pk_exceed.mean() * 100), 2)
+            # Peak TDD — uses per-interval maximum THD from obs[24] if available
+            pk_thd_cols = [f"{c}_peak" for c in i_thd_cols if f"{c}_peak" in df.columns]
+            if pk_thd_cols and use_tdd and il_amps:
+                pk_tdd_series: List[pd.Series] = []
+                for col in pk_thd_cols:
+                    base_col = col.replace("_peak", "")
+                    phase    = base_col[-1]
+                    i_col    = f"current_{phase}"
+                    aligned  = df[[col, i_col]].dropna() if i_col in df.columns else None
+                    if aligned is not None and len(aligned):
+                        pk_tdd_series.append(aligned[col] * aligned[i_col] / il_amps)
+                    else:
+                        pk_tdd_series.append(df[col].dropna())
+                pk_worst  = pd.concat(pk_tdd_series, axis=1).max(axis=1).dropna()
+                if not pk_worst.empty:
+                    pk_exceed = pk_worst > current_limit
+                    result["current"]["peak_max_tdd_pct"]   = round(float(pk_worst.max()), 2)
+                    result["current"]["peak_pct_exceeding"] = round(float(pk_exceed.mean() * 100), 2)
 
     v_viol = set(result["voltage"].get("violation_timestamps", []))
     i_viol = set(result["current"].get("violation_timestamps", []))

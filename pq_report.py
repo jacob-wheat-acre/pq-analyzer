@@ -628,11 +628,15 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         phases = volt["phases"]
         worst_oob = max(v["pct_out_of_bounds"] for v in phases.values())
         rng = volt["range_v"]
+        missing = volt.get("phases_missing_data") or []
+        missing_note = (
+            f"  |  No usable data: {', '.join(missing)}" if missing else ""
+        )
         meas = (f"Range {rng[0]:.1f}–{rng[1]:.1f} V  |  "
-                f"Worst phase: {worst_oob:.2f}% intervals out of band")
+                f"Worst phase: {worst_oob:.2f}% intervals out of band{missing_note}")
         add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", meas, pf["voltage"])
     else:
-        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", "No data", None)
+        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", volt.get("error", "No data"), None)
 
     # Voltage transients / ITIC
     add_row("Voltage transients within ITIC curve", "See Pronto waveform data", None)
@@ -721,7 +725,11 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         add_row(ci_label, "No data", None)
 
     # Flicker
-    if df is not None and "flicker_pst" in df.columns and "flicker_plt" in df.columns:
+    _flicker_has_data = (
+        df is not None and "flicker_pst" in df.columns and "flicker_plt" in df.columns
+        and df["flicker_pst"].notna().any() and df["flicker_plt"].notna().any()
+    )
+    if _flicker_has_data:
         pst_max = float(df["flicker_pst"].max())
         plt_max = float(df["flicker_plt"].max())
         pst_pass = pst_max <= 1.0
@@ -833,6 +841,12 @@ def _word_voltage(doc, report) -> None:
     _section_heading(doc, "Steady-State Voltage")
     if volt["available"]:
         rng = volt["range_v"]
+        missing = volt.get("phases_missing_data") or []
+        if missing:
+            _body(doc,
+                f"No usable voltage data for: {', '.join(missing)}. "
+                "The compliance result below reflects only the phase(s) with valid data."
+            )
         all_pass = all(v["pct_out_of_bounds"] == 0 for v in volt["phases"].values())
         _used_ext = any(v.get("used_interval_extremes") for v in volt["phases"].values())
         _ext_note = " Extremes reflect within-interval min/max from the meter's max-min record." if _used_ext else ""
@@ -1357,7 +1371,11 @@ def _word_harmonics(doc, report, thresh, df, outdir) -> None:
 
 
 def _word_flicker(doc, report, df) -> None:
-    if df is not None and "flicker_pst" in df.columns and "flicker_plt" in df.columns:
+    _has_data = (
+        df is not None and "flicker_pst" in df.columns and "flicker_plt" in df.columns
+        and df["flicker_pst"].notna().any() and df["flicker_plt"].notna().any()
+    )
+    if _has_data:
         _section_heading(doc, "Voltage Flicker (IEC 61000-3-3)")
         pst_med = float(df["flicker_pst"].median())
         pst_max = float(df["flicker_pst"].max())
