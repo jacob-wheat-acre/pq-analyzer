@@ -840,8 +840,9 @@ class ProntoAdapter:
             decoded here with latin-1 as '\\xf8'.
           - 'THD Ia (I1)' / 'Hrms Ia' DS labels have swapped meanings in the
             Pronto exporter firmware; THD is computed here from the harmonic block.
-          - 'Harm 1 of Ia' (obs_ci=109 on Watkins) is the I1 fundamental in Amps,
-            consistent with measured apparent power (VA/3/Vln).
+          - 'Harm 1 of Ia' (observed at a non-trivial obs_ci, e.g. 109 on a real
+            3-phase commercial file) is the I1 fundamental in Amps, consistent
+            with measured apparent power (VA/3/Vln).
         """
         interval_body: Optional[bytes] = None
         for rec in obs_recs:
@@ -902,17 +903,21 @@ class ProntoAdapter:
             len(interval_body),
         )
 
-        _logged_channels: Set[int] = set()
+        _logged_call_count = [0]
 
         def read_v2(ci: int) -> np.ndarray:
             pos = entry_start + ci * self._V2_ENTRY_SIZE + self._V2_BODY_OFF_REL
             ch_abs = struct.unpack_from('<I', interval_body, pos)[0]
             data_abs = ch_abs + data_rel
             count = struct.unpack_from('<I', interval_body, data_abs)[0]
-            if ci < 5 and ci not in _logged_channels:
-                _logged_channels.add(ci)
+            # Log the first few *calls*, not the first few channel-index values --
+            # real channel indices (ci) are scattered (see the note above), so
+            # filtering on ci itself never fires. This is what should have been
+            # logged last time.
+            if _logged_call_count[0] < 5:
+                _logged_call_count[0] += 1
                 log.info(
-                    "ProntoAdapter v2 channel %d: ch_abs=%d data_abs=%d count=%d "
+                    "ProntoAdapter v2 channel ci=%d: ch_abs=%d data_abs=%d count=%d "
                     "(valid range is 1-15000; outside that -> treated as empty)",
                     ci, ch_abs, data_abs, count,
                 )
@@ -1061,7 +1066,7 @@ class ProntoAdapter:
         few bytes.  Each channel block also contains three separate data blobs (max, min,
         and a third section — probably per-interval average) rather than one.
 
-        Channel layout confirmed from binary inspection of a real Watkins .pqd file:
+        Channel layout confirmed from binary inspection of a real 3-phase commercial .pqd file:
           ci=0  voltage_a (Van L-N)
           ci=1  voltage_b (Vbn L-N)
           ci=2  voltage_c (Vcn L-N)

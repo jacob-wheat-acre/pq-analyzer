@@ -1,5 +1,5 @@
 """
-validate_maxmin.py — Diagnostic: verify obs[24] max-min parsing against a real Watkins .pqd file.
+validate_maxmin.py — Diagnostic: verify obs[24] max-min parsing against a real .pqd file.
 
 Usage:
     python validate_maxmin.py path/to/site.pqd
