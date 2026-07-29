@@ -891,47 +891,61 @@ class ProntoAdapter:
         data_rel = self._V2_TS_REL + 4 + ts_count_raw * 8 + 32
 
         # Self-calibrate data_rel against channel 0 rather than trust the fixed
-        # "+32" gap for every file. On at least one real file that constant put
-        # data_abs on a duplicate of ts_count_raw (identical across channels at
-        # wildly different absolute positions -- not a real per-channel value
-        # count) instead of this channel's own value-count field. If that
-        # signature shows up here, search a small nearby window for a plausible
-        # alternative -- close to the known ~ts_count_raw/2 sample count and not
-        # just another copy of ts_count_raw -- and use that for every channel
-        # in this file instead. Leaves already-working files' behavior
-        # unchanged: if the naive gap already looks right, nothing is adjusted.
-        def _read_count_at(rel: int) -> Optional[int]:
+        # "+32" gap for every file. A count that merely looks plausible is NOT
+        # enough evidence on its own -- on a real file this previously picked a
+        # position whose count passed the sanity check but whose actual value
+        # array decoded to garbage (values like 1e190, inf, deeply negative
+        # billions) and shipped a full report full of nonsense with no error
+        # at all. That's worse than failing loudly. A candidate is only
+        # accepted if the decoded values themselves are finite and within a
+        # sane physical magnitude for any real PQ quantity (V, A, %, Hz,
+        # K-factor, PF are all comfortably under 1e6).
+        _SANE_MAX_ABS = 1_000_000.0
+
+        def _try_candidate(rel: int) -> Optional[np.ndarray]:
             abs_pos = ch0_abs + rel
             if abs_pos < 0 or abs_pos + 4 > len(interval_body):
                 return None
-            return struct.unpack_from('<I', interval_body, abs_pos)[0]
+            count = struct.unpack_from('<I', interval_body, abs_pos)[0]
+            if count == ts_count_raw or not (1 <= count <= 15_000):
+                return None
+            end = abs_pos + 4 + count * 8
+            if end > len(interval_body):
+                return None
+            raw = np.frombuffer(interval_body[abs_pos + 4:end], dtype='<f8')
+            vals = raw[0::2]
+            finite = vals[np.isfinite(vals)]
+            if len(finite) == 0 or np.max(np.abs(finite)) > _SANE_MAX_ABS:
+                return None
+            return finite
 
         n_expected = ts_count_raw // 2
-        naive_count = _read_count_at(data_rel)
-        if naive_count is None or naive_count == ts_count_raw or not (1 <= naive_count <= 15_000):
+        naive_vals = _try_candidate(data_rel)
+        if naive_vals is None:
             best_rel, best_diff = None, None
-            for delta in range(-64, 65, 4):
+            for delta in range(-256, 257, 4):
                 cand_rel = data_rel + delta
-                cand = _read_count_at(cand_rel)
-                if cand is None or cand == ts_count_raw or not (1 <= cand <= 15_000):
+                vals = _try_candidate(cand_rel)
+                if vals is None:
                     continue
-                diff = abs(cand - n_expected)
+                cand_count = struct.unpack_from('<I', interval_body, ch0_abs + cand_rel)[0]
+                diff = abs(cand_count - n_expected)
                 if best_diff is None or diff < best_diff:
                     best_rel, best_diff = cand_rel, diff
             if best_rel is not None:
                 log.warning(
-                    "ProntoAdapter v2: naive data_rel=%d gave count=%s (matches ts_count_raw "
-                    "or out of range) -- recalibrated to data_rel=%d (%+d bytes) based on a "
-                    "nearby value closer to the expected ~%d samples.",
-                    data_rel, naive_count, best_rel, best_rel - data_rel, n_expected,
+                    "ProntoAdapter v2: naive data_rel=%d didn't decode to sane values -- "
+                    "recalibrated to data_rel=%d (%+d bytes) based on a nearby position whose "
+                    "decoded values are finite and physically plausible.",
+                    data_rel, best_rel, best_rel - data_rel,
                 )
                 data_rel = best_rel
             else:
-                log.warning(
-                    "ProntoAdapter v2: naive data_rel=%d gave count=%s (matches ts_count_raw "
-                    "or out of range) and no plausible alternative found within +/-64 bytes. "
-                    "Falling back to the naive value -- channels will likely come back empty.",
-                    data_rel, naive_count,
+                raise ValueError(
+                    f"ProntoAdapter v2: could not find a data_rel within +/-256 bytes that "
+                    f"decodes channel 0 to sane values (naive data_rel={data_rel}). This file's "
+                    "export layout doesn't match any offset this adapter knows how to compute -- "
+                    "needs dedicated support rather than another guessed constant."
                 )
 
         # Structural diagnostics only -- byte offsets and counts, never any
