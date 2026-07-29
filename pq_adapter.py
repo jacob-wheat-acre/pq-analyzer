@@ -890,88 +890,6 @@ class ProntoAdapter:
         ts_count_raw = struct.unpack_from('<I', interval_body, ts_abs)[0]
         data_rel = self._V2_TS_REL + 4 + ts_count_raw * 8 + 32
 
-        # Self-calibrate data_rel against channel 0 rather than trust the fixed
-        # "+32" gap for every file. A count that merely looks plausible is NOT
-        # enough evidence on its own -- on a real file this previously picked a
-        # position whose count passed the sanity check but whose actual value
-        # array decoded to garbage (values like 1e190, inf, deeply negative
-        # billions) and shipped a full report full of nonsense with no error
-        # at all. That's worse than failing loudly. A candidate is only
-        # accepted if the decoded values themselves are finite and within a
-        # sane physical magnitude for any real PQ quantity (V, A, %, Hz,
-        # K-factor, PF are all comfortably under 1e6).
-        _SANE_MAX_ABS = 1_000_000.0
-
-        def _try_candidate(rel: int) -> Optional[np.ndarray]:
-            abs_pos = ch0_abs + rel
-            if abs_pos < 0 or abs_pos + 4 > len(interval_body):
-                return None
-            count = struct.unpack_from('<I', interval_body, abs_pos)[0]
-            if count == ts_count_raw or not (1 <= count <= 15_000):
-                return None
-            end = abs_pos + 4 + count * 8
-            if end > len(interval_body):
-                return None
-            raw = np.frombuffer(interval_body[abs_pos + 4:end], dtype='<f8')
-            vals = raw[0::2]
-            finite = vals[np.isfinite(vals)]
-            if len(finite) == 0 or np.max(np.abs(finite)) > _SANE_MAX_ABS:
-                return None
-            return finite
-
-        n_expected = ts_count_raw // 2
-        naive_vals = _try_candidate(data_rel)
-        if naive_vals is None:
-            naive_count = struct.unpack_from('<I', interval_body, ch0_abs + data_rel)[0]
-            candidates: List[Tuple[int, str]] = []
-
-            # Hypothesis (preferred): naive_count == ts_count_raw means we landed
-            # on the count field of an extra same-length array this file's layout
-            # includes that the fixed "+32" doesn't know about -- e.g. a quality
-            # flag per timestamp, mirroring the confirmed multi-blob-per-channel
-            # structure of the separate obs[24] max/min record. Its length is
-            # ts_count_raw itself, a value this file already told us, not a
-            # guessed constant -- so jump past 1, then 2, then 3 such arrays.
-            # This is the fix the file's own data points to, not a local nudge.
-            if naive_count == ts_count_raw:
-                block = 4 + ts_count_raw * 8
-                for n_blocks in (1, 2, 3):
-                    candidates.append((data_rel + block * n_blocks, f"+{n_blocks} same-length array(s)"))
-
-            # Fallback: small local misalignment in the fixed trailing gap.
-            for delta in range(-256, 257, 4):
-                if delta != 0:
-                    candidates.append((data_rel + delta, f"local offset {delta:+d}"))
-
-            best_rel, best_diff, best_desc = None, None, None
-            for cand_rel, desc in candidates:
-                vals = _try_candidate(cand_rel)
-                if vals is None:
-                    continue
-                cand_count = struct.unpack_from('<I', interval_body, ch0_abs + cand_rel)[0]
-                diff = abs(cand_count - n_expected)
-                if best_diff is None or diff < best_diff:
-                    best_rel, best_diff, best_desc = cand_rel, diff, desc
-
-            if best_rel is not None:
-                log.warning(
-                    "ProntoAdapter v2: naive data_rel=%d didn't decode to sane values "
-                    "(count field read %d) -- recalibrated to data_rel=%d (%+d bytes, via %s) "
-                    "based on a position whose decoded values are finite and physically "
-                    "plausible.",
-                    data_rel, naive_count, best_rel, best_rel - data_rel, best_desc,
-                )
-                data_rel = best_rel
-            else:
-                raise ValueError(
-                    f"ProntoAdapter v2: could not find a data_rel that decodes channel 0 to "
-                    f"sane values (naive data_rel={data_rel}, count field read {naive_count}). "
-                    "Tried skipping past extra same-length arrays and a +/-256 byte local "
-                    "search. This file's export layout doesn't match any offset this adapter "
-                    "knows how to compute -- needs dedicated support rather than another "
-                    "guessed constant."
-                )
-
         # Structural diagnostics only -- byte offsets and counts, never any
         # measured value. If every channel on a file comes back empty (see the
         # all-columns-NaN guard in extract_dataframe), these are the numbers
@@ -985,6 +903,17 @@ class ProntoAdapter:
             len(interval_body),
         )
 
+        # The per-channel value count naturally equals ts_count_raw -- there's
+        # one raw sample pair per timestamp, so this is the correct, expected
+        # case, not a broken signature. The old fixed "> 15_000" ceiling here
+        # was the actual bug: it silently rejected every channel (as if empty)
+        # on any recording long enough for ts_count_raw to exceed 15,000 (e.g.
+        # a 7-day 1-minute recording lands around 20,000) while a real 4064
+        # from a ~3-day recording passed fine. Bound it against the file's own
+        # ts_count_raw instead of a flat guess -- a channel can't legitimately
+        # have more raw samples than there are timestamps.
+        _count_ceiling = ts_count_raw
+
         _logged_call_count = [0]
 
         def read_v2(ci: int) -> np.ndarray:
@@ -992,40 +921,14 @@ class ProntoAdapter:
             ch_abs = struct.unpack_from('<I', interval_body, pos)[0]
             data_abs = ch_abs + data_rel
             count = struct.unpack_from('<I', interval_body, data_abs)[0]
-            # Log the first few *calls*, not the first few channel-index values --
-            # real channel indices (ci) are scattered (see the note above), so
-            # filtering on ci itself never fires. This is what should have been
-            # logged last time.
             if _logged_call_count[0] < 5:
-                first_call = _logged_call_count[0] == 0
                 _logged_call_count[0] += 1
                 log.info(
                     "ProntoAdapter v2 channel ci=%d: ch_abs=%d data_abs=%d count=%d "
-                    "(valid range is 1-15000; outside that -> treated as empty)",
-                    ci, ch_abs, data_abs, count,
+                    "(valid range is 1-%d; outside that -> treated as empty)",
+                    ci, ch_abs, data_abs, count, _count_ceiling,
                 )
-                if first_call:
-                    # data_abs is landing on a duplicate of ts_count_raw instead of
-                    # this channel's own value-count field -- the gap formula is off
-                    # by some fixed number of bytes. Search nearby 4-byte-aligned
-                    # positions for a value that looks like a real value-count
-                    # (close to the known row count) rather than guess at the
-                    # correct constant. Byte offsets and small integers only --
-                    # never any measured reading.
-                    window = 1200
-                    lo = max(0, data_abs - window)
-                    hi = min(len(interval_body) - 4, data_abs + window)
-                    candidates = []
-                    for off in range(lo, hi + 1, 4):
-                        v = struct.unpack_from('<I', interval_body, off)[0]
-                        if 1 <= v <= 25_000:
-                            candidates.append((off - data_abs, v))
-                    log.info(
-                        "ProntoAdapter v2 window scan around ci=%d data_abs (±%d bytes, "
-                        "4-byte aligned), plausible count-like values found: %s",
-                        ci, window, candidates,
-                    )
-            if count == 0 or count > 15_000:
+            if count == 0 or count > _count_ceiling:
                 return np.array([np.nan])
             raw = np.frombuffer(
                 interval_body[data_abs + 4 : data_abs + 4 + count * 8], dtype='<f8'
