@@ -1799,6 +1799,12 @@ def generate_word_report(
     # ── Save ──────────────────────────────────────────────────────────────────
     outdir.mkdir(parents=True, exist_ok=True)
     out_path = outdir / f"{stem}_report.docx"
-    doc.save(out_path)
+    try:
+        doc.save(out_path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Could not write {out_path.name} -- it's likely still open in Word or another "
+            "program. Close that document and run the analysis again."
+        ) from exc
     log.info("Word report saved → %s", out_path)
     return out_path
