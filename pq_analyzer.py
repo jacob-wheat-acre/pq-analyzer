@@ -51,6 +51,7 @@ from pq_analysis import (
     check_harmonic_statistics,
     detect_events,
     check_neutral_health,
+    check_itic,
     analyze_root_causes,
 )
 from pq_report import (
@@ -66,6 +67,11 @@ from pq_plots import (
     plot_harmonic_spectrum,
     plot_itic,
     plot_neutral_health,
+    plot_demand_profile,
+    plot_harmonic_trend,
+    plot_imbalance,
+    plot_pf_load,
+    plot_waveform_capture,
 )
 
 logging.basicConfig(
@@ -221,7 +227,8 @@ def main():
         else:
             log.warning(
                 "No Blue Book entry for service-type=%s kVA=%.0f nominal=%.0f V. "
-                "Pass --isc manually for TDD calculation.",
+                "TDD will assume the most restrictive class; pass --isc manually "
+                "for the true class limit.",
                 svc_type, args.transformer_kva, args.nominal,
             )
 
@@ -307,6 +314,7 @@ def main():
     stat_result         = check_harmonic_statistics(df, thresh)
     event_result        = detect_events(ds, thresh)
     neutral_health_result = check_neutral_health(ds, thresh)
+    itic_result         = check_itic(event_result, thresh)
 
     # ── Compile report ────────────────────────────────────────────────────────
     report = generate_report(
@@ -316,6 +324,7 @@ def main():
         source_harm_result, stat_result, event_result, thresh,
         neutral_health_result=neutral_health_result,
         spectral_shape_result=spectral_shape_result,
+        itic_result=itic_result,
     )
     report["root_causes"] = analyze_root_causes(report, ds, thresh)
 
@@ -328,12 +337,17 @@ def main():
     # ── Plots ─────────────────────────────────────────────────────────────────
     if not args.no_plots:
         log.info("Generating plots …")
-        plot_voltage(df, volt_result, thresh, outdir=outdir)
-        plot_thd(df, thd_result, thresh, outdir=outdir)
-        plot_summary(df, imb_result, outdir=outdir)
-        plot_harmonic_spectrum(df, thresh, outdir=outdir)
-        plot_itic(event_result["events"], thresh, outdir=outdir)
-        plot_neutral_health(ds, neutral_health_result, thresh, outdir=outdir)
+        plot_voltage(df, volt_result, thresh, outdir=outdir, stem=stem)
+        plot_thd(df, thd_result, thresh, outdir=outdir, stem=stem)
+        plot_summary(df, imb_result, outdir=outdir, stem=stem)
+        plot_harmonic_spectrum(df, thresh, outdir=outdir, stem=stem)
+        plot_itic(event_result["events"], thresh, outdir=outdir, stem=stem)
+        plot_neutral_health(ds, neutral_health_result, thresh, outdir=outdir, stem=stem)
+        plot_demand_profile(df, thd_result, outdir=outdir, stem=stem)
+        plot_harmonic_trend(df, outdir=outdir, stem=stem)
+        plot_imbalance(df, imb_result, curr_imb_result, outdir=outdir, stem=stem)
+        plot_pf_load(df, pf_result, outdir=outdir, stem=stem)
+        plot_waveform_capture(ds, thresh, outdir=outdir, stem=stem)
         log.info("All plots saved to %s/", outdir)
 
     # ── Word report ───────────────────────────────────────────────────────────

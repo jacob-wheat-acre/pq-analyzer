@@ -570,43 +570,11 @@ class ProntoAdapter:
     #   Voltage AC (C=1-7) → Current AC (C=8-11) → Unbalance (C=25-28) →
     #   Power (C=20-24) → Frequency (C=29) → Harmonic Group THD (C=12-19)
     # Timestamps and data are SINGLE float64s (no quality-pair interleaving, unlike interval).
-    _ADAP_ENTRY_START = 216   # entry table offset in decompressed adaptive body
-    _ADAP_TS_REL      = 236   # ts_count u32 at ch_abs+236; ts array at ch_abs+240
-    # Voltage AC (C=1–7)
-    _ADAP_CH_VAN  =  0   # Van RMS L-N (V)
-    _ADAP_CH_VBN  =  1   # Vbn RMS L-N (V)
-    _ADAP_CH_VCN  =  2   # Vcn RMS L-N (V)
-    _ADAP_CH_VNE  =  3   # Vne neutral-to-earth RMS (V) — typically 0–0.1 V
-    _ADAP_CH_VAB  =  4   # Vab L-L (V)
-    _ADAP_CH_VBC  =  5   # Vbc L-L (V)
-    _ADAP_CH_VAC  =  6   # Vac L-L (V)
-    # Current AC (C=8–11) — event-sampled; includes pre- and post-step instants
-    _ADAP_CH_IA   =  7   # Ia RMS (A)
-    _ADAP_CH_IB   =  8   # Ib RMS (A)
-    _ADAP_CH_IC   =  9   # Ic RMS (A)
-    _ADAP_CH_IN   = 10   # In neutral RMS (A)
-    # Unbalance (C=25–28)
-    _ADAP_CH_VUNBAL  = 11   # 3φ voltage unbalance % (NEMA method)
-    _ADAP_CH_NPS_PPS = 12   # 3φ voltage NPS/PPS ratio %
-    _ADAP_CH_NPS_ANG = 13   # 3φ voltage NPS-PPS phase angle (degrees)
-    _ADAP_CH_IUNBAL  = 14   # 3φ current unbalance % (NEMA method)
-    # Power (C=20–24)
-    _ADAP_CH_KW   = 15   # 3φ 4-wire real power (W)
-    _ADAP_CH_KVAR = 16   # 3φ 4-wire reactive power (VAr)
-    _ADAP_CH_KVARF= 17   # 3φ 4-wire reactive power fundamental (VAr)
-    _ADAP_CH_KVA  = 18   # 3φ 4-wire apparent power (VA)
-    _ADAP_CH_PF   = 19   # 3φ power factor
-    # Frequency (C=29)
-    _ADAP_CH_FREQ = 20   # AC frequency (Hz)
-    # Harmonic Group THD (C=12–19; entry 24 = THD_Vne absent in this file)
-    _ADAP_CH_THD_VAN = 21   # %THD Van
-    _ADAP_CH_THD_VBN = 22   # %THD Vbn
-    _ADAP_CH_THD_VCN = 23   # %THD Vcn
-    # entry 24 = THD_Vne (C=15) — absent (gap in entry table)
-    _ADAP_CH_THD_IA  = 25   # THD Ia in absolute Aac (not %; divide by Ia_RMS for %)
-    _ADAP_CH_THD_IB  = 26   # THD Ib in absolute Aac
-    _ADAP_CH_THD_IC  = 27   # THD Ic in absolute Aac
-    # entry 28: unknown (~192 A, n=19346; possibly Ia+Ib+Ic vector sum or peak)
+    _ADAP_TS_REL = 236   # ts_count u32 at ch_abs+236; ts array at ch_abs+240
+    # Entry-table start AND channel order both vary across export versions and
+    # service topologies (split-phase vs three-phase), so both are discovered
+    # per file at load time: _scan_entry_table locates the table by pattern,
+    # and _identify_adaptive_channels assigns names by signature.
 
     def __init__(self, filepath):
         self.filepath = Path(filepath)
@@ -614,6 +582,7 @@ class ProntoAdapter:
         self._obs_ts: Optional[np.ndarray] = None
         self._obs_data: Dict[int, np.ndarray] = {}
         self._adaptive_df: Optional[pd.DataFrame] = None
+        self._waveforms: List[dict] = []
         self._load()
 
     # ── Public interface (same contract as PQDIFAdapter) ──────────────────────
@@ -631,6 +600,11 @@ class ProntoAdapter:
     def adaptive_df(self) -> Optional[pd.DataFrame]:
         """High-resolution variable-rate DataFrame from the adaptive obs record, or None."""
         return self._adaptive_df
+
+    @property
+    def waveforms(self) -> List[dict]:
+        """Decoded point-on-wave capture records (empty when absent)."""
+        return self._waveforms
 
     # ── Private ───────────────────────────────────────────────────────────────
 
@@ -1063,6 +1037,7 @@ class ProntoAdapter:
             pd.Timestamp(self._obs_ts[-1]).strftime('%Y-%m-%d %H:%M') if n else '–',
         )
         self._load_adaptive(obs_recs, base_date)
+        self._load_waveforms(obs_recs)
         self._load_v2_maxmin(obs_recs, n)
 
     def _load_v2_maxmin(self, obs_recs: List[Dict], n: int) -> None:
@@ -1229,16 +1204,24 @@ class ProntoAdapter:
         if adap_body is None:
             return
 
-        es     = self._ADAP_ENTRY_START
         ts_rel = self._ADAP_TS_REL
-        entry_sz = self._V2_ENTRY_SIZE
-        body_off = self._V2_BODY_OFF_REL
+
+        # The channel entry table's start offset drifts between Pronto export
+        # versions (216 in the original format, 224 in newer exports), so
+        # locate it by pattern instead of a fixed constant.
+        ch_offsets = self._scan_entry_table(adap_body)
+        if not ch_offsets:
+            log.warning(
+                "ProntoAdapter adaptive: could not locate channel entry table — "
+                "adaptive record skipped."
+            )
+            return
+        log.info("ProntoAdapter adaptive: entry table with %d channels", len(ch_offsets))
 
         def read_adap_ch(ci: int):
-            pos = es + ci * entry_sz + body_off
-            if pos + 4 > len(adap_body):
+            if ci >= len(ch_offsets):
                 return None, None
-            ch_abs = struct.unpack_from('<I', adap_body, pos)[0]
+            ch_abs = ch_offsets[ci]
             ts_cnt_pos = ch_abs + ts_rel
             if ts_cnt_pos + 4 > len(adap_body):
                 return None, None
@@ -1271,48 +1254,27 @@ class ProntoAdapter:
 
         base_ns = np.int64(np.datetime64(base_date.replace(tzinfo=None), 'ns').view('int64'))
 
-        def ch_series(ci: int, col: str) -> Optional[pd.Series]:
+        def ch_series(ci: int) -> Optional[pd.Series]:
             ts, vals = read_adap_ch(ci)
             if ts is None or len(ts) == 0:
                 return None
             abs_ns = (base_ns + (ts * 1e9).astype('int64')).astype('datetime64[ns]')
-            return pd.Series(vals, index=pd.DatetimeIndex(abs_ns), name=col)
+            return pd.Series(vals, index=pd.DatetimeIndex(abs_ns))
 
-        wanted = {
-            self._ADAP_CH_VAN:     'van_v',
-            self._ADAP_CH_VBN:     'vbn_v',
-            self._ADAP_CH_VCN:     'vcn_v',
-            self._ADAP_CH_VNE:     'vne_v',
-            self._ADAP_CH_VAB:     'vab_v',
-            self._ADAP_CH_VBC:     'vbc_v',
-            self._ADAP_CH_VAC:     'vac_v',
-            self._ADAP_CH_IA:      'ia_a',
-            self._ADAP_CH_IB:      'ib_a',
-            self._ADAP_CH_IC:      'ic_a',
-            self._ADAP_CH_IN:      'in_a',
-            self._ADAP_CH_VUNBAL:  'v_unbal_pct',
-            self._ADAP_CH_NPS_PPS: 'nps_pps_pct',
-            self._ADAP_CH_NPS_ANG: 'nps_ang_deg',
-            self._ADAP_CH_IUNBAL:  'i_unbal_pct',
-            self._ADAP_CH_KW:      'kw_w',
-            self._ADAP_CH_KVAR:    'kvar_var',
-            self._ADAP_CH_KVARF:   'kvarf_var',
-            self._ADAP_CH_KVA:     'kva_va',
-            self._ADAP_CH_PF:      'adap_pf',
-            self._ADAP_CH_FREQ:    'adap_freq',
-            self._ADAP_CH_THD_VAN: 'thd_van_pct',
-            self._ADAP_CH_THD_VBN: 'thd_vbn_pct',
-            self._ADAP_CH_THD_VCN: 'thd_vcn_pct',
-            self._ADAP_CH_THD_IA:  'thd_ia_aac',
-            self._ADAP_CH_THD_IB:  'thd_ib_aac',
-            self._ADAP_CH_THD_IC:  'thd_ic_aac',
-        }
-
-        series_list = [s for ci, col in wanted.items()
-                       if (s := ch_series(ci, col)) is not None]
-        if not series_list:
+        parsed = [(ci, s) for ci in range(len(ch_offsets))
+                  if (s := ch_series(ci)) is not None and len(s.dropna()) >= 10]
+        if not parsed:
             return
 
+        # Channel ORDER in the adaptive record differs between split-phase and
+        # three-phase exports, so identify channels by signature (correlation
+        # against the interval-average channels) instead of by position.
+        named = self._identify_adaptive_channels(parsed)
+        if not named:
+            log.warning("ProntoAdapter adaptive: no channels identified — record skipped.")
+            return
+
+        series_list = [s.rename(col) for col, s in named.items()]
         df = pd.concat(series_list, axis=1).sort_index()
         df = df[~df.index.duplicated(keep='first')]
         self._adaptive_df = df
@@ -1322,6 +1284,290 @@ class ProntoAdapter:
             "ProntoAdapter adaptive: %d variable-rate samples, %.1f h span, %d channels",
             len(df), ts_span_h, len(series_list),
         )
+
+    def _load_waveforms(self, obs_recs: List[Dict]) -> None:
+        """Decode point-on-wave 'Waveform' capture observations.
+
+        Each capture is one observation record labeled
+        ``<meter> - Waveform - MM/DD/YY HH:MM:SS.ffff``.  Its body carries one
+        entry-table (located with _scan_entry_table) pointing at ~6 channel
+        blocks.  Block layout: u32 sample count at +208, float64 per-sample
+        times (seconds from capture start) at +212, then a 60-byte gap, a
+        repeated u32 count, and float64 instantaneous samples in engineering
+        units (V or A).  Typical captures: ~3 000 samples per channel at
+        ≈19.2 kHz (~320 samples/cycle), 0.1–1.5 s per capture.
+
+        Channels carry no identifying GUID, so they are classified by
+        amplitude against the interval Van RMS median: voltage phases first
+        (in table order), a near-zero block immediately after them as Vne,
+        and the remainder as phase currents (last one neutral when present).
+        """
+        # Reference L-N voltage from the interval channels for classification
+        ref_v = 120.0
+        labels = {ch.label.strip().lower() for ch in self._raw_channels}
+        for ch in self._raw_channels:
+            if ch.label.strip().lower() == 'van rms' and ch.index in self._obs_data:
+                vals = self._obs_data[ch.index]
+                med = float(np.nanmedian(vals)) if len(vals) else 0.0
+                if med > 1:
+                    ref_v = med
+                break
+        # Split-phase meters have no C phase — the third current block is neutral
+        is_split = 'ic rms' not in labels
+
+        for rec in obs_recs:
+            try:
+                body = zlib.decompress(rec['raw'])
+            except zlib.error:
+                continue
+            label = body[148:220].decode('ascii', errors='replace')
+            if ' - Waveform - ' not in label:
+                continue
+            m = re.search(
+                r'(\d{2})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d+)', label)
+            if not m:
+                continue
+            mo, dy, yr, hh, mm, ss, frac = m.groups()
+            try:
+                cap_ts = datetime(2000 + int(yr), int(mo), int(dy),
+                                  int(hh), int(mm), int(ss),
+                                  int(float('0.' + frac) * 1e6))
+            except ValueError:
+                continue
+
+            channels: List[Tuple[np.ndarray, np.ndarray]] = []
+            for off in self._scan_entry_table(body):
+                if off + 212 > len(body):
+                    continue
+                cnt = struct.unpack_from('<I', body, off + 208)[0]
+                if not (64 <= cnt <= 2_000_000):
+                    continue
+                ts_end = off + 212 + cnt * 8
+                if ts_end > len(body):
+                    continue
+                t = np.frombuffer(body[off + 212: ts_end], dtype='<f8')
+                if not (np.all(np.isfinite(t)) and t[0] >= 0 and t[-1] < 600
+                        and np.all(np.diff(t) >= 0)):
+                    continue
+                # data: u32 count (== cnt) within a small gap after ts array
+                data = None
+                for g in range(0, 68, 4):
+                    if ts_end + g + 4 + cnt * 8 > len(body):
+                        break
+                    if struct.unpack_from('<I', body, ts_end + g)[0] == cnt:
+                        data = np.frombuffer(
+                            body[ts_end + g + 4: ts_end + g + 4 + cnt * 8],
+                            dtype='<f8').copy()
+                        break
+                if data is None or not np.all(np.isfinite(data)):
+                    continue
+                channels.append((t, data))
+
+            if not channels:
+                continue
+
+            # Classify by amplitude and table position: L-N voltage phases come
+            # first, then (split-phase) a near-zero Vne block, then currents.
+            # Median half-cycle RMS is the discriminator — robust to sags and
+            # inrush spikes within the capture, unlike a simple peak test.
+            t0 = channels[0][0]
+            dt = float(np.median(np.diff(t0))) if len(t0) > 1 else 0.0
+            w = max(int(round((1 / 60.0) / dt / 2)), 8) if dt > 0 else 32
+
+            def _med_rms(x: np.ndarray) -> float:
+                if len(x) < w * 2:
+                    return float(np.sqrt(np.mean(x * x)))
+                c = np.cumsum(np.concatenate(([0.0], x * x)))
+                return float(np.median(np.sqrt((c[w:] - c[:-w]) / w)))
+
+            voltages: Dict[str, np.ndarray] = {}
+            currents: Dict[str, np.ndarray] = {}
+            vne: Optional[np.ndarray] = None
+            v_names = iter(('a', 'b') if is_split else ('a', 'b', 'c'))
+            i_names = iter(('a', 'b', 'n') if is_split else ('a', 'b', 'c', 'n'))
+            mode_v = True
+            v_cap  = 2 if is_split else 3
+            for _, data in channels:
+                m = _med_rms(data)
+                if mode_v and 0.4 * ref_v <= m <= 1.6 * ref_v and len(voltages) < v_cap:
+                    voltages[next(v_names)] = data
+                    continue
+                if mode_v and voltages:
+                    # first non-voltage block: split-phase exports place Vne here
+                    mode_v = False
+                    if m < 0.15 * ref_v and vne is None:
+                        vne = data
+                        continue
+                try:
+                    currents[next(i_names)] = data
+                except StopIteration:
+                    pass
+
+            if not voltages:
+                continue
+            self._waveforms.append({
+                "timestamp": cap_ts,
+                "label":     label.split('\x00')[0].strip(),
+                "t":         t0,
+                "fs_hz":     (1.0 / dt) if dt > 0 else None,
+                "voltages":  voltages,
+                "vne":       vne,
+                "currents":  currents,
+            })
+
+        if self._waveforms:
+            self._waveforms.sort(key=lambda w: w["timestamp"])
+            log.info(
+                "ProntoAdapter waveforms: decoded %d point-on-wave captures "
+                "(%s ch V / %s ch I typical, ~%.0f samples/cycle)",
+                len(self._waveforms),
+                len(self._waveforms[0]["voltages"]),
+                len(self._waveforms[0]["currents"]),
+                (self._waveforms[0]["fs_hz"] or 0) / 60.0,
+            )
+
+    # Interval-channel label → adaptive column name, used as identification
+    # references for adaptive channels (matched by correlation, not position).
+    _ADAP_REF_LABELS = {
+        'van rms': 'van_v', 'vbn rms': 'vbn_v', 'vcn rms': 'vcn_v',
+        'vne rms': 'vne_v',
+        'ia rms': 'ia_a', 'ib rms': 'ib_a', 'ic rms': 'ic_a', 'in rms': 'in_a',
+        'thd van': 'thd_van_pct', 'thd vbn': 'thd_vbn_pct', 'thd vcn': 'thd_vcn_pct',
+        'real power': 'kw_w', 'reactive power': 'kvar_var',
+        'apparent power': 'kva_va', 'power factor': 'adap_pf',
+    }
+
+    def _identify_adaptive_channels(
+        self, parsed: List[Tuple[int, pd.Series]]
+    ) -> Dict[str, pd.Series]:
+        """Assign canonical names to adaptive channels by signature.
+
+        Primary method: bin each adaptive series to the interval-average grid
+        and correlate against the interval channels (Van RMS, Ia RMS, …) — the
+        same physical quantity correlates ≈1 with its own interval average.
+        Near-constant references (e.g. Vne at ~0.1 V) fall back to median
+        matching; frequency/power-factor channels are identified by value
+        signature; L-L voltages by their ratio to the identified L-N voltage.
+        Unidentified channels are skipped."""
+        by_ci = dict(parsed)
+        assigned: Dict[str, pd.Series] = {}
+        used_ci: Set[int] = set()
+
+        if self._obs_ts is None or not self._obs_data or len(self._obs_ts) < 3:
+            return {}
+        ref_idx = pd.DatetimeIndex(self._obs_ts)
+        td = pd.Series(ref_idx[1:] - ref_idx[:-1]).median()
+
+        refs: Dict[str, pd.Series] = {}
+        for ch in self._raw_channels:
+            col = self._ADAP_REF_LABELS.get(ch.label.strip().lower())
+            if col and ch.index in self._obs_data and col not in refs:
+                vals = self._obs_data[ch.index]
+                r = pd.Series(vals[:len(ref_idx)], index=ref_idx[:len(vals)]).dropna()
+                if len(r) >= 20:
+                    refs[col] = r.groupby(r.index.floor(td)).mean()
+
+        binned = {ci: s.groupby(s.index.floor(td)).mean() for ci, s in parsed}
+
+        # 1. Correlation scoring against interval references
+        scores: List[Tuple[float, int, str]] = []
+        for ci, _ in parsed:
+            b = binned[ci]
+            for col, rb in refs.items():
+                al = pd.concat([b, rb], axis=1, join='inner').dropna()
+                if len(al) < 20:
+                    continue
+                x, y = al.iloc[:, 0], al.iloc[:, 1]
+                if x.std() == 0 or y.std() == 0:
+                    continue
+                corr = float(x.corr(y))
+                mx, my = float(x.median()), float(y.median())
+                ratio_ok = ((abs(my) < 1.0 and abs(mx) < 2.0)
+                            or (my != 0 and 0.5 <= mx / my <= 2.0))
+                if np.isfinite(corr) and corr >= 0.8 and ratio_ok:
+                    scores.append((corr, ci, col))
+        for corr, ci, col in sorted(scores, reverse=True):
+            if ci in used_ci or col in assigned:
+                continue
+            assigned[col] = by_ci[ci]
+            used_ci.add(ci)
+
+        # 2. Median-ratio fallback for near-constant references (Vne, idle currents)
+        for col, rb in refs.items():
+            if col in assigned:
+                continue
+            my = float(rb.median())
+            tol = max(abs(my) * 0.3, 0.5)
+            cands = [(abs(float(binned[ci].median()) - my), ci)
+                     for ci, _ in parsed
+                     if ci not in used_ci and abs(float(binned[ci].median()) - my) <= tol]
+            if cands:
+                _, ci = min(cands)
+                assigned[col] = by_ci[ci]
+                used_ci.add(ci)
+
+        # 3. Signature-only channels with no interval counterpart
+        for ci, s in parsed:
+            if ci in used_ci:
+                continue
+            med = float(s.median())
+            if 'adap_freq' not in assigned and 55.0 <= med <= 65.0 and float(s.std()) < 1.0:
+                assigned['adap_freq'] = s
+                used_ci.add(ci)
+                continue
+            if ('adap_pf' not in assigned and 0.3 <= abs(med) <= 1.05
+                    and float(s.abs().quantile(0.99)) <= 1.1):
+                assigned['adap_pf'] = s
+                used_ci.add(ci)
+
+        # 4. L-L voltages: ~2× L-N (split-phase) or ~√3× (wye)
+        ln = assigned.get('van_v')
+        if ln is not None and float(ln.median()) > 0:
+            ln_med = float(ln.median())
+            ll_names = iter(('vab_v', 'vbc_v', 'vac_v'))
+            for ci, s in parsed:
+                if ci in used_ci:
+                    continue
+                if 1.65 <= float(s.median()) / ln_med <= 2.1:
+                    try:
+                        assigned[next(ll_names)] = s
+                    except StopIteration:
+                        break
+                    used_ci.add(ci)
+
+        n_un = len(parsed) - len(used_ci)
+        log.info(
+            "ProntoAdapter adaptive: identified %d of %d channels by signature%s",
+            len(used_ci), len(parsed),
+            f" ({n_un} unidentified, skipped)" if n_un else "",
+        )
+        return assigned
+
+    @staticmethod
+    def _scan_entry_table(body: bytes, lo: int = 150, hi: int = 600) -> List[int]:
+        """Locate the per-channel entry table near the top of a decompressed
+        observation body and return the channel block offsets, in table order.
+
+        Entries are 28 bytes: u32 flag (=1), u32 absolute block offset, u32
+        sub-header size, and a 16-byte type GUID.  The table start drifts
+        between Pronto export versions, so scan for the longest run of valid
+        entries (flag == 1, offsets strictly increasing and within the body)
+        rather than trusting a fixed offset."""
+        n = len(body)
+        best: List[int] = []
+        for start in range(lo, min(hi, n - 28), 2):
+            offs: List[int] = []
+            pos = start
+            while pos + 28 <= n:
+                flag, off = struct.unpack_from('<2I', body, pos)
+                if flag == 1 and 0 < off < n and (not offs or off > offs[-1]):
+                    offs.append(off)
+                    pos += 28
+                else:
+                    break
+            if len(offs) > len(best):
+                best = offs
+        return best if len(best) >= 3 else []
 
     def _load_dedup(self, body: bytes, off: int, n: int) -> np.ndarray:
         raw = self._read_f64(body, off)
@@ -1533,6 +1779,7 @@ class PQDataset:
     df:          pd.DataFrame
     adaptive_df: Optional[pd.DataFrame]
     meta:        dict
+    waveforms:   List[dict] = field(default_factory=list)
 
     @property
     def duration_hours(self) -> float:
@@ -1547,6 +1794,10 @@ class PQDataset:
     @property
     def has_adaptive(self) -> bool:
         return self.adaptive_df is not None and len(self.adaptive_df) > 0
+
+    @property
+    def has_waveforms(self) -> bool:
+        return bool(self.waveforms)
 
     def catalog(self) -> str:
         """Human-readable inventory of every data source and channel group."""
@@ -1612,6 +1863,17 @@ class PQDataset:
         else:
             lines.append("  Adaptive events  (obs[25]): not present")
 
+        if self.has_waveforms:
+            wf = self.waveforms
+            fs = wf[0].get("fs_hz") or 0
+            lines.append(
+                f"  Waveform captures          : {len(wf)} point-on-wave records  "
+                f"[{len(wf[0]['voltages'])}V/{len(wf[0]['currents'])}I ch, "
+                f"{fs/1000:.1f} kHz]"
+            )
+        else:
+            lines.append("  Waveform captures          : not present")
+
         return "\n".join(lines)
 
 
@@ -1664,7 +1926,8 @@ def extract_dataset(
         "end_time":         df.index[-1].isoformat() if len(df) else None,
     }
 
-    ds = PQDataset(df=df, adaptive_df=adaptive_df, meta=meta)
+    ds = PQDataset(df=df, adaptive_df=adaptive_df, meta=meta,
+                   waveforms=getattr(adapter, "waveforms", []) or [])
     log.info("\n%s", ds.catalog())
     return ds
 

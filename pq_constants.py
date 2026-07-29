@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "0.2.0"
+import numpy as _np
+
+__version__ = "0.6.0"
 
 
 @dataclass
@@ -12,7 +14,7 @@ class Thresholds:
     nominal_voltage: float = 120.0        # V (line-to-neutral)
     volt_tolerance: float = 0.05          # ±5 % → ANSI C84.1 Range A
     thd_voltage_limit: float = 8.0        # % → IEEE 519 Table 2 (≤1 kV bus)
-    thd_current_limit: float = 5.0        # % fallback when isc_amps not provided
+    thd_current_limit: float = 5.0        # % THD fallback when no RMS current channels (TDD unavailable)
     power_factor_limit: float = 0.90      # lagging — flag below this
     imbalance_limit: float = 3.0          # % voltage unbalance — NEMA MG1 / IEEE 1159
     current_imbalance_limit: float = 10.0 # % current unbalance — per PSC procedure
@@ -538,3 +540,37 @@ def _impedance_range(service_type: str, kva: float) -> Optional[Tuple[float, flo
         if kva_min <= kva <= kva_max:
             return z_min, z_max
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ITIC (CBEMA) VOLTAGE TOLERANCE ENVELOPE
+# Reference: "ITI (CBEMA) Curve Application Note," Information Technology
+# Industry Council (ITIC), 2000.  Referenced by IEEE 1159-2019 as the standard
+# voltage tolerance envelope for information technology equipment.
+# Applicable to 120 V nominal (120/208 V and 120/240 V, 60 Hz systems).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Step-function boundary lines (duplicate x-values create vertical segments)
+_ITIC_UPPER_MS_STEP  = _np.array([0.001, 1,   1,   3,   3,   20,  20,  500, 500, 1e6])
+_ITIC_UPPER_PCT_STEP = _np.array([500,   500, 200, 200, 140, 140, 120, 120, 110, 110])
+_ITIC_LOWER_MS_STEP  = _np.array([0.001, 20,  20,  500, 500, 1e4, 1e4, 1e6])
+_ITIC_LOWER_PCT_STEP = _np.array([0,     0,   70,  70,  80,  80,  90,  90 ])
+
+
+def _itic_upper_v(x: "_np.ndarray") -> "_np.ndarray":
+    """ITIC upper boundary (% nominal) at each duration x (ms)."""
+    r = _np.full_like(x, 110.0, dtype=float)
+    r[x < 500] = 120.0
+    r[x < 20]  = 140.0
+    r[x < 3]   = 200.0
+    r[x < 1]   = 500.0
+    return r
+
+
+def _itic_lower_v(x: "_np.ndarray") -> "_np.ndarray":
+    """ITIC lower boundary (% nominal) at each duration x (ms)."""
+    r = _np.full_like(x, 90.0, dtype=float)
+    r[x < 10000] = 80.0
+    r[x < 500]   = 70.0
+    r[x < 20]    = 0.0
+    return r

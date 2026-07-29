@@ -82,6 +82,15 @@ try:
         plot_thd,
         plot_summary,
         plot_harmonic_spectrum,
+        plot_itic,
+        plot_neutral_health,
+        plot_demand_profile,
+        plot_harmonic_trend,
+        plot_imbalance,
+        plot_pf_load,
+        plot_waveform_capture,
+        check_neutral_health,
+        check_itic,
     )
     _BOOK_AVAILABLE = True
 except Exception as _import_exc:
@@ -775,13 +784,17 @@ class PQApp(tk.Tk):
         spectral_shape_result = check_spectral_shape(df, thresh, source_harm_result)
         stat_result         = check_harmonic_statistics(df, thresh)
         event_result        = detect_events(ds, thresh)
+        neutral_health_result = check_neutral_health(ds, thresh)
+        itic_result         = check_itic(event_result, thresh)
 
         report = generate_report(
             ds, volt_result, thd_result, pf_result,
             imb_result, curr_imb_result, demand_result,
             harm_result, volt_harm_result, neutral_harm_result,
             source_harm_result, stat_result, event_result, thresh,
+            neutral_health_result=neutral_health_result,
             spectral_shape_result=spectral_shape_result,
+            itic_result=itic_result,
         )
         report["root_causes"] = analyze_root_causes(report, ds, thresh)
 
@@ -789,10 +802,17 @@ class PQApp(tk.Tk):
         export_results(ds, report, outdir, stem=stem)
 
         # ── Plots ─────────────────────────────────────────────────────────────
-        plot_voltage(df, volt_result, thresh, outdir=outdir)
-        plot_thd(df, thd_result, thresh, outdir=outdir)
-        plot_summary(df, imb_result, outdir=outdir)
-        plot_harmonic_spectrum(df, thresh, outdir=outdir)
+        plot_voltage(df, volt_result, thresh, outdir=outdir, stem=stem)
+        plot_thd(df, thd_result, thresh, outdir=outdir, stem=stem)
+        plot_summary(df, imb_result, outdir=outdir, stem=stem)
+        plot_harmonic_spectrum(df, thresh, outdir=outdir, stem=stem)
+        plot_itic(event_result["events"], thresh, outdir=outdir, stem=stem)
+        plot_neutral_health(ds, neutral_health_result, thresh, outdir=outdir, stem=stem)
+        plot_demand_profile(df, thd_result, outdir=outdir, stem=stem)
+        plot_harmonic_trend(df, outdir=outdir, stem=stem)
+        plot_imbalance(df, imb_result, curr_imb_result, outdir=outdir, stem=stem)
+        plot_pf_load(df, pf_result, outdir=outdir, stem=stem)
+        plot_waveform_capture(ds, thresh, outdir=outdir, stem=stem)
 
         # ── Word report ───────────────────────────────────────────────────────
         generate_word_report(
@@ -1481,9 +1501,9 @@ class PQApp(tk.Tk):
         )
 
         concept(
-            "Root Cause Analysis",
+            "Engineering Assessment (Likely Causes)",
             "After all individual checks run, the tool synthesizes findings into a\n"
-            "root cause list ranked by severity.  Each finding includes:\n"
+            "likely-cause list ranked by severity.  Each finding includes:\n"
             "\n"
             "  Category     — what domain (voltage, harmonics, power factor, etc.)\n"
             "  Severity      — critical, warning, or info\n"

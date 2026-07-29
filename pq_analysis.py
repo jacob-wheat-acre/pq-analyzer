@@ -13,6 +13,8 @@ from pq_constants import (
     _SERVICE_TYPE_LABEL,
     _h519_limit,
     _impedance_range,
+    _itic_lower_v,
+    _itic_upper_v,
     _lookup_isc,
     _tdd_class,
     _tdd_limit,
@@ -108,10 +110,15 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """IEEE 519-2022 compliance: voltage THD and current TDD.
 
     Voltage: standard THD (relative to fundamental), limit from thresh.thd_voltage_limit.
-    Current: TDD (relative to maximum demand current IL) when thresh.isc_amps is set.
+    Current: TDD (relative to maximum demand current IL) whenever RMS current
+      channels are present — ISC is not required to compute TDD itself:
       TDD(t) = THD%(t) × Irms(t) / IL   where IL = max demand current in recording.
-      The TDD class limit is selected from IEEE 519-2022 Table 2 via the ISC/IL ratio.
-    Falls back to plain THD vs thresh.thd_current_limit when isc_amps is not provided.
+      The TDD class limit is selected from IEEE 519-2022 Table 2 via the ISC/IL
+      ratio when thresh.isc_amps is set; without ISC the most restrictive class
+      (ISC/IL < 20, 5.0%) is assumed — conservative, since the true limit can
+      only be equal or higher.
+    Falls back to plain THD vs thresh.thd_current_limit only when no RMS current
+    channels exist to derive IL from.
     """
     result = {
         "available":            False,
@@ -128,32 +135,48 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     if i_cols:
         il_amps = float(df[i_cols].max(axis=1).max())
 
-    if thresh.isc_amps is not None and il_amps and il_amps > 0:
-        isc_il      = thresh.isc_amps / il_amps
-        current_limit = _tdd_limit(isc_il)
-        use_tdd     = True
-        result["tdd_info"] = {
-            "isc_amps":      thresh.isc_amps,
-            "il_amps":       round(il_amps, 1),
-            "isc_il_ratio":  round(isc_il, 1),
-            "tdd_class":     _tdd_class(isc_il),
-            "tdd_limit_pct": current_limit,
-            "isc_source":    thresh.isc_source,
-        }
-        log.info(
-            "IEEE 519 TDD: ISC=%.0f A  IL=%.0f A  ISC/IL=%.1f  class %s  limit=%.1f%%",
-            thresh.isc_amps, il_amps, isc_il, _tdd_class(isc_il), current_limit,
-        )
+    if il_amps and il_amps > 0:
+        use_tdd = True
+        if thresh.isc_amps is not None:
+            isc_il        = thresh.isc_amps / il_amps
+            current_limit = _tdd_limit(isc_il)
+            result["tdd_info"] = {
+                "isc_amps":      thresh.isc_amps,
+                "il_amps":       round(il_amps, 1),
+                "isc_il_ratio":  round(isc_il, 1),
+                "tdd_class":     _tdd_class(isc_il),
+                "tdd_limit_pct": current_limit,
+                "isc_source":    thresh.isc_source,
+                "isc_provided":  True,
+            }
+            log.info(
+                "IEEE 519 TDD: ISC=%.0f A  IL=%.0f A  ISC/IL=%.1f  class %s  limit=%.1f%%",
+                thresh.isc_amps, il_amps, isc_il, _tdd_class(isc_il), current_limit,
+            )
+        else:
+            # TDD needs only IL; ISC is needed only to select the Table 2 limit
+            # class. Assume the most restrictive class (ISC/IL < 20) — the true
+            # limit can only be equal or higher.
+            isc_il        = None
+            current_limit = _tdd_limit(0.0)
+            result["tdd_info"] = {
+                "isc_amps":      None,
+                "il_amps":       round(il_amps, 1),
+                "isc_il_ratio":  None,
+                "tdd_class":     "< 20 (assumed)",
+                "tdd_limit_pct": current_limit,
+                "isc_source":    None,
+                "isc_provided":  False,
+            }
+            log.info(
+                "IEEE 519 TDD: ISC not provided — IL=%.0f A, most restrictive class "
+                "assumed (ISC/IL < 20, limit %.1f%%). Pass --isc for the true class limit.",
+                il_amps, current_limit,
+            )
     else:
         isc_il        = None
         current_limit = thresh.thd_current_limit
         use_tdd       = False
-        if i_cols:
-            log.warning(
-                "No --isc provided; using THD fallback limit %.1f%%. "
-                "Pass --isc <amps> for accurate IEEE 519-2022 TDD class.",
-                current_limit,
-            )
 
     # ── Voltage THD ───────────────────────────────────────────────────────────
     v_thd_cols = [c for c in ["thd_voltage_a", "thd_voltage_b", "thd_voltage_c"]
@@ -196,6 +219,11 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
             worst = pd.concat(tdd_cols, axis=1).max(axis=1).dropna()
             metric = "tdd"
         else:
+            log.warning(
+                "No RMS current channels — cannot derive IL for TDD. "
+                "Evaluating raw THD against the %.1f%% fallback limit; "
+                "light-load intervals may inflate THD.", current_limit,
+            )
             worst  = df[i_thd_cols].max(axis=1).dropna()
             # Filter out light-load intervals: at < 10% of peak demand the THD%
             # denominator (I₁) approaches zero and produces meaningless large values.
@@ -1041,7 +1069,7 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
       - voltage_spike : |ΔV| > event_delta_pct × nominal in one sample
       - flicker_pst   : adap_pst > 1.0  (adaptive only)
       - flicker_plt   : adap_plt > 0.65 (adaptive only)
-      - current_step  : |ΔI| > 25 % of mean current
+      - current_step  : |ΔI| > 25 % of mean current (5 A absolute floor)
     """
     events: list = []
     nominal      = thresh.nominal_voltage
@@ -1121,7 +1149,10 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
                 continue
             s = adf[icol].dropna()
             mean_i  = s.mean()
-            delta_i = 0.25 * mean_i if mean_i > 0 else 5.0
+            # 25% of mean, with a 5 A absolute floor — on lightly loaded services
+            # (mean of a few amps) a pure percentage threshold flags every
+            # appliance cycle as an event.
+            delta_i = max(0.25 * mean_i, 5.0)
             diffs = s.diff().abs()
             for ts in diffs[diffs > delta_i].index:
                 events.append({"timestamp": ts, "type": "current_step", "phase": phase,
@@ -1164,13 +1195,85 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
                 events.append({"timestamp": ts, "type": "current_step", "phase": phase,
                                "delta_a": float(diffs.loc[ts])})
 
+    # ── Waveform-capture sag/swell events (½-cycle RMS per IEEE 1159) ─────────
+    # Point-on-wave captures resolve events shorter than the adaptive record's
+    # cycle-level resolution.  Events already seen in the adaptive data (same
+    # phase within ±2 s) are skipped to avoid double counting.
+    wf_events = _waveform_sag_swell_events(ds, thresh)
+    if wf_events:
+        # Waveform timestamps come from naive capture labels; align tz with any
+        # existing events so comparison and sorting never mix aware and naive.
+        tzinfo = next((getattr(e.get("timestamp"), "tzinfo", None) for e in events
+                       if getattr(e.get("timestamp"), "tzinfo", None) is not None), None)
+        if tzinfo is not None:
+            for w in wf_events:
+                w["timestamp"] = pd.Timestamp(w["timestamp"]).tz_localize(tzinfo)
+
+        def _is_dup(w):
+            for e in events:
+                try:
+                    close = abs((e["timestamp"] - w["timestamp"]).total_seconds()) <= 2.0
+                except TypeError:
+                    close = False
+                if close and e["type"] == w["type"] and e.get("phase") == w["phase"]:
+                    return True
+            return False
+        events.extend(w for w in wf_events if not _is_dup(w))
+
     events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True) \
         if events else pd.DataFrame(columns=["timestamp", "type", "phase"])
     return {
-        "event_count": len(events_df),
-        "events":      events_df,
-        "data_source": data_source,
+        "event_count":       len(events_df),
+        "events":            events_df,
+        "data_source":       data_source,
+        "waveform_captures": len(getattr(ds, "waveforms", []) or []),
     }
+
+
+def _waveform_sag_swell_events(ds: PQDataset, thresh: Thresholds) -> List[dict]:
+    """Extract sag/swell events from point-on-wave captures via a sliding
+    half-cycle RMS envelope (IEEE 1159 characterization).  Durations are
+    clamped to the capture window, so they are lower bounds for events that
+    outlast the capture."""
+    import datetime as _dt
+
+    nominal = thresh.nominal_voltage
+    out: List[dict] = []
+    for wf in getattr(ds, "waveforms", None) or []:
+        t  = wf.get("t")
+        fs = wf.get("fs_hz")
+        if t is None or not fs or fs <= 0:
+            continue
+        w = max(int(round(fs / 60.0 / 2)), 8)          # half-cycle window
+        for ph, x in wf.get("voltages", {}).items():
+            n = min(len(x), len(t))
+            if n < 2 * w:
+                continue
+            x = np.asarray(x[:n], dtype=float)
+            c = np.cumsum(np.concatenate(([0.0], x * x)))
+            rms = np.sqrt((c[w:] - c[:-w]) / w)         # rms[i] over x[i:i+w]
+            for kind, mask in (
+                ("voltage_sag",   rms < 0.9 * nominal),
+                ("voltage_swell", rms > 1.1 * nominal),
+            ):
+                if not mask.any():
+                    continue
+                edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.view(np.int8), [0]))))
+                for s_i, e_i in zip(edges[::2], edges[1::2]):
+                    seg = rms[s_i:e_i]
+                    dur_ms = (t[min(e_i + w - 1, n - 1)] - t[s_i]) * 1000.0
+                    if dur_ms < 1000.0 / 60.0 / 2:      # ignore < half a cycle
+                        continue
+                    extreme = float(seg.min() if kind == "voltage_sag" else seg.max())
+                    out.append({
+                        "timestamp":   wf["timestamp"] + _dt.timedelta(seconds=float(t[s_i])),
+                        "type":        kind,
+                        "phase":       ph.upper(),
+                        "value_v":     round(extreme, 1),
+                        "duration_ms": round(float(dur_ms), 1),
+                        "source":      "waveform",
+                    })
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1504,6 +1607,75 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float) -> List[dict]:
         })
 
     return findings
+
+
+def check_itic(event_result: dict, thresh: Thresholds) -> dict:
+    """Evaluate detected sag/swell events against the ITIC (CBEMA) voltage
+    tolerance envelope.
+
+    Each event is a (duration, magnitude) point; points outside the envelope
+    (below the lower boundary or above the upper boundary) are disruptions the
+    ITI curve says IT equipment is not required to tolerate.  Requires
+    event-level durations, which come from adaptive (cycle-level) or waveform
+    records — 5-minute interval averages cannot resolve event duration.
+    """
+    ev = event_result.get("events")
+    if ev is None or len(ev) == 0:
+        return {
+            "available":    True,
+            "n_events":     0,
+            "n_violations": 0,
+            "overall_pass": True,
+            "note":         "No voltage sag/swell events detected during the recording.",
+            "violations":   [],
+        }
+
+    vs = ev[ev["type"].isin(["voltage_sag", "voltage_swell"])].copy()
+    if (vs.empty or "duration_ms" not in vs.columns
+            or not vs["duration_ms"].notna().any()):
+        if vs.empty:
+            return {
+                "available":    True,
+                "n_events":     0,
+                "n_violations": 0,
+                "overall_pass": True,
+                "note":         "No voltage sag/swell events detected during the recording.",
+                "violations":   [],
+            }
+        return {
+            "available": False,
+            "note": ("Sag/swell events were detected but event durations are not "
+                     "available from this recording's data (requires cycle-level "
+                     "adaptive or waveform records)."),
+        }
+
+    vs = vs.dropna(subset=["duration_ms", "value_v"])
+    dur = vs["duration_ms"].to_numpy(dtype=float)
+    pct = vs["value_v"].to_numpy(dtype=float) / thresh.nominal_voltage * 100.0
+    viol_mask = (pct > _itic_upper_v(dur)) | (pct < _itic_lower_v(dur))
+
+    violations = []
+    for (_, row), is_viol, p in zip(vs.iterrows(), viol_mask, pct):
+        if not is_viol:
+            continue
+        violations.append({
+            "timestamp":   row.get("timestamp"),
+            "type":        row["type"],
+            "phase":       row.get("phase"),
+            "value_v":     round(float(row["value_v"]), 1),
+            "pct_nominal": round(float(p), 1),
+            "duration_ms": round(float(row["duration_ms"]), 1),
+        })
+    violations.sort(key=lambda v: abs(v["pct_nominal"] - 100), reverse=True)
+
+    return {
+        "available":    True,
+        "n_events":     int(len(vs)),
+        "n_violations": int(viol_mask.sum()),
+        "overall_pass": bool(viol_mask.sum() == 0),
+        "worst":        violations[0] if violations else None,
+        "violations":   violations[:20],
+    }
 
 
 def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List[dict]:

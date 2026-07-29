@@ -13,7 +13,16 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
-from pq_constants import Thresholds, _h519_limit
+from pq_constants import (
+    Thresholds,
+    _h519_limit,
+    _itic_upper_v,
+    _itic_lower_v,
+    _ITIC_UPPER_MS_STEP,
+    _ITIC_UPPER_PCT_STEP,
+    _ITIC_LOWER_MS_STEP,
+    _ITIC_LOWER_PCT_STEP,
+)
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +30,40 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. VISUALIZATION
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Colorblind-safe phase palette (Okabe–Ito): blue / orange / green.
+# Validated for protan/deutan/tritan separation — do not swap for the old
+# Material blue/orange/green, whose orange↔green pair is indistinguishable
+# under protanopia.
+_PH_A = "#0072B2"
+_PH_B = "#E69F00"
+_PH_C = "#009E73"
+_PHASE_CLR  = {"a": _PH_A, "b": _PH_B, "c": _PH_C,
+               "A": _PH_A, "B": _PH_B, "C": _PH_C}
+_NEUTRAL_CLR = "#666666"
+
+
+def _plot_name(stem: str, name: str) -> str:
+    """Stem-prefixed plot filename so multi-site output dirs never collide."""
+    return f"{stem}_{name}" if stem else name
+
+
+def _fmt_time_axis(ax, index: pd.DatetimeIndex) -> None:
+    """Time-axis tick format: include the date once the span exceeds a day,
+    otherwise plain clock time."""
+    span_h = ((index[-1] - index[0]).total_seconds() / 3600) if len(index) > 1 else 0
+    fmt = "%m/%d %H:%M" if span_h > 30 else "%H:%M"
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
+
+
+def _save(fig, outdir: Optional[Path], stem: str, name: str) -> None:
+    if outdir:
+        fname = _plot_name(stem, name)
+        fig.savefig(outdir / fname, dpi=150)
+        log.info("Saved plot → %s/%s", outdir, fname)
+    else:
+        plt.show()
+    plt.close(fig)
 
 def _shade_violations(ax, violation_ts: pd.DatetimeIndex, df_index: pd.DatetimeIndex):
     """Shade violation windows on an axis as translucent red bands."""
@@ -46,6 +89,7 @@ def plot_voltage(
     volt_result: dict,
     thresh: Thresholds,
     outdir: Optional[Path] = None,
+    stem: str = "",
 ) -> None:
     v_cols = [c for c in ["voltage_a", "voltage_b", "voltage_c"] if c in df.columns]
     if not v_cols:
@@ -53,7 +97,7 @@ def plot_voltage(
         return
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    colors = {"voltage_a": "#2196F3", "voltage_b": "#FF9800", "voltage_c": "#4CAF50"}
+    colors = {"voltage_a": _PH_A, "voltage_b": _PH_B, "voltage_c": _PH_C}
     is_split = "voltage_c" not in df.columns
     if is_split:
         labels = {"voltage_a": "L1-N", "voltage_b": "L2-N"}
@@ -83,7 +127,7 @@ def plot_voltage(
             loc="upper left", fontsize=8,
         )
 
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    _fmt_time_axis(ax, df.index)
     fig.autofmt_xdate()
     ax.set_xlabel("Time")
     ax.set_ylabel("RMS Voltage (V)")
@@ -92,12 +136,7 @@ def plot_voltage(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
-    if outdir:
-        fig.savefig(outdir / "voltage.png", dpi=150)
-        log.info("Saved plot → %s/voltage.png", outdir)
-    else:
-        plt.show()
-    plt.close(fig)
+    _save(fig, outdir, stem, "voltage.png")
 
 
 def plot_thd(
@@ -105,7 +144,14 @@ def plot_thd(
     thd_result: dict,
     thresh: Thresholds,
     outdir: Optional[Path] = None,
+    stem: str = "",
 ) -> None:
+    """Voltage THD and current TDD (or THD fallback) timelines vs IEEE 519 limits.
+
+    When tdd_info is present in thd_result, the current panel shows the same
+    per-interval TDD series the compliance check evaluates:
+    TDD(t) = THD%(t) × Irms(t) / IL.
+    """
     thd_v = [c for c in ["thd_voltage_a", "thd_voltage_b", "thd_voltage_c"] if c in df.columns]
     thd_i = [c for c in ["thd_current_a", "thd_current_b", "thd_current_c"] if c in df.columns]
 
@@ -113,55 +159,73 @@ def plot_thd(
         log.warning("No THD columns to plot.")
         return
 
+    tdd_info = thd_result.get("tdd_info", {})
+    il_amps  = tdd_info.get("il_amps")
+    use_tdd  = bool(tdd_info) and il_amps
+    c_limit  = thd_result["current"].get("limit_pct", thresh.thd_current_limit) \
+               if thd_result.get("current", {}).get("available") else thresh.thd_current_limit
+    v_limit  = thd_result["voltage"].get("limit_pct", thresh.thd_voltage_limit) \
+               if thd_result.get("voltage", {}).get("available") else thresh.thd_voltage_limit
+
+    i_label = "Current TDD (%)" if use_tdd else "Current THD (%)"
+    if use_tdd and not tdd_info.get("isc_provided", True):
+        i_lim_label = f"Conservative limit ({c_limit:.1f}%, class assumed)"
+    else:
+        i_lim_label = f"IEEE 519 limit ({c_limit:.1f}%)"
+
     n_plots = int(bool(thd_v)) + int(bool(thd_i))
     fig, axes = plt.subplots(n_plots, 1, figsize=(14, 4 * n_plots), sharex=True)
     if n_plots == 1:
         axes = [axes]
 
     plot_idx = 0
-    for cols, limit, label, key in [
-        (thd_v, thresh.thd_voltage_limit, "Voltage THD (%)", "voltage"),
-        (thd_i, thresh.thd_current_limit, "Current THD (%)", "current"),
+    for cols, limit, label, lim_label, key in [
+        (thd_v, v_limit, "Voltage THD (%)", f"IEEE 519 limit ({v_limit:.1f}%)", "voltage"),
+        (thd_i, c_limit, i_label, i_lim_label, "current"),
     ]:
         if not cols:
             continue
         ax = axes[plot_idx]
         plot_idx += 1
         colors_map = {
-            f"thd_{key}_a": "#2196F3", f"thd_{key}_b": "#FF9800", f"thd_{key}_c": "#4CAF50"
+            f"thd_{key}_a": _PH_A, f"thd_{key}_b": _PH_B, f"thd_{key}_c": _PH_C
         }
         for col in cols:
-            ax.plot(df.index, df[col], color=colors_map.get(col, "gray"),
-                    lw=0.8, label=col.split("_")[-1].upper())
-        ax.axhline(limit, color="red", ls="--", lw=1.0, label=f"IEEE 519 limit ({limit}%)")
+            phase = col.split("_")[-1]
+            series = df[col]
+            if key == "current" and use_tdd:
+                i_col = f"current_{phase}"
+                if i_col in df.columns:
+                    aligned = df[[col, i_col]].dropna()
+                    series  = aligned[col] * aligned[i_col] / il_amps
+            ax.plot(series.index, series, color=colors_map.get(col, "gray"),
+                    lw=0.8, label=phase.upper())
+        ax.axhline(limit, color="red", ls="--", lw=1.0, label=lim_label)
 
         viol_ts_list = thd_result[key].get("violation_timestamps", [])
-        if viol_ts_list:
+        if viol_ts_list is not None and len(viol_ts_list):
             viol_idx = pd.DatetimeIndex(viol_ts_list)
             _shade_violations(ax, viol_idx, df.index)
 
         ax.set_ylabel(label)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
-        ax.set_title(f"{label.split(' ')[0]} THD — IEEE 519 Compliance")
+        metric_word = label.split(" ")[1]
+        ax.set_title(f"{label.split(' ')[0]} {metric_word} — IEEE 519 Compliance")
 
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    _fmt_time_axis(axes[-1], df.index)
     fig.autofmt_xdate()
     axes[-1].set_xlabel("Time")
     fig.tight_layout()
 
-    if outdir:
-        fig.savefig(outdir / "thd.png", dpi=150)
-        log.info("Saved plot → %s/thd.png", outdir)
-    else:
-        plt.show()
-    plt.close(fig)
+    _save(fig, outdir, stem, "thd.png")
 
 
 def plot_summary(
     df: pd.DataFrame,
     imb_result: dict,
     outdir: Optional[Path] = None,
+    stem: str = "",
 ) -> None:
     """Four-panel summary: voltage imbalance, power factor, real/reactive power."""
     panels = []
@@ -190,24 +254,20 @@ def plot_summary(
         ax.set_ylabel(ylabel, fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    _fmt_time_axis(axes[-1], df.index)
     fig.autofmt_xdate()
     axes[-1].set_xlabel("Time")
     fig.suptitle("Power Quality Summary", fontsize=11)
     fig.tight_layout()
 
-    if outdir:
-        fig.savefig(outdir / "summary.png", dpi=150)
-        log.info("Saved plot → %s/summary.png", outdir)
-    else:
-        plt.show()
-    plt.close(fig)
+    _save(fig, outdir, stem, "summary.png")
 
 
 def plot_harmonic_spectrum(
     df: pd.DataFrame,
     thresh: Thresholds,
     outdir: Optional[Path] = None,
+    stem: str = "",
 ) -> None:
     """Bar chart of median H3–H13 per phase (% of IL).
 
@@ -216,7 +276,7 @@ def plot_harmonic_spectrum(
     display as % of IL for direct comparison against limits.
     """
     orders = [3, 5, 7, 9, 11, 13]
-    phases = [("a", "Phase A", "#2196F3"), ("b", "Phase B", "#FF9800"), ("c", "Phase C", "#4CAF50")]
+    phases = [("a", "Phase A", _PH_A), ("b", "Phase B", _PH_B), ("c", "Phase C", _PH_C)]
 
     # Build per-phase median harmonic % of IL
     il_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
@@ -273,12 +333,7 @@ def plot_harmonic_spectrum(
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
 
-    if outdir:
-        fig.savefig(outdir / "harmonic_spectrum.png", dpi=150)
-        log.info("Saved plot → %s/harmonic_spectrum.png", outdir)
-    else:
-        plt.show()
-    plt.close(fig)
+    _save(fig, outdir, stem, "harmonic_spectrum.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,36 +345,11 @@ def plot_harmonic_spectrum(
 # Applicable to 120 V nominal (120/208 V and 120/240 V, 60 Hz systems).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Step-function boundary lines (duplicate x-values create vertical segments)
-_ITIC_UPPER_MS_STEP  = np.array([0.001, 1,   1,   3,   3,   20,  20,  500, 500, 1e6])
-_ITIC_UPPER_PCT_STEP = np.array([500,   500, 200, 200, 140, 140, 120, 120, 110, 110])
-_ITIC_LOWER_MS_STEP  = np.array([0.001, 20,  20,  500, 500, 1e4, 1e4, 1e6])
-_ITIC_LOWER_PCT_STEP = np.array([0,     0,   70,  70,  80,  80,  90,  90 ])
-
-
-def _itic_upper_v(x: np.ndarray) -> np.ndarray:
-    """ITIC upper boundary (% nominal) at each duration x (ms)."""
-    r = np.full_like(x, 110.0, dtype=float)
-    r[x < 500] = 120.0
-    r[x < 20]  = 140.0
-    r[x < 3]   = 200.0
-    r[x < 1]   = 500.0
-    return r
-
-
-def _itic_lower_v(x: np.ndarray) -> np.ndarray:
-    """ITIC lower boundary (% nominal) at each duration x (ms)."""
-    r = np.full_like(x, 90.0, dtype=float)
-    r[x < 10000] = 80.0
-    r[x < 500]   = 70.0
-    r[x < 20]    = 0.0
-    return r
-
-
 def plot_itic(
     events: pd.DataFrame,
     thresh: Thresholds,
     outdir: Optional[Path] = None,
+    stem: str = "",
 ) -> None:
     """ITIC voltage tolerance curve with sag/swell events plotted as (duration, magnitude) points.
 
@@ -363,7 +393,7 @@ def plot_itic(
     ax.plot(_ITIC_LOWER_MS_STEP, _ITIC_LOWER_PCT_STEP, "r-", lw=1.5, label="ITIC boundary")
     ax.axhline(100, color="#666666", ls=":", lw=0.8, alpha=0.7, label="100% nominal")
 
-    phase_colors = {"A": "#2196F3", "B": "#FF9800", "C": "#4CAF50"}
+    phase_colors = {"A": _PH_A, "B": _PH_B, "C": _PH_C}
     for phase, color in phase_colors.items():
         s = vol_events[(vol_events["type"] == "voltage_sag")    & (vol_events["phase"] == phase)]
         if not s.empty:
@@ -393,7 +423,7 @@ def plot_itic(
     ax.set_xticklabels(["0.001", "0.01", "0.1", "1", "10", "100", "1 s", "10 s", "100 s"])
 
     fig.tight_layout()
-    outpath = (outdir or Path(".")) / "itic_curve.png"
+    outpath = (outdir or Path(".")) / _plot_name(stem, "itic_curve.png")
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
     log.info("ITIC curve plot saved → %s", outpath)
@@ -404,6 +434,7 @@ def plot_neutral_health(
     neutral_result: dict,
     thresh: Thresholds,
     outdir: Optional[Path] = None,
+    stem: str = "",
 ) -> None:
     """Four-panel neutral health plot for split-phase services."""
     if not neutral_result.get("available"):
@@ -434,9 +465,9 @@ def plot_neutral_health(
     # ── Panel 0: L1 and L2 voltage ────────────────────────────────────────────
     ax = axes[0]
     ax.plot(aligned.index, aligned["voltage_a"],
-            color="#2196F3", lw=0.8, label="L1-N (voltage_a)")
+            color=_PH_A, lw=0.8, label="L1-N (voltage_a)")
     ax.plot(aligned.index, aligned["voltage_b"],
-            color="#FF9800", lw=0.8, label="L2-N (voltage_b)")
+            color=_PH_B, lw=0.8, label="L2-N (voltage_b)")
     vmin = nom * (1 - thresh.volt_tolerance)
     vmax = nom * (1 + thresh.volt_tolerance)
     ax.axhline(vmin, color="red", ls="--", lw=0.8, alpha=0.7, label=f"ANSI lower ({vmin:.1f} V)")
@@ -445,7 +476,7 @@ def plot_neutral_health(
     ax.set_title("L1-N and L2-N Voltages")
     ax.legend(fontsize=8, loc="upper right")
     ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    _fmt_time_axis(ax, aligned.index)
 
     # ── Panel 1: Voltage sum (L1 + L2) ───────────────────────────────────────
     ax = axes[1]
@@ -460,7 +491,7 @@ def plot_neutral_health(
     ax.set_title(f"Voltage Sum Stability  [std = {sum_std:.2f} V]")
     ax.legend(fontsize=8, loc="upper right")
     ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    _fmt_time_axis(ax, aligned.index)
 
     # ── Panel 2: Voltage asymmetry |L1 − L2| ─────────────────────────────────
     ax = axes[2]
@@ -478,7 +509,7 @@ def plot_neutral_health(
     )
     ax.legend(fontsize=8, loc="upper right")
     ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    _fmt_time_axis(ax, aligned.index)
 
     # ── Panel 3 (optional): Neutral-to-earth Vne ─────────────────────────────
     if has_vne:
@@ -495,7 +526,7 @@ def plot_neutral_health(
         )
         ax.legend(fontsize=8, loc="upper right")
         ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        _fmt_time_axis(ax, vne.index)
 
     sev_colors = {"normal": "green", "caution": "goldenrod",
                   "warning": "orange", "critical": "red"}
@@ -508,7 +539,333 @@ def plot_neutral_health(
     fig.autofmt_xdate()
     fig.tight_layout()
 
-    outpath = (outdir or Path(".")) / "neutral_health.png"
+    outpath = (outdir or Path(".")) / _plot_name(stem, "neutral_health.png")
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
     log.info("Neutral health plot saved → %s", outpath)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEMAND PROFILE / HEATMAP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_demand_profile(
+    df: pd.DataFrame,
+    thd_result: dict,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Time-of-day demand pattern.
+
+    Recordings spanning ≥ 2 days: hour-of-day × date heatmap of demand, plus a
+    TDD heatmap when computable — answers "when does the load (and distortion)
+    peak" at a glance.  Single-day recordings: hourly demand profile
+    (mean line + min–max band) instead, since a one-column heatmap is unreadable.
+    """
+    i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
+    if "power_real" in df.columns and df["power_real"].notna().any():
+        demand = df["power_real"].dropna()
+        d_label = "Real power (kW)"
+    elif i_cols:
+        demand = df[i_cols].max(axis=1).dropna()
+        d_label = "Worst-phase current (A)"
+    else:
+        log.warning("plot_demand_profile: no power or current channels.")
+        return
+    if demand.empty:
+        return
+
+    n_days = len(np.unique(demand.index.date))
+
+    # Per-interval TDD series (same formula as check_thd), worst phase
+    tdd_info = thd_result.get("tdd_info", {})
+    il_amps  = tdd_info.get("il_amps")
+    tdd_worst = None
+    if il_amps:
+        tdd_series = []
+        for ph in ("a", "b", "c"):
+            t_col, i_col = f"thd_current_{ph}", f"current_{ph}"
+            if t_col in df.columns and i_col in df.columns:
+                aligned = df[[t_col, i_col]].dropna()
+                if len(aligned):
+                    tdd_series.append(aligned[t_col] * aligned[i_col] / il_amps)
+        if tdd_series:
+            tdd_worst = pd.concat(tdd_series, axis=1).max(axis=1).dropna()
+
+    if n_days >= 2:
+        panels = [("Demand", demand, d_label, "Blues")]
+        if tdd_worst is not None and not tdd_worst.empty:
+            panels.append(("Current TDD", tdd_worst, "TDD (%)", "Oranges"))
+        fig, axes = plt.subplots(1, len(panels), figsize=(7.5 * len(panels), 5))
+        if len(panels) == 1:
+            axes = [axes]
+        for ax, (title, series, cbar_label, cmap) in zip(axes, panels):
+            grid = series.groupby(
+                [series.index.hour, series.index.date]
+            ).mean().unstack()
+            im = ax.imshow(grid.values, aspect="auto", cmap=cmap,
+                           origin="lower", interpolation="nearest")
+            ax.set_yticks(range(0, 24, 3))
+            ax.set_yticklabels([f"{h:02d}:00" for h in range(0, 24, 3)], fontsize=8)
+            ax.set_xticks(range(len(grid.columns)))
+            ax.set_xticklabels([d.strftime("%m/%d") for d in grid.columns],
+                               fontsize=8, rotation=45)
+            ax.set_ylabel("Hour of day")
+            ax.set_title(f"{title} by Hour and Day")
+            fig.colorbar(im, ax=ax, label=cbar_label, shrink=0.85)
+        fig.tight_layout()
+    else:
+        hours  = demand.index.hour
+        h_mean = demand.groupby(hours).mean()
+        h_min  = demand.groupby(hours).min()
+        h_max  = demand.groupby(hours).max()
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.fill_between(h_mean.index, h_min, h_max, color=_PH_A, alpha=0.15,
+                        linewidth=0, label="Min–max range")
+        ax.plot(h_mean.index, h_mean, color=_PH_A, lw=1.8, label="Hourly mean")
+        ax.set_xticks(range(0, 24, 3))
+        ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 3)])
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel(d_label)
+        ax.set_title("Demand Profile by Hour of Day")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+
+    _save(fig, outdir, stem, "demand_profile.png")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HARMONIC TREND vs LOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_harmonic_trend(
+    df: pd.DataFrame,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Worst-phase H3/H5/H7 harmonic current magnitudes over time, with total
+    load current for context (all in amps — one axis).  Load-correlated
+    harmonics point to customer load; load-independent harmonics point to
+    background/system sources."""
+    orders = [(3, _PH_A), (5, _PH_B), (7, _PH_C)]
+    series = {}
+    for h, _ in orders:
+        cols = [f"h{h}_current_{p}" for p in "abc" if f"h{h}_current_{p}" in df.columns]
+        if cols:
+            s = df[cols].max(axis=1).dropna()
+            if not s.empty:
+                series[h] = s
+    if not series:
+        log.warning("plot_harmonic_trend: no individual harmonic channels.")
+        return
+
+    i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
+    load = df[i_cols].max(axis=1).dropna() if i_cols else None
+
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+    if load is not None and not load.empty:
+        ax.plot(load.index, load, color=_NEUTRAL_CLR, lw=0.8, ls="--", alpha=0.7,
+                label="Load current (worst phase)")
+    for h, color in orders:
+        if h in series:
+            ax.plot(series[h].index, series[h], color=color, lw=1.0, label=f"H{h}")
+
+    _fmt_time_axis(ax, df.index)
+    fig.autofmt_xdate()
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Current (A)")
+    ax.set_title("Harmonic Current Magnitudes vs Load (worst phase per order)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    _save(fig, outdir, stem, "harmonic_trend.png")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMBALANCE & NEUTRAL CURRENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_imbalance(
+    df: pd.DataFrame,
+    volt_imb_result: dict,
+    curr_imb_result: dict,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Stacked panels: voltage imbalance %, current imbalance %, and neutral
+    current — each against its limit where one applies."""
+    panels = []
+
+    v_series = volt_imb_result.get("imbalance_series")
+    if v_series is not None and len(v_series.dropna()):
+        panels.append(("Voltage imbalance (%)", v_series.dropna(),
+                       volt_imb_result.get("limit_pct"), "#6A3D9A"))
+
+    i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
+    if len(i_cols) >= 2:
+        idf = df[i_cols].dropna()
+        if len(idf):
+            avg = idf.mean(axis=1)
+            dev = idf.subtract(avg, axis=0).abs().max(axis=1)
+            ci  = pd.Series(np.where(avg > 1.0, dev / avg * 100, np.nan), index=idf.index).dropna()
+            if len(ci):
+                panels.append(("Current imbalance (%)", ci,
+                               curr_imb_result.get("limit_pct"), _PH_B))
+
+    if "current_neutral" in df.columns:
+        nc = df["current_neutral"].dropna()
+        if len(nc):
+            panels.append(("Neutral current (A)", nc, None, _NEUTRAL_CLR))
+
+    if not panels:
+        log.warning("plot_imbalance: no imbalance data to plot.")
+        return
+
+    fig, axes = plt.subplots(len(panels), 1, figsize=(14, 3 * len(panels)), sharex=True)
+    if len(panels) == 1:
+        axes = [axes]
+    for ax, (ylabel, series, limit, color) in zip(axes, panels):
+        ax.plot(series.index, series, color=color, lw=0.8)
+        if limit is not None:
+            ax.axhline(limit, color="red", ls="--", lw=1.0, label=f"Limit ({limit:.0f}%)")
+            ax.legend(fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    _fmt_time_axis(axes[-1], df.index)
+    fig.autofmt_xdate()
+    axes[-1].set_xlabel("Time")
+    fig.suptitle("Voltage / Current Imbalance and Neutral Current", fontsize=11)
+    fig.tight_layout()
+
+    _save(fig, outdir, stem, "imbalance.png")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POWER FACTOR vs LOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_pf_load(
+    df: pd.DataFrame,
+    pf_result: dict,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Scatter of power factor vs load.  Shows whether low PF coincides with
+    high load (tariff-relevant) or only light load (usually benign)."""
+    if "power_factor" not in df.columns:
+        return
+    if "power_real" in df.columns and df["power_real"].notna().any():
+        load, x_label = df["power_real"], "Real power (kW)"
+    else:
+        i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
+        if not i_cols:
+            return
+        load, x_label = df[i_cols].max(axis=1), "Worst-phase current (A)"
+
+    aligned = pd.concat([load.rename("load"), df["power_factor"].abs().rename("pf")],
+                        axis=1).dropna()
+    if aligned.empty:
+        return
+
+    limit = pf_result.get("limit") if pf_result.get("available") else None
+    below = aligned["pf"] < limit if limit else pd.Series(False, index=aligned.index)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ok = aligned[~below]
+    ax.scatter(ok["load"], ok["pf"], s=14, color=_PH_A, alpha=0.5,
+               edgecolors="none", label="Interval")
+    if below.any():
+        bad = aligned[below]
+        ax.scatter(bad["load"], bad["pf"], s=18, color="#CC0000", alpha=0.7,
+                   edgecolors="white", linewidths=0.3,
+                   label=f"Below limit (n={len(bad)})")
+    if limit:
+        ax.axhline(limit, color="red", ls="--", lw=1.0, label=f"Tariff limit ({limit:.2f})")
+
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Power factor")
+    ax.set_ylim(min(0.5, float(aligned["pf"].min()) - 0.02), 1.02)
+    ax.set_title("Power Factor vs Load")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    _save(fig, outdir, stem, "pf_load.png")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POINT-ON-WAVE CAPTURE SNAPSHOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_waveform_capture(
+    ds,
+    thresh: Thresholds,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Instantaneous waveform snapshot of the most severe point-on-wave
+    capture (largest half-cycle RMS deviation from nominal voltage)."""
+    wfs = getattr(ds, "waveforms", None) or []
+    if not wfs:
+        return
+    nominal = thresh.nominal_voltage
+
+    def severity(wf) -> float:
+        fs = wf.get("fs_hz") or 0
+        if fs <= 0:
+            return 0.0
+        w = max(int(round(fs / 60.0 / 2)), 8)
+        worst = 0.0
+        for x in wf["voltages"].values():
+            x = np.asarray(x, dtype=float)
+            if len(x) < 2 * w:
+                continue
+            c = np.cumsum(np.concatenate(([0.0], x * x)))
+            rms = np.sqrt((c[w:] - c[:-w]) / w)
+            worst = max(worst, float(np.max(np.abs(rms - nominal))))
+        return worst
+
+    wf   = max(wfs, key=severity)
+    t_ms = np.asarray(wf["t"], dtype=float) * 1000.0
+    has_i = bool(wf.get("currents"))
+
+    fig, axes = plt.subplots(2 if has_i else 1, 1,
+                             figsize=(14, 7 if has_i else 4), sharex=True)
+    if not has_i:
+        axes = [axes]
+
+    ax = axes[0]
+    peak = nominal * np.sqrt(2)
+    for ph, x in wf["voltages"].items():
+        n = min(len(x), len(t_ms))
+        ax.plot(t_ms[:n], x[:n], color=_PHASE_CLR.get(ph, "gray"), lw=0.9,
+                label=f"V {ph.upper()}")
+    ax.axhline(peak,  color="red", ls=":", lw=0.8, alpha=0.7,
+               label=f"±nominal peak ({peak:.0f} V)")
+    ax.axhline(-peak, color="red", ls=":", lw=0.8, alpha=0.7)
+    ax.set_ylabel("Voltage (V)")
+    ax.set_title(
+        f"Worst Waveform Capture — {wf['timestamp']:%Y-%m-%d %H:%M:%S.%f}"[:60]
+        + f"  ({len(wfs)} captures in recording)"
+    )
+    ax.legend(fontsize=8, ncol=4)
+    ax.grid(True, alpha=0.3)
+
+    if has_i:
+        ax = axes[1]
+        for ph, x in wf["currents"].items():
+            n = min(len(x), len(t_ms))
+            lbl = "I N" if ph == "n" else f"I {ph.upper()}"
+            clr = _NEUTRAL_CLR if ph == "n" else _PHASE_CLR.get(ph, "gray")
+            ax.plot(t_ms[:n], x[:n], color=clr, lw=0.9, label=lbl)
+        ax.set_ylabel("Current (A)")
+        ax.legend(fontsize=8, ncol=4)
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Time from capture start (ms)")
+    fig.tight_layout()
+
+    _save(fig, outdir, stem, "waveform_worst.png")
