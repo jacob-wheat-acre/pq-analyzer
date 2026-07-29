@@ -922,30 +922,54 @@ class ProntoAdapter:
         n_expected = ts_count_raw // 2
         naive_vals = _try_candidate(data_rel)
         if naive_vals is None:
-            best_rel, best_diff = None, None
+            naive_count = struct.unpack_from('<I', interval_body, ch0_abs + data_rel)[0]
+            candidates: List[Tuple[int, str]] = []
+
+            # Hypothesis (preferred): naive_count == ts_count_raw means we landed
+            # on the count field of an extra same-length array this file's layout
+            # includes that the fixed "+32" doesn't know about -- e.g. a quality
+            # flag per timestamp, mirroring the confirmed multi-blob-per-channel
+            # structure of the separate obs[24] max/min record. Its length is
+            # ts_count_raw itself, a value this file already told us, not a
+            # guessed constant -- so jump past 1, then 2, then 3 such arrays.
+            # This is the fix the file's own data points to, not a local nudge.
+            if naive_count == ts_count_raw:
+                block = 4 + ts_count_raw * 8
+                for n_blocks in (1, 2, 3):
+                    candidates.append((data_rel + block * n_blocks, f"+{n_blocks} same-length array(s)"))
+
+            # Fallback: small local misalignment in the fixed trailing gap.
             for delta in range(-256, 257, 4):
-                cand_rel = data_rel + delta
+                if delta != 0:
+                    candidates.append((data_rel + delta, f"local offset {delta:+d}"))
+
+            best_rel, best_diff, best_desc = None, None, None
+            for cand_rel, desc in candidates:
                 vals = _try_candidate(cand_rel)
                 if vals is None:
                     continue
                 cand_count = struct.unpack_from('<I', interval_body, ch0_abs + cand_rel)[0]
                 diff = abs(cand_count - n_expected)
                 if best_diff is None or diff < best_diff:
-                    best_rel, best_diff = cand_rel, diff
+                    best_rel, best_diff, best_desc = cand_rel, diff, desc
+
             if best_rel is not None:
                 log.warning(
-                    "ProntoAdapter v2: naive data_rel=%d didn't decode to sane values -- "
-                    "recalibrated to data_rel=%d (%+d bytes) based on a nearby position whose "
-                    "decoded values are finite and physically plausible.",
-                    data_rel, best_rel, best_rel - data_rel,
+                    "ProntoAdapter v2: naive data_rel=%d didn't decode to sane values "
+                    "(count field read %d) -- recalibrated to data_rel=%d (%+d bytes, via %s) "
+                    "based on a position whose decoded values are finite and physically "
+                    "plausible.",
+                    data_rel, naive_count, best_rel, best_rel - data_rel, best_desc,
                 )
                 data_rel = best_rel
             else:
                 raise ValueError(
-                    f"ProntoAdapter v2: could not find a data_rel within +/-256 bytes that "
-                    f"decodes channel 0 to sane values (naive data_rel={data_rel}). This file's "
-                    "export layout doesn't match any offset this adapter knows how to compute -- "
-                    "needs dedicated support rather than another guessed constant."
+                    f"ProntoAdapter v2: could not find a data_rel that decodes channel 0 to "
+                    f"sane values (naive data_rel={data_rel}, count field read {naive_count}). "
+                    "Tried skipping past extra same-length arrays and a +/-256 byte local "
+                    "search. This file's export layout doesn't match any offset this adapter "
+                    "knows how to compute -- needs dedicated support rather than another "
+                    "guessed constant."
                 )
 
         # Structural diagnostics only -- byte offsets and counts, never any
