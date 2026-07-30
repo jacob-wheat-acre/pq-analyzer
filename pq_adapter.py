@@ -743,6 +743,19 @@ class ProntoAdapter:
             })
         return out
 
+    @staticmethod
+    def _find_channel_instances_off(obs_body: bytes) -> Optional[int]:
+        """Structural offset of the ChannelInstances element-list within an obs
+        body, read directly from the top-level PQDIF element table (guid4
+        0x3D786F91) rather than guessed from label length. Both the DS-label
+        map (_build_label_map) and the per-channel data pointers (_load_v2)
+        key off the same 'ci' index into this same table, so both must resolve
+        addresses through it -- see _load_v2's entry_start cross-check."""
+        for e in ProntoAdapter._pqdif_elements(obs_body, 0):
+            if e['guid4'] == 0x3D786F91:
+                return e['off']
+        return None
+
     def _build_label_map(self, all_recs: List[Dict], obs_body: bytes) -> Dict[str, int]:
         """Build {label → obs_ci} from DataSource channel names and ChannelInstances.
         Labels decoded with latin-1 to preserve all byte values (CP1253 phi=0xF8)."""
@@ -778,12 +791,7 @@ class ProntoAdapter:
                         ds_label[ds_ci] = lbl
                     break
 
-        obs_top = self._pqdif_elements(obs_body, 0)
-        ci_off: Optional[int] = None
-        for e in obs_top:
-            if e['guid4'] == 0x3D786F91:
-                ci_off = e['off']
-                break
+        ci_off = self._find_channel_instances_off(obs_body)
         if ci_off is None:
             return {}
 
@@ -800,6 +808,41 @@ class ProntoAdapter:
                     break
 
         return label_map
+
+    _PRINTABLE_RUN = re.compile(rb'[\x20-\x7e]{4,}')
+
+    @staticmethod
+    def _describe_obs_label(body: bytes) -> str:
+        """Best-effort human-readable label for a decompressed obs body, for error
+        diagnostics only. Tries the expected label_length/label field at offset
+        144/148 first (see _load_v2), then falls back to the longest run of
+        printable text in the first 300 bytes in case the layout has shifted."""
+        if len(body) > 148:
+            length = struct.unpack_from('<I', body, 144)[0]
+            if 1 <= length <= 200 and 148 + length <= len(body):
+                candidate = body[148:148 + length].rstrip(b'\x00')
+                if candidate:
+                    return repr(candidate.decode('latin-1'))
+        runs = ProntoAdapter._PRINTABLE_RUN.findall(body[:300])
+        if runs:
+            return repr(max(runs, key=len).decode('latin-1')) + ' (fallback scan)'
+        return '<no printable label found in first 300 bytes>'
+
+    @classmethod
+    def _describe_obs_records(cls, obs_recs: List[Dict]) -> str:
+        """One diagnostic line per Observation record: decompressed size and its
+        apparent label. Emitted in the 'Interval (avg) not found' error so a user's
+        traceback alone is enough to tell us what labels this file actually uses,
+        without needing the file itself."""
+        lines = []
+        for i, rec in enumerate(obs_recs):
+            try:
+                body = zlib.decompress(rec['raw'])
+            except zlib.error as exc:
+                lines.append(f"  obs[{i}]: zlib decompression failed ({exc}), raw_len={len(rec['raw'])}")
+                continue
+            lines.append(f"  obs[{i}]: body_len={len(body)}, label={cls._describe_obs_label(body)}")
+        return "\n".join(lines)
 
     def _load_v2(self, obs_recs: List[Dict], all_recs: List[Dict]) -> None:
         """Load new Pronto format using DataSource label-based channel discovery.
@@ -831,7 +874,9 @@ class ProntoAdapter:
         if interval_body is None:
             raise ValueError(
                 "ProntoAdapter v2: could not find 'Interval (avg)' observation record. "
-                "Is this a Pronto PQDIF file?"
+                "Is this a Pronto PQDIF file?\n"
+                f"Found {len(obs_recs)} Observation record(s):\n"
+                + self._describe_obs_records(obs_recs)
             )
 
         base_date = self._parse_v2_date(obs_recs)
@@ -843,16 +888,42 @@ class ProntoAdapter:
                 f"ProntoAdapter v2: unexpected label_length {label_length} in "
                 "'Interval (avg)' obs body — unsupported Pronto PQDIF format."
             )
-        entry_start = 148 + ((label_length + 3) & ~3) + 28
+        heuristic_entry_start = 148 + ((label_length + 3) & ~3) + 28
+
+        # ── Structural ChannelInstances table (authoritative) ────────────────
+        # entry_start used to be derived only from label_length padding, which
+        # happened to match this table's real start on every file seen so far.
+        # Read the table's own pointer (same one _build_label_map keys 'ci'
+        # against) instead of assuming that match always holds -- a per-channel
+        # index that comes from that same table must resolve addresses through
+        # it, not through a separately guessed offset.
+        ci_off = self._find_channel_instances_off(interval_body)
+        ci_elements = self._pqdif_elements(interval_body, ci_off) if ci_off is not None else []
+        entry_start = (ci_off + 4) if ci_off is not None else heuristic_entry_start
+        if ci_off is not None and entry_start != heuristic_entry_start:
+            log.warning(
+                "ProntoAdapter v2: ChannelInstances table starts at %d but the "
+                "label_length=%d heuristic predicted %d -- using the structural "
+                "table. If channel data still comes back empty, this file's "
+                "layout needs more adapter support.",
+                entry_start, label_length, heuristic_entry_start,
+            )
+
+        def channel_abs(ci: int) -> Optional[int]:
+            if ci < len(ci_elements):
+                return ci_elements[ci]['off']
+            pos = entry_start + ci * self._V2_ENTRY_SIZE + self._V2_BODY_OFF_REL
+            if pos + 4 > len(interval_body):
+                return None
+            return struct.unpack_from('<I', interval_body, pos)[0]
 
         # ── Dynamic DATA_REL ────────────────────────────────────────────────
-        pos0 = entry_start + self._V2_BODY_OFF_REL
-        if pos0 + 4 > len(interval_body):
+        ch0_abs = channel_abs(0)
+        if ch0_abs is None:
             raise ValueError(
                 f"ProntoAdapter v2: entry_start={entry_start} + body_off="
                 f"{self._V2_BODY_OFF_REL} exceeds body length {len(interval_body)}."
             )
-        ch0_abs = struct.unpack_from('<I', interval_body, pos0)[0]
         ts_abs = ch0_abs + self._V2_TS_REL
         if ts_abs + 4 > len(interval_body):
             raise ValueError(
@@ -891,8 +962,9 @@ class ProntoAdapter:
         _logged_call_count = [0]
 
         def read_v2(ci: int) -> np.ndarray:
-            pos = entry_start + ci * self._V2_ENTRY_SIZE + self._V2_BODY_OFF_REL
-            ch_abs = struct.unpack_from('<I', interval_body, pos)[0]
+            ch_abs = channel_abs(ci)
+            if ch_abs is None:
+                return np.array([np.nan])
             data_abs = ch_abs + data_rel
             count = struct.unpack_from('<I', interval_body, data_abs)[0]
             if _logged_call_count[0] < 5:
@@ -1077,12 +1149,35 @@ class ProntoAdapter:
 
         # entry_start: bytes 144-147 hold the label length (including null terminator).
         # The label field is padded to a 4-byte boundary, then followed by a fixed 28-byte
-        # header block, then the channel entry table.
+        # header block, then the channel entry table. Prefer the structural
+        # ChannelInstances pointer (same lookup used in _load_v2) over that padding
+        # arithmetic -- see the entry_start cross-check there for why the heuristic
+        # alone isn't reliable on every file.
         label_length = struct.unpack_from('<I', maxmin_body, 144)[0]
-        entry_start  = 148 + ((label_length + 3) & ~3) + 28
+        heuristic_entry_start = 148 + ((label_length + 3) & ~3) + 28
+        ci_off = self._find_channel_instances_off(maxmin_body)
+        ci_elements = self._pqdif_elements(maxmin_body, ci_off) if ci_off is not None else []
+        entry_start = (ci_off + 4) if ci_off is not None else heuristic_entry_start
+        if ci_off is not None and entry_start != heuristic_entry_start:
+            log.warning(
+                "ProntoAdapter v2: obs[24] ChannelInstances table starts at %d but the "
+                "label_length=%d heuristic predicted %d -- using the structural table.",
+                entry_start, label_length, heuristic_entry_start,
+            )
 
-        pos0    = entry_start + self._V2_BODY_OFF_REL
-        ch0_abs = struct.unpack_from('<I', maxmin_body, pos0)[0]
+        def _channel_abs(ci: int) -> Optional[int]:
+            if ci < len(ci_elements):
+                return ci_elements[ci]['off']
+            pos = entry_start + ci * self._V2_ENTRY_SIZE + self._V2_BODY_OFF_REL
+            if pos + 4 > len(maxmin_body):
+                return None
+            return struct.unpack_from('<I', maxmin_body, pos)[0]
+
+        ch0_abs = _channel_abs(0)
+        if ch0_abs is None:
+            self._interval_peaks = {}
+            self._interval_mins  = {}
+            return
 
         # The maxmin channel block has more intra-block header bytes than the avg block
         # (extra sub-blob pointers for the min and third sections).  Find ts_count_raw
@@ -1107,10 +1202,9 @@ class ProntoAdapter:
         min_rel   = data_rel + blob_size + 32        # skip max blob + 32-byte separator
 
         def _read_section(ci: int, rel: int) -> Optional[np.ndarray]:
-            pos = entry_start + ci * self._V2_ENTRY_SIZE + self._V2_BODY_OFF_REL
-            if pos + 4 > len(maxmin_body):
+            ch_abs = _channel_abs(ci)
+            if ch_abs is None:
                 return None
-            ch_abs  = struct.unpack_from('<I', maxmin_body, pos)[0]
             abs_off = ch_abs + rel
             if abs_off + 4 > len(maxmin_body):
                 return None
