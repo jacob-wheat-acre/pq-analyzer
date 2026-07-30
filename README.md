@@ -98,6 +98,73 @@ on the file in Finder and choose **Copy as Pathname**.
 
 ---
 
+## Keeping the Tool Updated
+
+Fixes ship regularly, especially for new meter file variants. Update your
+copy periodically — and any time you're asked to retry after reporting an
+error. The easiest way is `git pull`, which only downloads what changed
+instead of a fresh copy of everything.
+
+### Windows
+
+**One-time: install Git.**
+Download and install [Git for Windows](https://git-scm.com/download/win)
+(the default options are fine).
+
+**One-time: switch your existing folder to git.**
+If your `pq-analyzer` folder came from a ZIP download (not `git clone`),
+convert it once so future updates are a single command:
+1. Rename or delete your current `pq-analyzer` folder.
+2. Open Command Prompt, `cd` to where you want the folder (e.g. `cd
+   Documents`), then run:
+   ```
+   git clone https://github.com/jacob-wheat-acre/pq-analyzer.git
+   ```
+3. Re-run `install_shortcut.bat` if you use the Desktop shortcut, so it
+   points at the new folder.
+
+**From then on, to update:**
+Shift+right-click inside the `pq-analyzer` folder → "Open PowerShell window
+here" (or `cd` there in Command Prompt), then run:
+```
+git pull
+```
+
+### Mac
+
+**One-time: install Git.**
+Git ships with the Xcode Command Line Tools. If `git` isn't already
+installed, Terminal will prompt you to install it the first time you run a
+git command, or you can trigger it directly:
+```
+xcode-select --install
+```
+
+**One-time: switch your existing folder to git.**
+If your `pq-analyzer` folder came from a ZIP download (not `git clone`),
+convert it once so future updates are a single command:
+1. Rename or delete your current `pq-analyzer` folder.
+2. In Terminal, navigate to where you want the folder, then run:
+   ```
+   git clone https://github.com/jacob-wheat-acre/pq-analyzer.git
+   ```
+
+**From then on, to update:**
+Open Terminal in the `pq-analyzer` folder and run:
+```
+git pull
+```
+
+### After any update
+
+Dependencies occasionally change. After pulling, re-run:
+```
+pip install -r pq_analyzer_requirements.txt      # Windows
+pip3 install -r pq_analyzer_requirements.txt     # Mac
+```
+
+---
+
 ## Typical Workflow
 
 1. Open the tool and select a `.pqd` file using the **Browse** button.
