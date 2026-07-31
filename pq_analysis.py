@@ -298,6 +298,97 @@ def check_frequency(df: pd.DataFrame, thresh: Thresholds) -> dict:
     }
 
 
+#: Current-channel display resolution of the meter, in amps. Reported per-order
+#: harmonic magnitudes are quantised to this.
+CURRENT_RESOLUTION_A = 0.1
+
+#: A spectrum is only classified when its dominant order stands this many
+#: resolution steps clear of the quantisation floor. At 5 steps the largest order
+#: carries ~10% quantisation error and the small orders far more, which is the
+#: point where ratios like H5/H7 stop meaning anything.
+_MIN_RESOLUTION_STEPS = 5
+
+#: Lower bound on what counts as a loaded interval, in amps: ten resolution
+#: steps. Nothing below this is meaningful load on any service.
+_MIN_LOADED_AMPS = 1.0
+
+#: Fewest loaded intervals worth drawing a spectral conclusion from.
+_MIN_LOADED_INTERVALS = 20
+
+
+def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """Whether the current harmonic spectrum carries usable shape information.
+
+    Harmonic *shape* -- the ratios between orders that identify a load type or
+    a resonance -- is only meaningful when the orders are well clear of the
+    meter's 0.1 A reporting resolution and the service is actually loaded. On a
+    1.1 A residential service with 0.2 A of third harmonic, each order carries
+    25-50% quantisation error, every ratio built from them is noise, and a
+    classifier will nonetheless return a confident answer: this is what had a
+    house reported as an electric arc furnace at 94% similarity.
+
+    IEEE 519-2022 also specifies harmonic evaluation at maximum demand
+    conditions, so light intervals are excluded from the spectrum rather than
+    averaged into it.
+
+    Returns a dict with ``usable``, a human ``reason``, the ``loaded`` boolean
+    mask to compute the spectrum over, and the diagnostics behind the decision.
+    """
+    i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
+    out: dict = {"usable": False, "reason": "", "loaded": None,
+                 "loaded_intervals": 0, "dominant_order_amps": 0.0,
+                 "resolution_steps": 0.0, "load_verified": bool(i_cols)}
+
+    # Restricting to loaded intervals is a refinement and needs an RMS current
+    # channel. The resolution test below is the substantive one and stands on
+    # its own, so a file without RMS current is still assessed rather than
+    # declined outright.
+    if i_cols:
+        demand = df[i_cols].max(axis=1)
+        il_amps = float(demand.max())
+        floor = max(_MIN_LOADED_AMPS, il_amps * 0.10)
+        loaded = demand >= floor
+        out["loaded"] = loaded
+        out["loaded_intervals"] = int(loaded.sum())
+        out["load_floor_amps"] = round(floor, 3)
+        out["il_amps"] = round(il_amps, 2)
+
+        if out["loaded_intervals"] < _MIN_LOADED_INTERVALS:
+            out["reason"] = (
+                f"Only {out['loaded_intervals']} interval(s) reached {floor:.1f} A "
+                f"(10% of the {il_amps:.1f} A maximum demand); too little loaded "
+                "data to characterise the harmonic spectrum."
+            )
+            return out
+        scope = df[loaded]
+    else:
+        scope = df
+
+    means = _harmonic_means(scope, (3, 5, 7, 9, 11, 13))
+    dominant = max(means.values()) if means else 0.0
+    steps = dominant / CURRENT_RESOLUTION_A if CURRENT_RESOLUTION_A else 0.0
+    out["dominant_order_amps"] = round(dominant, 3)
+    out["resolution_steps"] = round(steps, 1)
+
+    if steps < _MIN_RESOLUTION_STEPS:
+        out["reason"] = (
+            f"The largest harmonic order averages {dominant:.2f} A, only "
+            f"{steps:.1f} times the meter's {CURRENT_RESOLUTION_A} A reporting "
+            "resolution. The spectrum is dominated by quantisation, so its shape "
+            "cannot identify a load type or a resonance."
+        )
+        return out
+
+    out["usable"] = True
+    out["reason"] = (
+        (f"{out['loaded_intervals']} loaded interval(s); " if i_cols
+         else "load level not verified (no RMS current channel); ")
+        + f"largest harmonic order {dominant:.2f} A "
+        f"({steps:.0f}x the {CURRENT_RESOLUTION_A} A resolution)."
+    )
+    return out
+
+
 def check_voltage_compliance(
     df: pd.DataFrame, thresh: Thresholds
 ) -> dict:
@@ -846,6 +937,12 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
       corr > 0.50 → 'customer'  (V and I co-vary → load injection drives both)
       else        → 'indeterminate'
     """
+    # Z_h and the ratios built from it are only interpretable when the harmonic
+    # orders stand clear of the meter's reporting resolution. Below that the
+    # impedance estimate is a ratio of two quantised near-zero numbers, which is
+    # what produced a 13x "resonance" on a 1.1 A residential service.
+    significance = harmonic_spectrum_significance(df, thresh)
+
     orders_with_data: dict[int, dict] = {}
 
     for h in _SOURCE_ORDERS:
@@ -925,6 +1022,24 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
     customer_count = attrs.count("customer")
     resonance_count = len(resonant_orders)
 
+    if not significance["usable"]:
+        # Keep the measured impedances as data, but draw no conclusion from them.
+        for od in orders_with_data.values():
+            od["attribution"] = "not_assessed"
+        return {
+            "available":      True,
+            "orders":         orders_with_data,
+            "linear_slope_a": round(a_fit, 5) if a_fit is not None else None,
+            "resonant_orders": [],
+            "overall":         "not_assessed",
+            "significance":    significance,
+            "note": (
+                "Source attribution and resonance screening were not performed: "
+                + significance["reason"]
+                + " The impedances above are reported as measured data only."
+            ),
+        }
+
     if resonance_count > 0:
         overall = "resonance_suspect"
     elif customer_count == len(attrs):
@@ -940,6 +1055,7 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "linear_slope_a": round(a_fit, 5) if a_fit is not None else None,
         "resonant_orders": resonant_orders,
         "overall":         overall,
+        "significance":    significance,
         "note": (
             "Attribution is indicative — Pearson r between V_h and I_h interval series. "
             "Exact source direction requires waveform phasor measurements."
@@ -968,6 +1084,14 @@ def check_spectral_shape(df: pd.DataFrame, thresh: Thresholds, source_harm: dict
     a resonance_suspect order at this site -- the two checks are complementary
     (narrowband vs. broadband explanations), not competing votes on the same finding.
     """
+    significance = harmonic_spectrum_significance(df, thresh)
+    if not significance["usable"]:
+        return {
+            "available": False,
+            "error": "Spectral shape not classified: " + significance["reason"],
+            "significance": significance,
+        }
+
     _ORDERS = (3, 5, 7, 11, 13)
     v_cols_by_order = {
         h: [c for c in (f"h{h}_voltage_a", f"h{h}_voltage_b", f"h{h}_voltage_c") if c in df.columns]
@@ -1865,7 +1989,8 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
-def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float) -> List[dict]:
+def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
+                               significance: Optional[dict] = None) -> List[dict]:
     """
     Score each entry in _LOAD_SIGNATURES against the measured harmonic spectrum
     using cosine similarity, then return the top matches as finding dicts.
@@ -1876,7 +2001,16 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float) -> List[dict]:
     stability (steady-state vs. intermittent).
     """
     _ORDERS = [3, 5, 7, 9, 11, 13]
-    h_mean = _harmonic_means(df, _ORDERS)
+    # Matching a load signature is a statement about spectral shape, so it is
+    # only made when the shape is measurable -- otherwise the library always
+    # returns its nearest neighbour to noise, with a confident-looking score.
+    if significance is not None and not significance["usable"]:
+        log.info("Harmonic load-signature matching skipped: %s",
+                 significance["reason"])
+        return []
+    scope = df[significance["loaded"]] if (
+        significance and significance.get("loaded") is not None) else df
+    h_mean = _harmonic_means(scope, _ORDERS)
     if len(h_mean) < 3:
         return []
 
@@ -1885,10 +2019,10 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float) -> List[dict]:
         return []
 
     # H5 inter-interval variability (coefficient of variation)
-    h5_cols = [f"h5_current_{p}" for p in "abc" if f"h5_current_{p}" in df.columns]
+    h5_cols = [f"h5_current_{p}" for p in "abc" if f"h5_current_{p}" in scope.columns]
     h5_cv = 0.0
     if h5_cols:
-        s = df[h5_cols].values.flatten()
+        s = scope[h5_cols].values.flatten()
         s = s[~np.isnan(s)]
         if len(s) > 0 and s.mean() > 0:
             h5_cv = float(s.std() / s.mean())
@@ -2076,7 +2210,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
 
     # ── Harmonic signature detection ──────────────────────────────────────────
     if il_amps > 0 and any(f"h5_current_{p}" in df.columns for p in "abc"):
-        findings.extend(_detect_harmonic_signature(df, il_amps))
+        findings.extend(_detect_harmonic_signature(
+            df, il_amps, harmonic_spectrum_significance(df, thresh)))
 
     # ── TDD approaching limit (marginal compliance warning) ──────────────────
     c_thd = thd.get("current", {})
@@ -2526,7 +2661,11 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
             k_phase = None
             k_source = "estimated"
         _k_rating, _k_wording = standard_k_rating(k_factor)
-        if pct_tx > 70 and k_factor > 4:
+        # A K-rating recommendation is only actionable when the harmonic content
+        # behind it was measured at real load; at 1.1 A the meter's K-factor runs
+        # to the hundreds and means nothing for sizing.
+        _k_significant = harmonic_spectrum_significance(df, thresh)["usable"]
+        if pct_tx > 70 and k_factor > 4 and _k_significant:
             findings.append({
                 "category":       "demand",
                 "severity":       "warning",

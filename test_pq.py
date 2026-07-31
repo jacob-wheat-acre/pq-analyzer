@@ -1376,3 +1376,87 @@ class TestTruncatedFile:
         broken.write_bytes(bytes(raw))
         with pytest.raises(pqdif.PQDIFError, match="could be read"):
             _ = pqdif.PQDIFFile(broken).observations
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. Harmonic conclusions are gated on measurable load
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHarmonicSignificanceGate:
+    """A spectrum quantised to the meter's resolution carries no shape.
+
+    Without this gate a 1.1 A residential service with 0.2 A of third harmonic
+    was reported as an electric arc furnace at 94% similarity, with a
+    recommendation to install a STATCOM.
+    """
+
+    @staticmethod
+    def _frame(fundamental, h3, n=300):
+        import pandas as pd
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min", tz="UTC")
+        return pd.DataFrame({
+            "current_a": [fundamental] * n,
+            "h3_current_a": [h3] * n,
+            "h5_current_a": [h3 * 0.5] * n,
+            "h7_current_a": [h3 * 0.3] * n,
+            "h9_current_a": [h3 * 0.1] * n,
+            "h3_voltage_a": [h3 * 0.1] * n,
+            "h5_voltage_a": [h3 * 0.08] * n,
+            "h7_voltage_a": [h3 * 0.06] * n,
+        }, index=idx)
+
+    def test_light_load_spectrum_is_refused(self):
+        from pq_analysis import harmonic_spectrum_significance
+        r = harmonic_spectrum_significance(self._frame(1.1, 0.2), Thresholds())
+        assert r["usable"] is False
+        assert "resolution" in r["reason"]
+
+    def test_loaded_spectrum_is_accepted(self):
+        from pq_analysis import harmonic_spectrum_significance
+        r = harmonic_spectrum_significance(self._frame(20.0, 4.0), Thresholds())
+        assert r["usable"] is True
+        assert r["resolution_steps"] >= 5
+
+    def test_no_signature_match_at_light_load(self):
+        from pq_analysis import _detect_harmonic_signature, harmonic_spectrum_significance
+        df = self._frame(1.1, 0.2)
+        sig = harmonic_spectrum_significance(df, Thresholds())
+        assert _detect_harmonic_signature(df, 1.1, sig) == []
+
+    def test_signature_match_survives_at_real_load(self):
+        from pq_analysis import _detect_harmonic_signature, harmonic_spectrum_significance
+        df = self._frame(20.0, 4.0)
+        sig = harmonic_spectrum_significance(df, Thresholds())
+        assert _detect_harmonic_signature(df, 20.0, sig)
+
+    def test_attribution_and_resonance_withheld_at_light_load(self):
+        from pq_analysis import check_harmonic_sources
+        r = check_harmonic_sources(self._frame(1.1, 0.2), Thresholds())
+        # The impedances stay as measured data; only the conclusions are withheld.
+        assert r["available"] is True
+        assert r["overall"] == "not_assessed"
+        assert r["resonant_orders"] == []
+        assert all(od["attribution"] == "not_assessed" for od in r["orders"].values())
+
+    def test_spectral_shape_declines_at_light_load(self):
+        from pq_analysis import check_spectral_shape, check_harmonic_sources
+        df = self._frame(1.1, 0.2)
+        src = check_harmonic_sources(df, Thresholds())
+        r = check_spectral_shape(df, Thresholds(), src)
+        assert r["available"] is False and "not classified" in r["error"]
+
+    def test_too_few_loaded_intervals_is_refused(self):
+        from pq_analysis import harmonic_spectrum_significance
+        import pandas as pd
+        df = self._frame(20.0, 4.0, n=300)
+        # Only 5 intervals at real load; the rest near zero.
+        df.loc[df.index[5:], "current_a"] = 0.1
+        r = harmonic_spectrum_significance(df, Thresholds())
+        assert r["usable"] is False and "loaded" in r["reason"]
+
+    def test_resolution_test_applies_without_an_rms_current_channel(self):
+        # Load cannot be verified, but the quantisation test still governs.
+        from pq_analysis import harmonic_spectrum_significance
+        df = self._frame(1.1, 0.2).drop(columns=["current_a"])
+        r = harmonic_spectrum_significance(df, Thresholds())
+        assert r["usable"] is False and r["load_verified"] is False
