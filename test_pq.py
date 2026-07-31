@@ -1049,3 +1049,39 @@ class TestFixturesAreCompliant:
             assert (low <= avg + 1e-9).all(), f"{col}: min > avg"
             checked += 1
         assert checked >= 2, "expected max-min columns on the fixtures"
+
+
+class TestOverloadedCharacteristics:
+    """Pronto reuses ID_QC_HRMS for four different channels per phase."""
+
+    def test_hrms_requires_a_name_prefix(self):
+        # 'Hrms Van (V1)', 'Odds Van (V1)', 'Evens Van (V1)' and 'Triplens Van'
+        # all carry characteristic HRMS with phase 'an'. Only the first is the
+        # total; without the prefix check, file ordering alone decided which one
+        # became hrms_voltage_a.
+        assert ProntoAdapter._SPEC_NAME_PREFIX["HRMS"] == "hrms"
+        assert ("voltage", "HRMS", "an") in ProntoAdapter._SPEC_CHANNELS
+        for name, wanted in [
+            ("Hrms Van (V1)", True), ("Odds Van (V1)", False),
+            ("Evens Van (V1)", False), ("Triplens Van", False),
+        ]:
+            matches = name.lower().startswith(
+                ProntoAdapter._SPEC_NAME_PREFIX["HRMS"])
+            assert matches is wanted, name
+
+    def test_aggregate_hrms_is_not_a_per_order_column(self):
+        # hrms_voltage_a must not be swept up by the per-order harmonic checks,
+        # which would test the whole harmonic RMS against a single-order limit.
+        from pq_analysis import _HARMONIC_COL
+        assert _HARMONIC_COL.match("h3_voltage_a")
+        assert _HARMONIC_COL.match("h13_current_neutral")
+        assert not _HARMONIC_COL.match("hrms_voltage_a")
+        assert not _HARMONIC_COL.match("hrms_current_neutral")
+
+    def test_new_canonical_names_are_all_resolvable(self):
+        # Every canonical name _SPEC_CHANNELS claims must exist in CANONICAL,
+        # or extract_dataframe would drop the column on the floor.
+        from pq_adapter import CANONICAL
+        for key, (_label, canonical, *_tags) in \
+                ProntoAdapter._SPEC_CHANNELS.items():
+            assert canonical in CANONICAL, f"{key} → {canonical!r} not in CANONICAL"

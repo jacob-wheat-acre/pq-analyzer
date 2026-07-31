@@ -56,8 +56,22 @@ CANONICAL = [
     *[f"h{h}_voltage_{ph}" for ph in ("a", "b", "c") for h in (3, 5, 7, 11, 13)],
     # Neutral current harmonics — triplens accumulate in neutral for zero-sequence diagnosis
     *[f"h{h}_current_neutral" for h in (3, 5, 7, 9, 11, 13)],
+    # Line-to-line and neutral-to-earth voltages
+    "voltage_ab", "voltage_bc", "voltage_ca", "voltage_neutral",
+    # Apparent power and system frequency
+    "power_apparent", "frequency",
+    # Total harmonic RMS per phase, as computed by the meter at full precision
+    # (more accurate than summing the rounded per-order magnitudes)
+    "hrms_voltage_a", "hrms_voltage_b", "hrms_voltage_c",
+    "hrms_current_a", "hrms_current_b", "hrms_current_c", "hrms_current_neutral",
+    # Neutral distortion
+    "thd_current_neutral", "thd_voltage_neutral",
+    # Meter-reported unbalance (cross-check against our own NEMA computation)
+    "unbalance_voltage_meter", "unbalance_current_meter", "unbalance_voltage_nps",
     # Meter-measured transformer K-factor and IEC flicker severity
-    "kfactor_meter",
+    "kfactor_meter", "kfactor_current_b", "kfactor_current_c",
+    "kfactor_current_neutral",
+    "flicker_pst_b", "flicker_plt_b", "flicker_pst_c", "flicker_plt_c",
     "flicker_pst",
     "flicker_plt",
 ]
@@ -108,26 +122,58 @@ _TAG_MAP: Dict[str, Dict[str, Set[str]]] = {
     # Individual harmonic currents — one entry per order × phase.
     # Note: standard PQDIF files use QuantityCharacteristic.Spectra with SeriesNominalQuantity
     # for the harmonic order; the h{n}/harmonic{n} strings below match Pronto label-derived channels.
-    **{f"h{h}_current_a": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"an","a","phase_a"}}
+    **{f"h{h}_current_a": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"an","a","phase_a"}}
        for h in _H519_ORDERS},
-    **{f"h{h}_current_b": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"bn","b","phase_b"}}
+    **{f"h{h}_current_b": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"bn","b","phase_b"}}
        for h in _H519_ORDERS},
-    **{f"h{h}_current_c": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"cn","c","phase_c"}}
+    **{f"h{h}_current_c": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"cn","c","phase_c"}}
        for h in _H519_ORDERS},
-    **{f"h{h}_current_neutral": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"ng","neutral","n","in","i4","phase_n"}}
+    **{f"h{h}_current_neutral": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"ng","neutral","n","in","i4","phase_n"}}
        for h in (3, 5, 7, 9, 11, 13)},
     # Individual harmonic voltages
-    **{f"h{h}_voltage_a": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"an","a","phase_a"}}
+    **{f"h{h}_voltage_a": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"an","a","phase_a"}}
        for h in (3, 5, 7, 11, 13)},
-    **{f"h{h}_voltage_b": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"bn","b","phase_b"}}
+    **{f"h{h}_voltage_b": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"bn","b","phase_b"}}
        for h in (3, 5, 7, 11, 13)},
-    **{f"h{h}_voltage_c": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra", "hrms"}, "ph": {"cn","c","phase_c"}}
+    **{f"h{h}_voltage_c": {"qt": {"voltageharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"cn","c","phase_c"}}
        for h in (3, 5, 7, 11, 13)},
+    # Line-to-line voltages (ANSI C84.1 applies to these as well as L-N)
+    "voltage_ab":     {"qt": {"voltage"},       "qm": {"rms"},                         "ph": {"ab"}},
+    "voltage_bc":     {"qt": {"voltage"},       "qm": {"rms"},                         "ph": {"bc"}},
+    "voltage_ca":     {"qt": {"voltage"},       "qm": {"rms"},                         "ph": {"ca", "ac"}},
+    # Neutral-to-earth voltage — the primary open-neutral indicator
+    "voltage_neutral":{"qt": {"voltage"},       "qm": {"rms"},                         "ph": {"ng", "neutral"}},
+    # Apparent power as measured (includes distortion power, unlike sqrt(P²+Q²))
+    "power_apparent": {"qt": {"power"},         "qm": {"apparent", "va", "s"},         "ph": {"total", "net", "residual", ""}},
+    "frequency":      {"qt": {"frequency"},     "qm": {"frequency"},                   "ph": {"total", "net", ""}},
+    # Total harmonic RMS (aggregate, not a single order)
+    "hrms_voltage_a": {"qt": {"voltageharmonics"}, "qm": {"hrms"}, "ph": {"an", "a", "phase_a"}},
+    "hrms_voltage_b": {"qt": {"voltageharmonics"}, "qm": {"hrms"}, "ph": {"bn", "b", "phase_b"}},
+    "hrms_voltage_c": {"qt": {"voltageharmonics"}, "qm": {"hrms"}, "ph": {"cn", "c", "phase_c"}},
+    "hrms_current_a": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"an", "a", "phase_a"}},
+    "hrms_current_b": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"bn", "b", "phase_b"}},
+    "hrms_current_c": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"cn", "c", "phase_c"}},
+    "hrms_current_neutral": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"ng", "neutral", "n"}},
+    # Neutral distortion
+    "thd_current_neutral": {"qt": {"currentharmonics"}, "qm": {"thd", "totalthd"}, "ph": {"ng", "neutral", "n"}},
+    "thd_voltage_neutral": {"qt": {"voltageharmonics"}, "qm": {"thd", "totalthd"}, "ph": {"ng", "neutral", "n"}},
+    # Meter-reported unbalance.  AVG_IMBAL is the max-deviation-from-average
+    # definition; S2S1 is the IEC negative/positive sequence ratio.
+    "unbalance_voltage_meter": {"qt": {"voltage"}, "qm": {"avgimbal"},  "ph": {"total", "net", ""}},
+    "unbalance_current_meter": {"qt": {"current"}, "qm": {"avgimbal"},  "ph": {"total", "net", ""}},
+    "unbalance_voltage_nps":   {"qt": {"voltage"}, "qm": {"s2s1"},     "ph": {"total", "net", ""}},
     # Transformer K-factor
-    "kfactor_meter": {"qt": {"kfactor"}, "qm": {"kfactor"},        "ph": {"total", "net", "residual", ""}},
+    "kfactor_meter": {"qt": {"kfactor"}, "qm": {"kfactor"},        "ph": {"an", "a", "total", "net", "residual", ""}},
+    "kfactor_current_b": {"qt": {"kfactor"}, "qm": {"kfactor"},    "ph": {"bn", "b"}},
+    "kfactor_current_c": {"qt": {"kfactor"}, "qm": {"kfactor"},    "ph": {"cn", "c"}},
+    "kfactor_current_neutral": {"qt": {"kfactor"}, "qm": {"kfactor"}, "ph": {"ng", "neutral", "n"}},
     # Flicker: FlkrPST / FlkrPLT are QuantityCharacteristic GUIDs → normalised to "flkrpst"/"flkrplt"
     "flicker_pst":   {"qt": {"flicker", "voltage"}, "qm": {"pst", "flkrpst"}, "ph": {"an", "a", "phase_a", "total", "net", ""}},
     "flicker_plt":   {"qt": {"flicker", "voltage"}, "qm": {"plt", "flkrplt"}, "ph": {"an", "a", "phase_a", "total", "net", ""}},
+    "flicker_pst_b": {"qt": {"flicker", "voltage"}, "qm": {"pst", "flkrpst"}, "ph": {"bn", "b", "phase_b"}},
+    "flicker_plt_b": {"qt": {"flicker", "voltage"}, "qm": {"plt", "flkrplt"}, "ph": {"bn", "b", "phase_b"}},
+    "flicker_pst_c": {"qt": {"flicker", "voltage"}, "qm": {"pst", "flkrpst"}, "ph": {"cn", "c", "phase_c"}},
+    "flicker_plt_c": {"qt": {"flicker", "voltage"}, "qm": {"plt", "flkrplt"}, "ph": {"cn", "c", "phase_c"}},
 }
 
 # ── Fuzzy name patterns (fallback when tags are absent or non-standard) ───────
@@ -782,14 +828,87 @@ class ProntoAdapter:
                                          'currentharmonics', 'thd', 'bn'),
         ('current', 'TOTAL_THD', 'cn'): ('THD Ic', 'thd_current_c',
                                          'currentharmonics', 'thd', 'cn'),
-        # ── Meter-computed K-factor and IEC flicker ───────────────────────
+        # ── Meter-computed K-factor and IEC flicker, per phase ────────────
         ('current', 'K_FACTOR', 'an'): ('K-Factor', 'kfactor_meter',
-                                        'kfactor', 'kfactor', 'total'),
+                                        'kfactor', 'kfactor', 'an'),
+        ('current', 'K_FACTOR', 'bn'): ('K-Factor Ib', 'kfactor_current_b',
+                                        'kfactor', 'kfactor', 'bn'),
+        ('current', 'K_FACTOR', 'cn'): ('K-Factor Ic', 'kfactor_current_c',
+                                        'kfactor', 'kfactor', 'cn'),
+        ('current', 'K_FACTOR', 'ng'): ('K-Factor In', 'kfactor_current_neutral',
+                                        'kfactor', 'kfactor', 'neutral'),
         ('voltage', 'FLKR_PST', 'an'): ('Flicker PST', 'flicker_pst',
                                         'flicker', 'pst', 'an'),
         ('voltage', 'FLKR_PLT', 'an'): ('Flicker PLT', 'flicker_plt',
                                         'flicker', 'plt', 'an'),
+        ('voltage', 'FLKR_PST', 'bn'): ('Flicker PST Vbn', 'flicker_pst_b',
+                                        'flicker', 'pst', 'bn'),
+        ('voltage', 'FLKR_PLT', 'bn'): ('Flicker PLT Vbn', 'flicker_plt_b',
+                                        'flicker', 'plt', 'bn'),
+        ('voltage', 'FLKR_PST', 'cn'): ('Flicker PST Vcn', 'flicker_pst_c',
+                                        'flicker', 'pst', 'cn'),
+        ('voltage', 'FLKR_PLT', 'cn'): ('Flicker PLT Vcn', 'flicker_plt_c',
+                                        'flicker', 'plt', 'cn'),
+        # ── Line-to-line and neutral-to-earth voltage ─────────────────────
+        ('voltage', 'RMS', 'ab'): ('Vab RMS', 'voltage_ab', 'voltage', 'rms', 'ab'),
+        ('voltage', 'RMS', 'bc'): ('Vbc RMS', 'voltage_bc', 'voltage', 'rms', 'bc'),
+        ('voltage', 'RMS', 'ca'): ('Vca RMS', 'voltage_ca', 'voltage', 'rms', 'ca'),
+        ('voltage', 'RMS', 'ng'): ('Vne RMS', 'voltage_neutral',
+                                   'voltage', 'rms', 'neutral'),
+        # ── Apparent power and frequency ──────────────────────────────────
+        # The meter's S includes distortion power, so it is not sqrt(P² + Q²).
+        ('power', 'S', 'none'): ('Apparent Power', 'power_apparent',
+                                 'power', 'apparent', 'total'),
+        ('voltage', 'FREQUENCY', 'none'): ('Frequency', 'frequency',
+                                           'frequency', 'frequency', 'total'),
+        # ── Aggregate harmonic RMS ────────────────────────────────────────
+        # Computed inside the meter at full precision; summing the reported
+        # per-order magnitudes understates it, badly at light load where the
+        # individual orders round to the display resolution.
+        ('voltage', 'HRMS', 'an'): ('Hrms Van', 'hrms_voltage_a',
+                                    'voltageharmonics', 'hrms', 'an'),
+        ('voltage', 'HRMS', 'bn'): ('Hrms Vbn', 'hrms_voltage_b',
+                                    'voltageharmonics', 'hrms', 'bn'),
+        ('voltage', 'HRMS', 'cn'): ('Hrms Vcn', 'hrms_voltage_c',
+                                    'voltageharmonics', 'hrms', 'cn'),
+        ('current', 'HRMS', 'an'): ('Hrms Ia', 'hrms_current_a',
+                                    'currentharmonics', 'hrms', 'an'),
+        ('current', 'HRMS', 'bn'): ('Hrms Ib', 'hrms_current_b',
+                                    'currentharmonics', 'hrms', 'bn'),
+        ('current', 'HRMS', 'cn'): ('Hrms Ic', 'hrms_current_c',
+                                    'currentharmonics', 'hrms', 'cn'),
+        ('current', 'HRMS', 'ng'): ('Hrms In', 'hrms_current_neutral',
+                                    'currentharmonics', 'hrms', 'neutral'),
+        # ── Neutral distortion ────────────────────────────────────────────
+        ('current', 'TOTAL_THD', 'ng'): ('THD In', 'thd_current_neutral',
+                                         'currentharmonics', 'thd', 'neutral'),
+        ('voltage', 'TOTAL_THD', 'ng'): ('THD Vne', 'thd_voltage_neutral',
+                                         'voltageharmonics', 'thd', 'neutral'),
+        # ── Unbalance as the meter computes it ────────────────────────────
+        ('voltage', 'AVG_IMBAL', 'none'): ('V Unbalance',
+                                           'unbalance_voltage_meter',
+                                           'voltage', 'avgimbal', 'total'),
+        ('current', 'AVG_IMBAL', 'none'): ('I Unbalance',
+                                           'unbalance_current_meter',
+                                           'current', 'avgimbal', 'total'),
+        ('voltage', 'S2S1', 'none'): ('V Unbalance NPS/PPS',
+                                      'unbalance_voltage_nps',
+                                      'voltage', 's2s1', 'total'),
     }
+
+    #: Characteristics that are instrument housekeeping rather than power
+    #: quality, so their absence from _SPEC_CHANNELS is deliberate and does not
+    #: warrant a log line.
+    _SPEC_IGNORED = {'STATUS'}
+
+    #: Characteristics Pronto overloads across several distinct channels, where
+    #: the metadata alone is not enough to tell them apart.  HRMS is used for
+    #: the total harmonic RMS *and* for the odd, even and triplen subtotals
+    #: ('Hrms Van (V1)', 'Odds Van (V1)', 'Evens Van (V1)', 'Triplens Van' all
+    #: carry ID_QC_HRMS, where the standard offers HRMS_ODD / HRMS_EVEN /
+    #: HRMS_TRIPLEN).  Requiring a name prefix keeps the subtotals from being
+    #: silently picked up as the total, which file ordering alone decided.
+    _SPEC_NAME_PREFIX = {'HRMS': 'hrms'}
 
     #: Harmonic channel names, e.g. 'Harm 13 of Van'.  The order lives only in
     #: the name -- Pronto gives each order its own channel definition rather
@@ -831,6 +950,22 @@ class ProntoAdapter:
         ('voltage', 'FREQUENCY', 'none'): 'adap_freq',
         ('voltage', 'AVG_IMBAL', 'none'): 'v_imbalance_pct',
         ('current', 'AVG_IMBAL', 'none'): 'i_imbalance_pct',
+        ('voltage', 'S2S1', 'none'): 'v_nps_pps_pct',
+        ('current', 'TOTAL_THD', 'ng'): 'thd_in_pct',
+        # Deliberately absent: ('voltage', 'TOTAL_THD', 'ng') -- THD of the
+        # neutral-to-earth voltage.  Divided by a reference near zero it is
+        # numerical noise (median 171 % on the files checked), and because this
+        # record logs a sample per change it is the single largest channel here
+        # -- half a million points, a fifth of the whole record -- which would
+        # inflate the union index for nothing.  It is still exposed on the
+        # interval grid as thd_voltage_neutral, where it costs nothing.
+        ('voltage', 'FLKR_PST', 'an'): 'pst_van',
+        ('voltage', 'FLKR_PST', 'bn'): 'pst_vbn',
+        ('voltage', 'FLKR_PST', 'cn'): 'pst_vcn',
+        ('voltage', 'FLKR_PLT', 'an'): 'plt_van',
+        ('voltage', 'FLKR_PLT', 'bn'): 'plt_vbn',
+        ('voltage', 'FLKR_PLT', 'cn'): 'plt_vcn',
+        ('power', 'Q_FUND', 'none'): 'kvar_fund_var',
     }
 
     def _load_spec(self) -> None:
@@ -1045,10 +1180,16 @@ class ProntoAdapter:
         peaks: Dict[str, np.ndarray] = {}
         mins: Dict[str, np.ndarray] = {}
 
+        unmapped: Dict[Tuple[str, str, str], List[str]] = {}
+
         for channel in pooled:
             key = (channel.quantity_measured, channel.characteristic,
                    channel.phase)
             entry = self._SPEC_CHANNELS.get(key)
+            prefix = self._SPEC_NAME_PREFIX.get(channel.characteristic)
+            if entry is not None and prefix is not None \
+                    and not channel.name.lower().startswith(prefix):
+                entry = None
             if entry is not None:
                 if key in seen:
                     continue
@@ -1080,6 +1221,27 @@ class ProntoAdapter:
                     values = measured(channel)
                     if values is not None:
                         harmonics[(group, order)] = values
+                continue
+
+            # Nothing recognised this channel.  It parsed fine -- we simply have
+            # no canonical column for it -- so record it and report once below.
+            # This is how a new firmware's additions announce themselves instead
+            # of quietly going missing from the analysis.
+            if channel.characteristic not in self._SPEC_IGNORED:
+                unmapped.setdefault(key, []).append(channel.name)
+
+        if unmapped:
+            log.info(
+                "ProntoAdapter (spec): %d channel group(s) in this file have no "
+                "canonical column and are not analysed. Add to _SPEC_CHANNELS "
+                "to expose them: %s",
+                len(unmapped),
+                "; ".join(
+                    f"{k[0]}/{k[1]}/phase={k[2]} ({names[0]!r}"
+                    + (f" +{len(names) - 1} more)" if len(names) > 1 else ")")
+                    for k, names in sorted(unmapped.items())
+                ),
+            )
 
         # Emit the reported harmonic orders in a stable order.
         for group, orders in self._HARM_REPORT.items():
@@ -1154,13 +1316,19 @@ class ProntoAdapter:
         correlating each unnamed channel against the interval averages.
         """
         columns: Dict[str, pd.Series] = {}
-        skipped: List[str] = []
+        unmapped: Dict[Tuple[str, str, str], List[str]] = {}
         for channel in obs.channels:
             key = (channel.quantity_measured, channel.characteristic,
                    channel.phase)
             column = self._SPEC_ADAPTIVE.get(key)
+            prefix = self._SPEC_NAME_PREFIX.get(channel.characteristic)
+            if column is not None and prefix is not None \
+                    and not channel.name.lower().startswith(prefix):
+                column = None
             if column is None or column in columns:
-                skipped.append(channel.name)
+                if (column is None
+                        and channel.characteristic not in self._SPEC_IGNORED):
+                    unmapped.setdefault(key, []).append(channel.name)
                 continue
             t = channel.time
             values = channel.series.get('AVG', channel.series.get('VAL'))
@@ -1190,13 +1358,20 @@ class ProntoAdapter:
                       if len(df) > 1 else 0.0)
         log.info(
             "ProntoAdapter (spec): variable-rate record %d rows × %d channels, "
-            "%.1f h span%s",
+            "%.1f h span",
             len(df), len(df.columns), span_hours,
-            f" ({len(skipped)} channels not mapped)" if skipped else "",
         )
-        if skipped:
-            log.debug("ProntoAdapter (spec): unmapped variable-rate channels: %s",
-                      ", ".join(sorted(skipped)))
+        if unmapped:
+            log.info(
+                "ProntoAdapter (spec): %d variable-rate channel group(s) have no "
+                "column and are not analysed. Add to _SPEC_ADAPTIVE to expose "
+                "them: %s",
+                len(unmapped),
+                "; ".join(
+                    f"{k[0]}/{k[1]}/phase={k[2]} ({names[0]!r})"
+                    for k, names in sorted(unmapped.items())
+                ),
+            )
 
     def _load_spec_waveforms(self, waveform_obs: List) -> None:
         """Decode point-on-wave captures.

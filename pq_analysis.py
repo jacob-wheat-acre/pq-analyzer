@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -20,6 +21,11 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
+
+#: Matches a per-order harmonic column (h3_current_a, h13_voltage_b, …) and
+#: nothing else.  Aggregate channels like hrms_current_a must not be mistaken
+#: for a single order.
+_HARMONIC_COL = re.compile(r"h\d+_(current|voltage)_")
 
 log = logging.getLogger(__name__)
 
@@ -323,7 +329,10 @@ def check_individual_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
         result["note"] = "Pass --isc to enable per-order IEEE 519 check"
         return result
 
-    h_cols = [c for c in df.columns if c.startswith("h") and "_current_" in c]
+    # Per-order channels only: h3_current_a and friends. A loose startswith("h")
+    # test also swallows aggregate channels such as hrms_current_a, which would
+    # then be squared into the harmonic sum as if it were a single order.
+    h_cols = [c for c in df.columns if _HARMONIC_COL.match(c) and "_current_" in c]
     if not h_cols:
         result["note"] = "Meter did not record individual harmonic orders (only THD totals available)"
         return result
@@ -395,7 +404,7 @@ def check_neutral_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
           > 3     → resonance amplification
     """
     avail = [c for c in df.columns
-             if c.startswith("h") and c.endswith("_current_neutral")]
+             if _HARMONIC_COL.match(c) and c.endswith("_current_neutral")]
     if not avail:
         return {"available": False, "note": "No neutral harmonic channels in dataset"}
 
@@ -667,7 +676,7 @@ def check_individual_voltage_harmonics(df: pd.DataFrame, thresh: Thresholds) -> 
     if v_nom <= 0:
         return result
 
-    v_h_cols = [c for c in df.columns if c.startswith("h") and "_voltage_" in c]
+    v_h_cols = [c for c in df.columns if _HARMONIC_COL.match(c) and "_voltage_" in c]
     if not v_h_cols:
         result["note"] = "No per-order voltage harmonic channels available"
         return result
@@ -748,7 +757,7 @@ def check_harmonic_statistics(df: pd.DataFrame, thresh: Thresholds) -> dict:
         result["note"] = "ISC not provided — statistical harmonic check requires --isc"
         return result
 
-    h_cols = [c for c in df.columns if c.startswith("h") and "_current_" in c]
+    h_cols = [c for c in df.columns if _HARMONIC_COL.match(c) and "_current_" in c]
     thd_cols = [c for c in df.columns if c.startswith("thd_current_")]
     if not h_cols and not thd_cols:
         result["note"] = "No harmonic channels available"
