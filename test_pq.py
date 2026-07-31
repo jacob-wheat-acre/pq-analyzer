@@ -1392,17 +1392,22 @@ class TestHarmonicSignificanceGate:
 
     @staticmethod
     def _frame(fundamental, h3, n=300):
+        # Slight variation, not constants: a constant series has zero standard
+        # deviation, which makes the Pearson correlation undefined and buries the
+        # behaviour under a divide warning.
         import pandas as pd
+        rng = np.random.default_rng(11)
         idx = pd.date_range("2025-01-01", periods=n, freq="5min", tz="UTC")
+        jitter = lambda base: np.abs(base * (1 + rng.normal(0, 0.02, n)))
         return pd.DataFrame({
-            "current_a": [fundamental] * n,
-            "h3_current_a": [h3] * n,
-            "h5_current_a": [h3 * 0.5] * n,
-            "h7_current_a": [h3 * 0.3] * n,
-            "h9_current_a": [h3 * 0.1] * n,
-            "h3_voltage_a": [h3 * 0.1] * n,
-            "h5_voltage_a": [h3 * 0.08] * n,
-            "h7_voltage_a": [h3 * 0.06] * n,
+            "current_a": jitter(fundamental),
+            "h3_current_a": jitter(h3),
+            "h5_current_a": jitter(h3 * 0.5),
+            "h7_current_a": jitter(h3 * 0.3),
+            "h9_current_a": jitter(h3 * 0.1),
+            "h3_voltage_a": jitter(h3 * 0.1),
+            "h5_voltage_a": jitter(h3 * 0.08),
+            "h7_voltage_a": jitter(h3 * 0.06),
         }, index=idx)
 
     def test_light_load_spectrum_is_refused(self):
