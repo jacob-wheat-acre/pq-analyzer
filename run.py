@@ -91,6 +91,10 @@ try:
         plot_waveform_capture,
         check_neutral_health,
         check_itic,
+        check_line_to_line_voltage,
+        check_frequency,
+        check_flicker,
+        kfactor_by_phase,
     )
     _BOOK_AVAILABLE = True
 except Exception as _import_exc:
@@ -786,6 +790,10 @@ class PQApp(tk.Tk):
         event_result        = detect_events(ds, thresh)
         neutral_health_result = check_neutral_health(ds, thresh)
         itic_result         = check_itic(event_result, thresh)
+        ll_volt_result      = check_line_to_line_voltage(df, thresh)
+        frequency_result    = check_frequency(df, thresh)
+        flicker_result      = check_flicker(df, thresh)
+        kfactor_result      = kfactor_by_phase(df)
 
         report = generate_report(
             ds, volt_result, thd_result, pf_result,
@@ -795,6 +803,10 @@ class PQApp(tk.Tk):
             neutral_health_result=neutral_health_result,
             spectral_shape_result=spectral_shape_result,
             itic_result=itic_result,
+            ll_volt_result=ll_volt_result,
+            frequency_result=frequency_result,
+            flicker_result=flicker_result,
+            kfactor_result=kfactor_result,
         )
         report["root_causes"] = analyze_root_causes(report, ds, thresh)
 

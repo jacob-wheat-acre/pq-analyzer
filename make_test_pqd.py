@@ -486,6 +486,57 @@ def scenario_channels(labels: list[str], arrays: list[np.ndarray],
                           + (sum(squares) if squares else 0.0))
         add_rms(rms_name, phase, measured, units, rms)
 
+    # ── Quantities a real Pronto export always carries ────────────────────
+    # These are synthesised rather than written into each scenario because they
+    # follow from the voltages already there, and every service has them.
+
+    n = len(times) // 2
+
+    # System frequency: nominally 60 Hz with a little wander, well inside the
+    # +/-0.5 Hz band so the fixtures pass unless a scenario says otherwise.
+    add_avg('Frequency', 'none', 'voltage', 'FREQUENCY', 'Hz',
+            60.0 + RNG.normal(0.0, 0.015, n))
+
+    # Line-to-line voltages.  On a split-phase service the two legs are 180
+    # degrees apart so the L-L voltage is their sum -- which is what makes the
+    # open-neutral window visible as a steady 240 V across a swollen and a
+    # sagging leg.  On a wye service the L-L voltage is sqrt(3) times the mean
+    # of the two line-to-neutral voltages.
+    van = harmonics.get(('Van', 1))
+    vbn = harmonics.get(('Vbn', 1))
+    vcn = harmonics.get(('Vcn', 1))
+    if van is not None and vbn is not None:
+        if vcn is None:
+            add_rms('Calc RMS Vab', 'ab', 'voltage', 'V', van + vbn)
+        else:
+            root3 = np.sqrt(3.0)
+            add_rms('Calc RMS Vab', 'ab', 'voltage', 'V', root3 * (van + vbn) / 2)
+            add_rms('Calc RMS Vbc', 'bc', 'voltage', 'V', root3 * (vbn + vcn) / 2)
+            add_rms('Calc RMS Vca', 'ca', 'voltage', 'V', root3 * (vcn + van) / 2)
+
+    # Per-phase K-factor and flicker.  Phase B is deliberately the worst so the
+    # fixtures exercise worst-phase selection: reading phase A alone understates
+    # the transformer K-rating and can miss a flicker exceedance entirely.
+    for source, factors in (
+        ('K-Factor Ia', (('K-Factor Ib', 'bn', 1.8), ('K-Factor Ic', 'cn', 0.6))),
+        ('Flicker PST Van (V1)', (('Flicker PST Vbn (V2)', 'bn', 1.5),
+                                  ('Flicker PST Vcn (V3)', 'cn', 0.7))),
+        ('Flicker PLT Van (V1)', (('Flicker PLT Vbn (V2)', 'bn', 1.5),
+                                  ('Flicker PLT Vcn (V3)', 'cn', 0.7))),
+    ):
+        base = data.get(source)
+        if base is None:
+            continue
+        characteristic = ('K_FACTOR' if 'K-Factor' in source else
+                          'FLKR_PST' if 'PST' in source else 'FLKR_PLT')
+        measured = 'current' if 'K-Factor' in source else 'voltage'
+        for name, phase, factor in factors:
+            # Only for phases this service actually has.
+            if phase == 'cn' and vcn is None:
+                continue
+            add_avg(name, phase, measured, characteristic, '',
+                    np.asarray(base, dtype=float) * factor)
+
     # ── Current THD, computed from the harmonics the fixture carries ──────
     for group in ('Ia', 'Ib', 'Ic', 'In'):
         fundamental = harmonics.get((group, 1))

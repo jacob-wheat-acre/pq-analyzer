@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 
 @dataclass
@@ -19,6 +19,10 @@ class Thresholds:
     imbalance_limit: float = 3.0          # % voltage unbalance — NEMA MG1 / IEEE 1159
     current_imbalance_limit: float = 10.0 # % current unbalance — per PSC procedure
     event_delta_pct: float = 0.10         # spike detection: step > 10 % of nominal
+    # ANSI C84.1 does not limit frequency; ±0.5 Hz is a practical flag band,
+    # comparable to EN 50160's ±1 % for interconnected systems.
+    frequency_nominal: float = 60.0       # Hz
+    frequency_tolerance_hz: float = 0.5   # Hz — flag deviation beyond this
     isc_amps: Optional[float] = None      # short-circuit current at PCC (A) — from Blue Book
     isc_source: Optional[str] = None     # human-readable note on how ISC was determined
     transformer_kva: Optional[float] = None  # service transformer nameplate (kVA)

@@ -17,6 +17,7 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
+from pq_analysis import standard_k_rating
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,10 @@ def generate_report(
     neutral_health_result: Optional[dict] = None,
     spectral_shape_result: Optional[dict] = None,
     itic_result: Optional[dict] = None,
+    ll_volt_result: Optional[dict] = None,
+    frequency_result: Optional[dict] = None,
+    flicker_result: Optional[dict] = None,
+    kfactor_result: Optional[dict] = None,
 ) -> dict:
     """Compile all analysis results into a structured summary dictionary."""
     df = ds.df
@@ -134,6 +139,14 @@ def generate_report(
             "catalog":          ds.catalog(),
         },
         "voltage_compliance":    volt_result,
+        "voltage_ll_compliance": ll_volt_result or {"available": False,
+                                                    "error": "not evaluated"},
+        "frequency":             frequency_result or {"available": False,
+                                                      "error": "not evaluated"},
+        "flicker":               flicker_result or {"available": False,
+                                                    "error": "not evaluated"},
+        "kfactor":               kfactor_result or {"available": False,
+                                                    "note": "not evaluated"},
         "thd_compliance":        thd_result,
         "power_factor":          pf_result,
         "voltage_imbalance":     volt_imb_result,
@@ -152,6 +165,12 @@ def generate_report(
             "transformer_loading":    transformer_pass,
             "voltage":                volt_result["total_pct_out_of_bounds"] == 0
                                       if volt_result["available"] else None,
+            "voltage_line_to_line":   (ll_volt_result or {}).get("overall_pass")
+                                      if (ll_volt_result or {}).get("available") else None,
+            "frequency":              (frequency_result or {}).get("overall_pass")
+                                      if (frequency_result or {}).get("available") else None,
+            "flicker":                (flicker_result or {}).get("overall_pass")
+                                      if (flicker_result or {}).get("available") else None,
             "thd_voltage":            thd_result["voltage"]["pct_exceeding"] == 0
                                       if thd_result["voltage"]["available"] else None,
             "thd_current":            thd_result["current"]["pct_exceeding"] == 0
@@ -238,6 +257,48 @@ def print_report(report: dict) -> None:
               f"(nominal {vc['nominal_v']} V ± {(vc['range_v'][1]/vc['nominal_v']-1)*100:.0f}%)")
         if _any_extremes:
             print("  (min/max from the interval max-min record; captures within-window excursions)")
+
+    # ── Line-to-line voltage ──────────────────────────────────────────────────
+    llv = report.get("voltage_ll_compliance") or {"available": False}
+    if llv.get("available"):
+        print(f"\n{sep}")
+        print("  LINE-TO-LINE VOLTAGE (ANSI C84.1)")
+        for pair, st in llv["pairs"].items():
+            sym = "PASS" if st["pct_out_of_bounds"] == 0 else "FAIL"
+            print(f"  {pair:12s}: {st['min_v']:6.1f} / {st['mean_v']:6.1f} / "
+                  f"{st['max_v']:6.1f} V    {st['pct_out_of_bounds']:5.2f}% OOB  [{sym}]")
+        print(f"  Allowed range: {llv['range_v'][0]:.1f} – {llv['range_v'][1]:.1f} V  "
+              f"(nominal {llv['nominal_v']:.0f} V ± "
+              f"{(llv['range_v'][1]/llv['nominal_v']-1)*100:.0f}%, {llv['configuration']})")
+
+    # ── Frequency ─────────────────────────────────────────────────────────────
+    freq = report.get("frequency") or {"available": False}
+    if freq.get("available"):
+        print(f"\n{sep}")
+        print("  FREQUENCY")
+        sym = "PASS" if freq["overall_pass"] else "FAIL"
+        print(f"  {freq['min_hz']:.3f} / {freq['mean_hz']:.3f} / {freq['max_hz']:.3f} Hz"
+              f"   max deviation {freq['max_deviation_hz']:.3f} Hz"
+              f"   out of band {freq['pct_out_of_band']:.2f}%  [{sym}]")
+        print(f"  Allowed range: {freq['range_hz'][0]:.2f} – {freq['range_hz'][1]:.2f} Hz "
+              f"(nominal {freq['nominal_hz']:.0f} Hz)")
+
+    # ── Flicker ───────────────────────────────────────────────────────────────
+    fl = report.get("flicker") or {"available": False}
+    if fl.get("available"):
+        print(f"\n{sep}")
+        print("  FLICKER (IEC 61000-3-3)")
+        for kind, label, limit in (("pst", "Pst", fl["pst_limit"]),
+                                   ("plt", "Plt", fl["plt_limit"])):
+            if not fl[kind]:
+                continue
+            per_phase = "  ".join(f"{p}={v['max']:.2f}"
+                                  for p, v in sorted(fl[kind].items()))
+            worst = max(fl[kind].values(), key=lambda v: v["max"])
+            sym = "PASS" if worst["max"] <= limit else "FAIL"
+            print(f"  {label} max by phase: {per_phase}   limit={limit:.2f}  [{sym}]")
+        print(f"  Governing phase: {fl['worst_phase']} "
+              f"({fl['worst_ratio_of_limit']:.2f}× its limit)")
 
     # ── THD / TDD ─────────────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -781,21 +842,27 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     else:
         add_row(ci_label, "No data", None)
 
-    # Flicker
-    _flicker_has_data = (
-        df is not None and "flicker_pst" in df.columns and "flicker_plt" in df.columns
-        and df["flicker_pst"].notna().any() and df["flicker_plt"].notna().any()
-    )
-    if _flicker_has_data:
-        pst_max = float(df["flicker_pst"].max())
-        plt_max = float(df["flicker_plt"].max())
-        pst_pass = pst_max <= 1.0
-        plt_pass = plt_max <= 0.65
-        flicker_pass = pst_pass and plt_pass
+    # Flicker — every phase the meter recorded, not just phase A. The row makes
+    # an unqualified statement about the service, so it has to be based on the
+    # worst phase or it can read as a pass while another phase is over limit.
+    fl = report.get("flicker") or {"available": False}
+    if fl.get("available"):
+        pst_max = fl.get("pst_max")
+        plt_max = fl.get("plt_max")
+        phases = ", ".join(fl.get("phases_read", []))
+        worst = fl.get("worst_phase")
+        measured = (
+            f"Pst max {pst_max:.2f} (limit {fl['pst_limit']:.2f})"
+            if pst_max is not None else "Pst n/a"
+        ) + "  /  " + (
+            f"Plt max {plt_max:.2f} (limit {fl['plt_limit']:.2f})"
+            if plt_max is not None else "Plt n/a"
+        ) + f"  — worst phase {worst} of {phases}"
         add_row(
-            "Flicker within IEC 61000-3-3 limits (Pst ≤ 1.0, Plt ≤ 0.65)",
-            f"Pst max {pst_max:.2f} (limit 1.00)  /  Plt max {plt_max:.2f} (limit 0.65)",
-            flicker_pass,
+            f"Flicker within IEC 61000-3-3 limits, all phases "
+            f"(Pst ≤ {fl['pst_limit']:.1f}, Plt ≤ {fl['plt_limit']:.2f})",
+            measured,
+            fl.get("overall_pass"),
         )
     else:
         add_row("Flicker within IEC 61000-3-3 limits (Pst ≤ 1.0, Plt ≤ 0.65)", "Not measured in this recording", None)
@@ -1799,29 +1866,26 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
     # K-factor section
     if has_kfactor:
         doc.add_paragraph()
-        kf_med  = float(df["kfactor_meter"].median())
-        kf_max  = float(df["kfactor_meter"].max())
-        kf_min  = float(df["kfactor_meter"].min())
-        kf_rate = int(kf_med) + (1 if kf_med % 1 >= 0.5 else 0)
-        # Round up to nearest standard K-rating (4, 7, 13, 20)
-        for std_k in (4, 7, 13, 20, 30, 40, 50):
-            if std_k >= kf_med:
-                kf_rate = std_k
-                break
-        if kf_med <= 1.0:
-            kf_interp = "K=1 rated (standard) transformer is adequate."
-        elif kf_med <= 4.0:
-            kf_interp = f"K-4 rated transformer recommended — light harmonic load."
-        elif kf_med <= 7.0:
-            kf_interp = f"K-7 rated transformer recommended — moderate harmonic load."
-        elif kf_med <= 13.0:
-            kf_interp = f"K-13 rated transformer recommended — heavy harmonic load."
+        kf_stats = report.get("kfactor") or {"available": False}
+        if kf_stats.get("available"):
+            kf_med, kf_min, kf_max = (kf_stats["median"], kf_stats["min"],
+                                      kf_stats["max"])
+            kf_phase = kf_stats["worst_phase"]
+            kf_detail = ", ".join(f"phase {p} {v['median']:.1f}"
+                                  for p, v in sorted(kf_stats["phases"].items()))
         else:
-            kf_interp = f"K-{kf_rate} rated transformer recommended — very high harmonic load."
+            kf_med  = float(df["kfactor_meter"].median())
+            kf_max  = float(df["kfactor_meter"].max())
+            kf_min  = float(df["kfactor_meter"].min())
+            kf_phase, kf_detail = "A", ""
+        kf_rate, kf_interp = standard_k_rating(kf_med)
         _body(doc,
-            f"The meter-measured harmonic K-factor (IEEE C57.110) over the recording period: "
-            f"median {kf_med:.1f}, minimum {kf_min:.1f}, maximum {kf_max:.1f}. "
-            f"Standard distribution transformers are designed for K=1 (sinusoidal load). "
+            f"The meter-measured harmonic K-factor (IEEE C57.110) over the recording "
+            f"period, taken from the worst phase ({kf_phase}) because harmonic heating "
+            f"is per-winding: median {kf_med:.1f}, minimum {kf_min:.1f}, maximum "
+            f"{kf_max:.1f}."
+            + (f" By phase: {kf_detail}. " if kf_detail else " ")
+            + f"Standard distribution transformers are designed for K=1 (sinusoidal load). "
             f"Harmonic currents cause additional eddy-current and hysteresis losses in the "
             f"transformer core and windings, reducing rated capacity and accelerating insulation "
             f"aging. {kf_interp}"
@@ -1833,7 +1897,11 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                 f"With the transformer currently loaded to {pct_tx:.0f}% of its {tx['nameplate_kva']:.0f} kVA "
                 f"nameplate and a K-factor of {kf_med:.1f}, the effective thermal load on the "
                 f"transformer significantly exceeds nameplate assumptions. "
-                f"A K-{kf_rate} rated unit is recommended before any additional load is added."
+                + (f"A K-{kf_rate} rated unit is recommended before any additional "
+                   "load is added."
+                   if kf_rate else
+                   "No standard K-rating covers a K-factor this high, so re-assess "
+                   "it under representative load before specifying a replacement.")
             )
 
     doc.add_paragraph()

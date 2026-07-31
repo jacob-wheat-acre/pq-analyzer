@@ -1085,3 +1085,129 @@ class TestOverloadedCharacteristics:
         for key, (_label, canonical, *_tags) in \
                 ProntoAdapter._SPEC_CHANNELS.items():
             assert canonical in CANONICAL, f"{key} → {canonical!r} not in CANONICAL"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Line-to-line voltage, frequency, flicker and K-factor
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _frame(**cols):
+    import pandas as pd
+    n = len(next(iter(cols.values())))
+    return pd.DataFrame(cols, index=pd.date_range("2025-01-01", periods=n, freq="5min"))
+
+
+class TestKFactorByPhase:
+    def test_rating_is_sized_on_the_worst_phase(self):
+        from pq_analysis import kfactor_by_phase
+        df = _frame(kfactor_meter=[104.0] * 10, kfactor_current_b=[217.0] * 10)
+        kf = kfactor_by_phase(df)
+        assert kf["available"] and kf["worst_phase"] == "B"
+        assert kf["median"] == 217.0
+        assert kf["phase_a_median"] == 104.0
+
+    def test_neutral_does_not_drive_the_rating(self):
+        # Neutral K-factor describes conductor heating, not a transformer winding.
+        from pq_analysis import kfactor_by_phase
+        df = _frame(kfactor_meter=[6.0] * 10, kfactor_current_neutral=[99.0] * 10)
+        kf = kfactor_by_phase(df)
+        assert kf["worst_phase"] == "A" and kf["median"] == 6.0
+        assert "N" in kf["phases"]
+
+    def test_unavailable_without_channels(self):
+        from pq_analysis import kfactor_by_phase
+        assert kfactor_by_phase(_frame(voltage_a=[120.0] * 5))["available"] is False
+
+    def test_rating_never_exceeds_a_purchasable_unit(self):
+        from pq_analysis import standard_k_rating, STANDARD_K_RATINGS
+        for k in (1.5, 5.0, 10.0, 25.0, 50.0):
+            rating, _ = standard_k_rating(k)
+            assert rating in STANDARD_K_RATINGS or rating == 1
+            assert rating >= k or rating == 1
+        rating, wording = standard_k_rating(217.3)
+        assert rating is None and "exceeds K-50" in wording
+
+
+class TestFlickerAllPhases:
+    def test_worst_phase_governs_not_phase_a(self):
+        from pq_analysis import check_flicker
+        df = _frame(flicker_pst=[0.5] * 10, flicker_pst_b=[4.98] * 10,
+                    flicker_plt=[0.2] * 10, flicker_plt_b=[2.21] * 10)
+        r = check_flicker(df, Thresholds())
+        assert r["available"] and r["worst_phase"] == "B"
+        assert r["pst_max"] == 4.98
+        # Phase A alone would have passed both limits.
+        assert r["pst"]["A"]["pass"] and not r["pst"]["B"]["pass"]
+        assert r["overall_pass"] is False
+
+    def test_pass_when_every_phase_is_within_limits(self):
+        from pq_analysis import check_flicker
+        df = _frame(flicker_pst=[0.4] * 10, flicker_pst_c=[0.6] * 10,
+                    flicker_plt=[0.3] * 10)
+        r = check_flicker(df, Thresholds())
+        assert r["overall_pass"] is True
+        assert sorted(r["phases_read"]) == ["A", "C"]
+
+    def test_unavailable_without_channels(self):
+        from pq_analysis import check_flicker
+        assert check_flicker(_frame(voltage_a=[120.0] * 5), Thresholds())["available"] is False
+
+
+class TestLineToLineVoltage:
+    def test_wye_nominal_inferred_and_snapped(self):
+        from pq_analysis import check_line_to_line_voltage
+        df = _frame(voltage_a=[120.0] * 20, voltage_b=[120.0] * 20,
+                    voltage_c=[120.0] * 20, voltage_ab=[207.8] * 20,
+                    voltage_bc=[207.8] * 20, voltage_ca=[207.8] * 20)
+        r = check_line_to_line_voltage(df, Thresholds(nominal_voltage=120.0))
+        assert r["available"] and r["nominal_v"] == 208.0
+        assert "wye" in r["configuration"]
+        assert r["overall_pass"] is True
+        assert set(r["pairs"]) == {"A-B", "B-C", "C-A"}
+
+    def test_split_phase_nominal_inferred(self):
+        from pq_analysis import check_line_to_line_voltage
+        df = _frame(voltage_a=[120.0] * 20, voltage_b=[120.0] * 20,
+                    voltage_ab=[240.0] * 20)
+        r = check_line_to_line_voltage(df, Thresholds(nominal_voltage=120.0))
+        assert r["available"] and r["nominal_v"] == 240.0
+        assert "split-phase" in r["configuration"]
+
+    def test_out_of_band_is_flagged(self):
+        from pq_analysis import check_line_to_line_voltage
+        ll = [207.8] * 18 + [180.0, 180.0]     # 13% low on the last two intervals
+        df = _frame(voltage_a=[120.0] * 20, voltage_b=[120.0] * 20,
+                    voltage_c=[120.0] * 20, voltage_ab=ll)
+        r = check_line_to_line_voltage(df, Thresholds(nominal_voltage=120.0))
+        assert r["overall_pass"] is False
+        assert r["pairs"]["A-B"]["pct_under"] == pytest.approx(10.0)
+
+    def test_ambiguous_ratio_is_refused_not_guessed(self):
+        from pq_analysis import check_line_to_line_voltage
+        df = _frame(voltage_a=[120.0] * 10, voltage_ab=[300.0] * 10)  # ratio 2.5
+        r = check_line_to_line_voltage(df, Thresholds(nominal_voltage=120.0))
+        assert r["available"] is False and "neither" in r["error"]
+
+    def test_unavailable_without_ll_channels(self):
+        from pq_analysis import check_line_to_line_voltage
+        r = check_line_to_line_voltage(_frame(voltage_a=[120.0] * 5), Thresholds())
+        assert r["available"] is False
+
+
+class TestFrequency:
+    def test_in_band_passes(self):
+        from pq_analysis import check_frequency
+        r = check_frequency(_frame(frequency=[60.0, 59.98, 60.02] * 4), Thresholds())
+        assert r["available"] and r["overall_pass"] is True
+        assert r["pct_out_of_band"] == 0.0
+
+    def test_deviation_beyond_band_fails(self):
+        from pq_analysis import check_frequency
+        r = check_frequency(_frame(frequency=[60.0] * 8 + [58.9, 61.2]), Thresholds())
+        assert r["overall_pass"] is False
+        assert r["pct_out_of_band"] == pytest.approx(20.0)
+        assert r["max_deviation_hz"] == pytest.approx(1.2, abs=1e-9)
+
+    def test_unavailable_without_channel(self):
+        from pq_analysis import check_frequency
+        assert check_frequency(_frame(voltage_a=[120.0] * 5), Thresholds())["available"] is False

@@ -52,6 +52,10 @@ from pq_analysis import (
     detect_events,
     check_neutral_health,
     check_itic,
+    check_line_to_line_voltage,
+    check_frequency,
+    check_flicker,
+    kfactor_by_phase,
     analyze_root_causes,
 )
 from pq_report import (
@@ -315,6 +319,10 @@ def main():
     event_result        = detect_events(ds, thresh)
     neutral_health_result = check_neutral_health(ds, thresh)
     itic_result         = check_itic(event_result, thresh)
+    ll_volt_result      = check_line_to_line_voltage(df, thresh)
+    frequency_result    = check_frequency(df, thresh)
+    flicker_result      = check_flicker(df, thresh)
+    kfactor_result      = kfactor_by_phase(df)
 
     # ── Compile report ────────────────────────────────────────────────────────
     report = generate_report(
@@ -325,6 +333,10 @@ def main():
         neutral_health_result=neutral_health_result,
         spectral_shape_result=spectral_shape_result,
         itic_result=itic_result,
+        ll_volt_result=ll_volt_result,
+        frequency_result=frequency_result,
+        flicker_result=flicker_result,
+        kfactor_result=kfactor_result,
     )
     report["root_causes"] = analyze_root_causes(report, ds, thresh)
 

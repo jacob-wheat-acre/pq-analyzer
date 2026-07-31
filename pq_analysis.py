@@ -42,6 +42,262 @@ def _require(df: pd.DataFrame, *cols: str) -> bool:
     return True
 
 
+#: Meter K-factor columns by phase label.  Phase A keeps the historical name.
+KFACTOR_COLS = {"A": "kfactor_meter", "B": "kfactor_current_b",
+                "C": "kfactor_current_c", "N": "kfactor_current_neutral"}
+
+#: Flicker columns by phase label, for each IEC 61000-3-3 severity index.
+FLICKER_COLS = {
+    "pst": {"A": "flicker_pst", "B": "flicker_pst_b", "C": "flicker_pst_c"},
+    "plt": {"A": "flicker_plt", "B": "flicker_plt_b", "C": "flicker_plt_c"},
+}
+
+#: Line-to-line voltage columns and the pair each represents.
+LL_COLS = {"voltage_ab": "A-B", "voltage_bc": "B-C", "voltage_ca": "C-A"}
+
+#: Standard ANSI C84.1 line-to-line nominal voltages, used to snap the inferred
+#: nominal to a recognisable value for the report.
+_STANDARD_LL_NOMINAL = [208, 240, 380, 400, 415, 480, 600, 2400, 4160, 4800,
+                        12470, 13200, 13800, 22860, 24940, 34500]
+
+
+#: Standard UL/IEEE C57.110 transformer K-ratings.  Nothing above K-50 is made.
+STANDARD_K_RATINGS = (4, 9, 13, 20, 30, 40, 50)
+
+
+def standard_k_rating(k_factor: float) -> Tuple[Optional[int], str]:
+    """Map a measured K-factor onto a K-rating a transformer can actually be bought at.
+
+    Returns (rating, wording).  Above K-50 there is no standard unit, and a
+    K-factor that high in practice means the harmonic content was measured at
+    very light load, where the index is dominated by the current resolution
+    rather than by real harmonic heating -- 1.1 A of fundamental with harmonics
+    rounded to 0.1 A can compute to K > 200.  Saying "a K-217 rated unit" would
+    be a recommendation nobody can act on.
+    """
+    if k_factor <= 1.0:
+        return 1, "K=1 rated (standard) transformer is adequate."
+    for rating in STANDARD_K_RATINGS:
+        if k_factor <= rating:
+            severity = ("light" if rating <= 4 else
+                        "moderate" if rating <= 9 else
+                        "heavy" if rating <= 20 else "very high")
+            return rating, (f"K-{rating} rated transformer recommended — "
+                            f"{severity} harmonic load.")
+    return None, (
+        f"The measured K-factor of {k_factor:.0f} exceeds K-50, the highest "
+        "standard rating available, which in practice means the harmonic content "
+        "was measured at very light load where this index is not a meaningful "
+        "sizing basis. Re-assess K-factor during a period of representative "
+        "loading before specifying a transformer."
+    )
+
+
+def kfactor_by_phase(df: pd.DataFrame) -> dict:
+    """Per-phase meter K-factor, and the phase that governs transformer rating.
+
+    Harmonic heating is per-winding, so the K-rating a transformer needs is set
+    by the worst phase -- reading phase A alone understated it by 2.1x on a real
+    split-phase file (A=104, B=217). The neutral K-factor is reported but does
+    not drive the rating: it describes neutral conductor heating rather than a
+    transformer winding.
+    """
+    phases: Dict[str, dict] = {}
+    for phase, col in KFACTOR_COLS.items():
+        if col not in df.columns:
+            continue
+        s = df[col].dropna()
+        if s.empty:
+            continue
+        phases[phase] = {
+            "column": col,
+            "median": float(s.median()),
+            "min":    float(s.min()),
+            "max":    float(s.max()),
+        }
+
+    if not phases:
+        return {"available": False, "phases": {}, "worst_phase": None,
+                "note": "No meter K-factor channels available."}
+
+    rating = {p: v for p, v in phases.items() if p != "N"} or phases
+    worst = max(rating, key=lambda p: rating[p]["median"])
+    return {
+        "available":     True,
+        "phases":        phases,
+        "worst_phase":   worst,
+        "median":        rating[worst]["median"],
+        "min":           rating[worst]["min"],
+        "max":           rating[worst]["max"],
+        "phases_read":   sorted(phases),
+        "phase_a_median": phases.get("A", {}).get("median"),
+    }
+
+
+def check_flicker(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """IEC 61000-3-3 flicker severity, on every phase the meter recorded.
+
+    Previously only phase A was examined while the report asserted compliance
+    for the service as a whole. On a real split-phase file phase B reached
+    Pst 4.98 against phase A's 1.43, so the reported severity was 3.5x low, and
+    a compliant phase A with a non-compliant phase B would have read as a pass.
+    """
+    out: dict = {"available": False, "pst": {}, "plt": {},
+                 "pst_limit": _PST_LIMIT, "plt_limit": _PLT_LIMIT,
+                 "worst_phase": None, "overall_pass": None}
+
+    for kind, limit in (("pst", _PST_LIMIT), ("plt", _PLT_LIMIT)):
+        for phase, col in FLICKER_COLS[kind].items():
+            if col not in df.columns:
+                continue
+            s = df[col].dropna()
+            if s.empty:
+                continue
+            out[kind][phase] = {
+                "column":       col,
+                "max":          float(s.max()),
+                "mean":         float(s.mean()),
+                "p95":          float(s.quantile(0.95)),
+                "pct_exceeding": float((s > limit).mean() * 100),
+                "pass":         bool(s.max() <= limit),
+            }
+
+    if not out["pst"] and not out["plt"]:
+        out["note"] = "No flicker channels available."
+        return out
+
+    out["available"] = True
+    # The governing phase is whichever comes closest to (or furthest past) its
+    # own limit, so Pst and Plt are compared on equal footing.
+    worst_ratio, worst_phase = -1.0, None
+    for kind, limit in (("pst", _PST_LIMIT), ("plt", _PLT_LIMIT)):
+        for phase, stats in out[kind].items():
+            ratio = stats["max"] / limit if limit else 0.0
+            if ratio > worst_ratio:
+                worst_ratio, worst_phase = ratio, phase
+    out["worst_phase"] = worst_phase
+    out["worst_ratio_of_limit"] = round(worst_ratio, 3)
+    out["pst_max"] = max((v["max"] for v in out["pst"].values()), default=None)
+    out["plt_max"] = max((v["max"] for v in out["plt"].values()), default=None)
+    out["overall_pass"] = all(
+        v["pass"] for kind in ("pst", "plt") for v in out[kind].values()
+    )
+    out["phases_read"] = sorted({p for kind in ("pst", "plt") for p in out[kind]})
+    return out
+
+
+def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """ANSI C84.1 compliance for line-to-line voltage.
+
+    The line-to-neutral limits say nothing about line-to-line: the two differ by
+    sqrt(3) on a wye service and by 2 on a split-phase one, and three-phase
+    customer equipment is rated for the L-L value. The L-L nominal is inferred
+    from the measured ratio to the L-N nominal rather than asking for another
+    command-line argument, then snapped to a standard nominal when it is close.
+    """
+    ll_cols = [c for c in LL_COLS if c in df.columns and df[c].notna().any()]
+    if not ll_cols:
+        return {"available": False, "error": "No line-to-line voltage channels found.",
+                "pairs": {}, "total_pct_out_of_bounds": None}
+
+    ln_cols = [c for c in ("voltage_a", "voltage_b", "voltage_c")
+               if c in df.columns and df[c].notna().any()]
+    if not ln_cols:
+        return {"available": False,
+                "error": "Line-to-line channels present but no line-to-neutral "
+                         "reference to infer the nominal from.",
+                "pairs": {}, "total_pct_out_of_bounds": None}
+
+    ln_median = float(np.nanmedian(df[ln_cols].to_numpy()))
+    ll_median = float(np.nanmedian(df[ll_cols].to_numpy()))
+    ratio = ll_median / ln_median if ln_median > 0 else 0.0
+
+    if 1.60 <= ratio <= 1.85:
+        factor, configuration = np.sqrt(3.0), "wye (L-L = √3 × L-N)"
+    elif 1.90 <= ratio <= 2.10:
+        factor, configuration = 2.0, "split-phase (L-L = 2 × L-N)"
+    else:
+        return {"available": False,
+                "error": (f"Measured L-L/L-N ratio {ratio:.2f} matches neither a "
+                          "wye (1.73) nor a split-phase (2.00) service; cannot "
+                          "infer the line-to-line nominal."),
+                "pairs": {}, "total_pct_out_of_bounds": None}
+
+    nominal = thresh.nominal_voltage * factor
+    snapped = min(_STANDARD_LL_NOMINAL, key=lambda v: abs(v - nominal))
+    if abs(snapped - nominal) / nominal <= 0.02:
+        nominal = float(snapped)
+
+    vmin = nominal * (1 - thresh.volt_tolerance)
+    vmax = nominal * (1 + thresh.volt_tolerance)
+    result: dict = {
+        "available":     True,
+        "error":         None,
+        "nominal_v":     nominal,
+        "range_v":       (vmin, vmax),
+        "configuration": configuration,
+        "ln_ll_ratio":   round(ratio, 3),
+        "pairs":         {},
+        "violation_timestamps": pd.DatetimeIndex([]),
+    }
+
+    all_violations = pd.Series(False, index=df.index)
+    for col in ll_cols:
+        s = df[col].dropna()
+        smin = df[f"{col}_min"].reindex(s.index).fillna(s)  if f"{col}_min"  in df.columns else s
+        smax = df[f"{col}_peak"].reindex(s.index).fillna(s) if f"{col}_peak" in df.columns else s
+        under, over = smin < vmin, smax > vmax
+        viol = under | over
+        all_violations.loc[viol.index[viol]] = True
+        result["pairs"][LL_COLS[col]] = {
+            "column":            col,
+            "pct_out_of_bounds": float(viol.mean() * 100),
+            "pct_under":         float(under.mean() * 100),
+            "pct_over":          float(over.mean() * 100),
+            "min_v":             float(smin.min()),
+            "max_v":             float(smax.max()),
+            "mean_v":            float(s.mean()),
+        }
+
+    result["violation_timestamps"] = df.index[all_violations]
+    result["total_pct_out_of_bounds"] = float(all_violations.mean() * 100)
+    result["overall_pass"] = result["total_pct_out_of_bounds"] == 0
+    return result
+
+
+def check_frequency(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """System frequency deviation.
+
+    ANSI C84.1 sets no frequency limit, so the default band is a practical one:
+    +/-0.5 Hz, comparable to EN 50160's +/-1% for interconnected systems. On a
+    healthy interconnection deviations are far smaller than this, so an
+    exceedance points at an islanded service or a measurement problem rather
+    than at ordinary grid regulation.
+    """
+    if "frequency" not in df.columns or df["frequency"].notna().sum() == 0:
+        return {"available": False, "error": "No frequency channel available."}
+
+    s = df["frequency"].dropna()
+    nominal = thresh.frequency_nominal
+    tolerance = thresh.frequency_tolerance_hz
+    low, high = nominal - tolerance, nominal + tolerance
+    out_of_band = (s < low) | (s > high)
+    deviation = (s - nominal).abs()
+    return {
+        "available":          True,
+        "error":              None,
+        "nominal_hz":         nominal,
+        "range_hz":           (low, high),
+        "min_hz":             float(s.min()),
+        "max_hz":             float(s.max()),
+        "mean_hz":            float(s.mean()),
+        "max_deviation_hz":   float(deviation.max()),
+        "pct_out_of_band":    float(out_of_band.mean() * 100),
+        "overall_pass":       bool(not out_of_band.any()),
+        "violation_timestamps": s.index[out_of_band],
+    }
+
+
 def check_voltage_compliance(
     df: pd.DataFrame, thresh: Thresholds
 ) -> dict:
@@ -2145,15 +2401,21 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
         # Prefer meter-measured K-factor (includes all H1-H51) over estimated value --
         # but only when the channel actually has valid data, otherwise fall through
         # to the estimated branch instead of silently losing this finding to a NaN.
-        if "kfactor_meter" in df.columns and df["kfactor_meter"].notna().any():
-            k_factor = float(df["kfactor_meter"].median())
-            k_source = "meter"
+        # Sized on the worst phase: heating is per-winding, so the phase with the
+        # highest K-factor sets the rating the transformer needs.
+        kf = kfactor_by_phase(df)
+        if kf["available"]:
+            k_factor = kf["median"]
+            k_phase = kf["worst_phase"]
+            k_source = f"meter, phase {k_phase}"
         else:
             h_means  = _harmonic_means(df, _H519_ORDERS)
             k_num    = sum((h_means.get(h, 0) / il_amps)**2 * h**2 for h in _H519_ORDERS)
             k_denom  = sum((h_means.get(h, 0) / il_amps)**2 for h in _H519_ORDERS)
             k_factor = k_num / k_denom if k_denom > 0 else 1.0
+            k_phase = None
             k_source = "estimated"
+        _k_rating, _k_wording = standard_k_rating(k_factor)
         if pct_tx > 70 and k_factor > 4:
             findings.append({
                 "category":       "demand",
@@ -2161,7 +2423,10 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "title":          "Transformer derating — harmonic K-factor",
                 "finding":        (f"Transformer loaded at {pct_tx:.0f}% of nameplate. "
                                    f"Harmonic load K-factor = {k_factor:.1f} ({k_source}). "
-                                   "Standard distribution transformers are rated K=1."),
+                                   + (", ".join(f"phase {p} = {v['median']:.1f}"
+                                                for p, v in sorted(kf["phases"].items()))
+                                      + ". " if kf["available"] and len(kf["phases"]) > 1 else "")
+                                   + "Standard distribution transformers are rated K=1."),
                 "cause":          ("Harmonic currents cause additional eddy-current losses in "
                                    "transformer windings beyond what the nameplate rating assumes. "
                                    f"A K-factor of {k_factor:.1f} means harmonic-related heating "
@@ -2169,15 +2434,21 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                    "the same kVA, increasing winding temperature and accelerating "
                                    "insulation degradation."),
                 "responsibility": "customer",
-                "recommendation": (f"Derate the transformer or replace with a K-{int(k_factor)+1} "
-                                   "or higher rated unit. Alternatively, reduce harmonic content "
-                                   "(AC line reactors on VFD inputs, or a passive harmonic filter) "
-                                   "to lower the effective K-factor before the next capacity "
-                                   "addition."),
-                "confidence":     "high" if k_source == "meter" else "medium",
+                "recommendation": (
+                    (f"Derate the transformer or replace with a K-{_k_rating} "
+                     "or higher rated unit. " if _k_rating else _k_wording + " ")
+                    + "Alternatively, reduce harmonic content "
+                    "(AC line reactors on VFD inputs, or a passive harmonic filter) "
+                    "to lower the effective K-factor before the next capacity "
+                    "addition."),
+                "confidence":     "high" if k_phase else "medium",
                 "evidence":       {"pct_nameplate":   round(pct_tx, 1),
                                    "k_factor":        round(k_factor, 1),
-                                   "k_source":        k_source},
+                                   "k_source":        k_source,
+                                   "k_worst_phase":   k_phase,
+                                   "k_by_phase":      {p: round(v["median"], 1)
+                                                       for p, v in kf["phases"].items()}
+                                                      if kf["available"] else None},
             })
 
     return findings
