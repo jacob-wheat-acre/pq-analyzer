@@ -23,6 +23,9 @@ import pytest
 # ── Make pq_* importable from any working directory ──────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 
+import struct
+
+import pqdif
 from pq_constants import (
     Thresholds,
     _h519_limit,
@@ -803,3 +806,145 @@ class TestUnavailableShapes:
         r = check_demand(df, thresh)
         assert r["available"] is True
         assert r["error"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Spec-compliant PQDIF reader (IEEE Std 1159.3-2019)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPQDIFPhysical:
+    """Annex A physical structure: elements, scalars, vectors."""
+
+    @staticmethod
+    def _element(body, physical_type, link, size, embedded=False,
+                 element_type=pqdif.ELEMENT_VECTOR):
+        return pqdif.Element(pqdif.TAG_SERIES_VALUES, element_type,
+                             physical_type, embedded, link, size, body)
+
+    def test_real8_vector(self):
+        body = struct.pack("<I3d", 3, 1.5, 2.5, 3.5)
+        el = self._element(body, 41, 0, len(body))
+        assert np.allclose(el.vector(), [1.5, 2.5, 3.5])
+
+    def test_int2_vector_widths_follow_physical_type(self):
+        # A vector's stride comes from typePhysical, so INTEGER2 is 2 bytes per
+        # point -- never assumed to be 8.
+        body = struct.pack("<I4h", 4, -3, 7, 11, -19)
+        el = self._element(body, 21, 0, len(body))
+        assert np.allclose(el.vector(), [-3, 7, 11, -19])
+
+    def test_complex16_takes_real_part(self):
+        # COMPLEX16 is two REAL8 per point (Annex A), i.e. 16 bytes.
+        body = struct.pack("<I4d", 2, 1.0, 90.0, 2.0, -45.0)
+        el = self._element(body, 43, 0, len(body))
+        assert np.allclose(el.vector(), [1.0, 2.0])
+
+    def test_embedded_scalar_reads_from_link_bytes(self):
+        # isEmbedded=TRUE stores the value in the 8 link/size bytes themselves.
+        el = self._element(b"", 32, 1234, 0, embedded=True,
+                           element_type=pqdif.ELEMENT_SCALAR)
+        assert el.scalar() == 1234
+
+    def test_non_embedded_scalar_reads_from_body(self):
+        body = struct.pack("<xxxxI", 4321)
+        el = self._element(body, 32, 4, 4, embedded=False,
+                           element_type=pqdif.ELEMENT_SCALAR)
+        assert el.scalar() == 4321
+
+    def test_vector_overrunning_body_is_rejected(self):
+        body = struct.pack("<I1d", 500, 1.0)   # claims 500 points, carries 1
+        el = self._element(body, 41, 0, len(body))
+        with pytest.raises(pqdif.PQDIFError):
+            el.vector()
+
+    def test_non_pqdif_file_is_rejected(self, tmp_path):
+        # The signature GUID check is what routes the synthetic test fixtures to
+        # the legacy reader instead of the spec reader.
+        path = tmp_path / "not.pqd"
+        path.write_bytes(b"\x00" * 256)
+        with pytest.raises(pqdif.PQDIFError):
+            pqdif.PQDIFFile(path)
+
+
+class TestPQDIFIncrementSeries:
+    """Clause 5.5.2 regular-rate series, using the standard's own examples."""
+
+    def test_single_rate(self):
+        # Spec example: 1792 points at 0.01 s.
+        out = pqdif._expand_increment(np.array([1.0, 1792.0, 0.01]))
+        assert len(out) == 1792
+        assert out[0] == pytest.approx(0.0)
+        assert out[1] == pytest.approx(0.01)
+        assert out[-1] == pytest.approx(1791 * 0.01)
+
+    def test_two_rates(self):
+        # Spec example: 896 points at 0.01 s then 896 at 0.02 s.
+        out = pqdif._expand_increment(
+            np.array([2.0, 896.0, 0.01, 896.0, 0.02]))
+        assert len(out) == 1792
+        assert out[895] == pytest.approx(895 * 0.01)
+        assert out[896] == pytest.approx(896 * 0.01)
+        assert out[897] == pytest.approx(896 * 0.01 + 0.02)
+
+    def test_truncated_instructions_rejected(self):
+        with pytest.raises(pqdif.PQDIFError):
+            pqdif._expand_increment(np.array([5.0, 10.0, 0.01]))
+
+
+class TestStepPairDetection:
+    """Pronto writes each interval twice, at its start and end."""
+
+    def test_step_pairs_detected(self):
+        # Gaps within a pair are the interval; gaps between pairs are ~1 us.
+        t = np.array([0.0, 120.0, 120.000001, 240.0, 240.000001, 360.0])
+        assert ProntoAdapter._step_pair_stride(t) == 2
+
+    def test_plain_series_not_deduplicated(self):
+        t = np.arange(0.0, 600.0, 120.0)
+        assert ProntoAdapter._step_pair_stride(t) == 1
+
+    def test_odd_length_never_paired(self):
+        t = np.array([0.0, 120.0, 120.000001])
+        assert ProntoAdapter._step_pair_stride(t) == 1
+
+    def test_uniform_series_not_paired(self):
+        # Equal gaps everywhere: no pair structure, so keep every point.
+        t = np.arange(0.0, 8.0, 1.0)
+        assert ProntoAdapter._step_pair_stride(t) == 1
+
+
+class TestSpecChannelTable:
+    """The metadata → canonical mapping must agree with ChannelMapper."""
+
+    def test_canonical_names_match_tag_resolution(self):
+        # _SPEC_CHANNELS records the canonical name so interval_peaks/_mins can
+        # be keyed by it. That name must be what ChannelMapper independently
+        # derives from the same tags, or peaks would attach to the wrong column.
+        mapper = ChannelMapper()
+        for key, (label, canonical, qt, qm, phase) in \
+                ProntoAdapter._SPEC_CHANNELS.items():
+            info = RawChannelInfo(0, label, qt, qm, phase, "")
+            assert mapper._match_by_tags(info) == canonical, (
+                f"{key} → {canonical!r} but tags {(qt, qm, phase)} resolve to "
+                f"{mapper._match_by_tags(info)!r}"
+            )
+
+    def test_rms_is_preferred_over_the_fundamental(self):
+        # 'Harm 1 of Van' is characteristic SPECTRA_HGROUP and must never be
+        # picked up as the voltage trend; only RMS may map to voltage_a.
+        assert ('voltage', 'RMS', 'an') in ProntoAdapter._SPEC_CHANNELS
+        assert ProntoAdapter._SPEC_CHANNELS[('voltage', 'RMS', 'an')][1] == \
+            'voltage_a'
+        for key in ProntoAdapter._SPEC_CHANNELS:
+            assert key[1] not in ('SPECTRA_HGROUP', 'SPECTRA'), (
+                f"{key} would source a trend from a harmonic magnitude"
+            )
+
+    def test_harmonic_name_pattern(self):
+        m = ProntoAdapter._HARM_NAME.match('Harm 13 of Van')
+        assert m and m.group(1) == '13' and m.group(2) == 'Van'
+        m = ProntoAdapter._HARM_NAME.match('Harm 3 of In')
+        assert m and m.group(1) == '3' and m.group(2) == 'In'
+        # The RMS channels must not be mistaken for harmonic orders.
+        assert ProntoAdapter._HARM_NAME.match('RMS Van (V1)') is None
+        assert ProntoAdapter._HARM_NAME.match('Hrms Van (V1)') is None

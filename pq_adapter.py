@@ -14,12 +14,12 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
+import pqdif
 from pq_constants import _H519_ORDERS
 
-# pqdifpy — the primary PQDIF parsing library.
-# Install with: pip install pqdifpy
-# If you are using a different library (openhistorian, custom parser, etc.)
-# replace only the PQDIFAdapter class below; everything else is unaffected.
+# PQDIF parsing is handled by pqdif.py (this repo), written directly from
+# IEEE Std 1159.3-2019 -- see ProntoAdapter.  pqdifpy is optional and only
+# backs the unused PQDIFAdapter class below; nothing requires it.
 try:
     import pqdifpy
     _PQDIF_AVAILABLE = True
@@ -478,21 +478,32 @@ class PQDIFAdapter:
 
 class ProntoAdapter:
     """
-    Direct binary reader for Pronto PQDIF files (Xcel Energy metering system).
+    Reader for Pronto PQDIF files (Xcel Energy metering system).
 
-    Drop-in replacement for PQDIFAdapter for .pqd files created by Xcel Energy
-    Pronto power-quality meters.  Reads the non-standard IEEE 1159.3 variant
-    binary format without any external PQDIF library.
+    Pronto's .pqd exports are fully compliant with IEEE Std 1159.3-2019, so the
+    primary path (``_load_spec``) resolves everything structurally through
+    pqdif.py: channel identity comes from the file's own series definitions
+    (quantity measured, quantity characteristic, phase), timestamps come from
+    each observation's tagTimeStart, and value arrays come from tagSeriesValues.
+    No byte offsets, channel orderings or label spellings are assumed, which is
+    what makes it robust across firmware versions and service topologies.
 
-    Confirmed structure (reverse-engineered from real Xcel Energy files):
-      - 6 physical records: Container, DataSource, Unknown, 3 Observation
-      - Record bodies: zlib-compressed (magic bytes 0x78 0xDA)
-      - obs[0]: 468 harmonic/power-quality channels (DataSource index 50+)
-      - obs[1]: 11 five-minute RMS channels (DataSource index 39-49)
-      - obs[2]: waveform data (not extracted here)
+    Two Pronto conventions are *not* in the standard and so are detected rather
+    than assumed:
 
-    Each 5-minute interval is stored as a near-identical pair of values;
-    this adapter deduplicates by taking every other sample (even indices).
+      - Each interval is written as a step pair -- the same value at the
+        interval's start and end time -- which _step_pair_stride() detects from
+        the time series and deduplicates.
+      - Interval data is split across two observation records that share one
+        time base: 'Interval (avg)' carries derived quantities (THD, harmonics,
+        power, flicker) and 'Interval (max-min)' carries the true RMS voltages
+        and currents.  Both are pooled.
+
+    A legacy reverse-engineered reader (``_load_legacy`` and the ``_load_v2*``
+    methods) is retained for files that are not valid PQDIF -- notably the
+    synthetic fixtures in test_data/, which were generated to match this
+    adapter's original model of the format rather than the published standard.
+    It should not be needed for any file a Pronto meter produces.
 
     Channels exposed (match CANONICAL names via _TAG_MAP):
         voltage_a/b/c (V), current_a/b/c (A),
@@ -609,6 +620,29 @@ class ProntoAdapter:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _load(self):
+        """Read the file, preferring the spec-compliant path.
+
+        Pronto's exports are fully IEEE 1159.3-2019 compliant, so pqdif.py
+        handles them without any offset guessing.  The legacy offset reader is
+        kept only for files that are not valid PQDIF -- notably the synthetic
+        fixtures in test_data/, which were generated to match this adapter's
+        original (mistaken) model of the format rather than the standard.
+        """
+        try:
+            self._spec = pqdif.PQDIFFile(self.filepath)
+        except pqdif.PQDIFError as exc:
+            log.info(
+                "ProntoAdapter: %s is not standard PQDIF (%s); using the "
+                "legacy offset reader.", self.filepath.name, exc,
+            )
+            self._spec = None
+
+        if self._spec is not None:
+            self._load_spec()
+            return
+        self._load_legacy()
+
+    def _load_legacy(self):
         raw = self.filepath.read_bytes()
         recs = self._walk_records(raw)
 
@@ -703,6 +737,517 @@ class ProntoAdapter:
             pd.Timestamp(self._obs_ts[0]).strftime('%Y-%m-%d %H:%M') if n else '–',
             pd.Timestamp(self._obs_ts[-1]).strftime('%Y-%m-%d %H:%M') if n else '–',
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Spec-compliant path (IEEE Std 1159.3-2019, via pqdif.py)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # (quantity_measured, characteristic, phase) → (label, canonical, tag qt,
+    # tag qm, tag phase).  The key is read straight out of the file's own series
+    # definitions, so this table does not depend on channel names, service
+    # topology or firmware version.  The tag fields feed _TAG_MAP via
+    # ChannelMapper, which derives the same canonical name recorded here.
+    _SPEC_CHANNELS: Dict[Tuple[str, str, str], Tuple[str, str, str, str, str]] = {
+        # ── True RMS, not the fundamental ────────────────────────────────
+        # Characteristic RMS is the quantity ANSI C84.1 limits apply to.
+        # 'Harm 1 of Van' is characteristic SPECTRA_HGROUP -- the H1 magnitude,
+        # which reads low by a factor of sqrt(1 + THD²) (0.3 % at 7.5 % THD)
+        # and must never be used as the voltage trend.
+        ('voltage', 'RMS', 'an'): ('Van RMS', 'voltage_a', 'voltage', 'rms', 'an'),
+        ('voltage', 'RMS', 'bn'): ('Vbn RMS', 'voltage_b', 'voltage', 'rms', 'bn'),
+        ('voltage', 'RMS', 'cn'): ('Vcn RMS', 'voltage_c', 'voltage', 'rms', 'cn'),
+        ('current', 'RMS', 'an'): ('Ia RMS', 'current_a', 'current', 'rms', 'an'),
+        ('current', 'RMS', 'bn'): ('Ib RMS', 'current_b', 'current', 'rms', 'bn'),
+        ('current', 'RMS', 'cn'): ('Ic RMS', 'current_c', 'current', 'rms', 'cn'),
+        ('current', 'RMS', 'ng'): ('In RMS', 'current_neutral',
+                                   'current', 'rms', 'neutral'),
+        # ── Power ─────────────────────────────────────────────────────────
+        ('power', 'P',  'none'): ('Real Power', 'power_real',
+                                  'watts', 'watts', 'total'),
+        ('power', 'Q',  'none'): ('Reactive Power', 'power_reactive',
+                                  'power', 'reactive', 'total'),
+        ('power', 'PF', 'none'): ('Power Factor', 'power_factor',
+                                  'powerfactor', 'powerfactor', 'total'),
+        # ── Distortion, as measured by the instrument ─────────────────────
+        ('voltage', 'TOTAL_THD', 'an'): ('THD Van', 'thd_voltage_a',
+                                         'voltageharmonics', 'thd', 'an'),
+        ('voltage', 'TOTAL_THD', 'bn'): ('THD Vbn', 'thd_voltage_b',
+                                         'voltageharmonics', 'thd', 'bn'),
+        ('voltage', 'TOTAL_THD', 'cn'): ('THD Vcn', 'thd_voltage_c',
+                                         'voltageharmonics', 'thd', 'cn'),
+        ('current', 'TOTAL_THD', 'an'): ('THD Ia', 'thd_current_a',
+                                         'currentharmonics', 'thd', 'an'),
+        ('current', 'TOTAL_THD', 'bn'): ('THD Ib', 'thd_current_b',
+                                         'currentharmonics', 'thd', 'bn'),
+        ('current', 'TOTAL_THD', 'cn'): ('THD Ic', 'thd_current_c',
+                                         'currentharmonics', 'thd', 'cn'),
+        # ── Meter-computed K-factor and IEC flicker ───────────────────────
+        ('current', 'K_FACTOR', 'an'): ('K-Factor', 'kfactor_meter',
+                                        'kfactor', 'kfactor', 'total'),
+        ('voltage', 'FLKR_PST', 'an'): ('Flicker PST', 'flicker_pst',
+                                        'flicker', 'pst', 'an'),
+        ('voltage', 'FLKR_PLT', 'an'): ('Flicker PLT', 'flicker_plt',
+                                        'flicker', 'plt', 'an'),
+    }
+
+    #: Harmonic channel names, e.g. 'Harm 13 of Van'.  The order lives only in
+    #: the name -- Pronto gives each order its own channel definition rather
+    #: than using one definition with per-instance frequency, so there is no
+    #: metadata field to read it from.
+    _HARM_NAME = re.compile(r'^Harm (\d+) of (V[a-z]{2}|I[a-z])$')
+
+    #: Which orders are reported per phase group, matching CANONICAL.
+    _HARM_REPORT = {
+        'Van': (3, 5, 7, 11, 13), 'Vbn': (3, 5, 7, 11, 13),
+        'Vcn': (3, 5, 7, 11, 13),
+        'Ia': _H519_ORDERS, 'Ib': _H519_ORDERS, 'Ic': _H519_ORDERS,
+        'In': (3, 5, 7, 9, 11, 13),
+    }
+
+    #: (quantity_measured, characteristic, phase) → adaptive DataFrame column.
+    _SPEC_ADAPTIVE = {
+        ('voltage', 'RMS', 'an'): 'van_v',
+        ('voltage', 'RMS', 'bn'): 'vbn_v',
+        ('voltage', 'RMS', 'cn'): 'vcn_v',
+        ('voltage', 'RMS', 'ng'): 'vne_v',
+        ('voltage', 'RMS', 'ab'): 'vab_v',
+        ('voltage', 'RMS', 'bc'): 'vbc_v',
+        ('voltage', 'RMS', 'ca'): 'vac_v',
+        ('current', 'RMS', 'an'): 'ia_a',
+        ('current', 'RMS', 'bn'): 'ib_a',
+        ('current', 'RMS', 'cn'): 'ic_a',
+        ('current', 'RMS', 'ng'): 'in_a',
+        ('voltage', 'TOTAL_THD', 'an'): 'thd_van_pct',
+        ('voltage', 'TOTAL_THD', 'bn'): 'thd_vbn_pct',
+        ('voltage', 'TOTAL_THD', 'cn'): 'thd_vcn_pct',
+        ('current', 'TOTAL_THD', 'an'): 'thd_ia_pct',
+        ('current', 'TOTAL_THD', 'bn'): 'thd_ib_pct',
+        ('current', 'TOTAL_THD', 'cn'): 'thd_ic_pct',
+        ('power', 'P',  'none'): 'kw_w',
+        ('power', 'Q',  'none'): 'kvar_var',
+        ('power', 'S',  'none'): 'kva_va',
+        ('power', 'PF', 'none'): 'adap_pf',
+        ('voltage', 'FREQUENCY', 'none'): 'adap_freq',
+        ('voltage', 'AVG_IMBAL', 'none'): 'v_imbalance_pct',
+        ('current', 'AVG_IMBAL', 'none'): 'i_imbalance_pct',
+    }
+
+    def _load_spec(self) -> None:
+        """Load a standards-compliant PQDIF file by structural traversal."""
+        spec = self._spec
+        assert spec is not None
+        interval_obs, adaptive_obs, waveform_obs = self._classify_observations()
+
+        if not interval_obs:
+            raise ValueError(
+                f"{self.filepath.name}: no interval (uniform time base) "
+                f"observation record found among {len(spec.observations)} "
+                "observations. Observation names: "
+                + ", ".join(repr(o.name) for o in spec.observations[:8])
+            )
+
+        log.info(
+            "ProntoAdapter (spec): PQDIF %d.%d, %d channel definitions, "
+            "%d interval / %d adaptive / %d waveform observations",
+            spec.version[0], spec.version[1], len(spec.definitions),
+            len(interval_obs), 1 if adaptive_obs else 0, len(waveform_obs),
+        )
+
+        self._load_spec_interval(interval_obs)
+        if adaptive_obs is not None:
+            self._load_spec_adaptive(adaptive_obs)
+        self._load_spec_waveforms(waveform_obs)
+
+    def _classify_observations(self):
+        """Split observations by structure rather than by label text.
+
+        Three kinds occur, distinguished by what the file itself says:
+
+        * waveform captures  -- channels of quantity type WAVEFORM
+        * interval trends    -- every channel shares one common time base
+        * variable adaptive  -- each channel carries its own time base
+
+        Naming ('Interval (avg)', 'Variable Adaptive') is a Pronto convention,
+        not part of the standard, so it is used only for logging.
+        """
+        interval, waveform = [], []
+        adaptive = None
+        for obs in self._spec.observations:
+            if not obs.channels:
+                continue
+            if any(c.quantity_type == 'WAVEFORM' for c in obs.channels):
+                waveform.append(obs)
+            elif self._shares_one_time_base(obs):
+                interval.append(obs)
+            elif adaptive is None or len(obs.channels) > len(adaptive.channels):
+                # More than one per-channel-time-base record would be unusual;
+                # keep the richest and note the rest.
+                if adaptive is not None:
+                    log.warning(
+                        "ProntoAdapter (spec): ignoring extra variable-rate "
+                        "observation %r (%d channels)",
+                        adaptive.name, len(adaptive.channels),
+                    )
+                adaptive = obs
+        return interval, adaptive, waveform
+
+    @staticmethod
+    def _shares_one_time_base(obs) -> bool:
+        """True when every channel in the observation has the same TIME series."""
+        reference: Optional[np.ndarray] = None
+        for channel in obs.channels:
+            t = channel.time
+            if t is None or len(t) == 0:
+                return False
+            if reference is None:
+                reference = t
+                continue
+            if len(t) != len(reference):
+                return False
+            # Compare endpoints and midpoint rather than the whole array: a
+            # shared time base is written once and referenced, so any two
+            # channels either match everywhere or diverge immediately.
+            probe = (0, len(t) // 2, len(t) - 1)
+            if any(t[i] != reference[i] for i in probe):
+                return False
+        return reference is not None
+
+    @staticmethod
+    def _step_pair_stride(t: np.ndarray) -> int:
+        """Detect Pronto's step-pair interval encoding.
+
+        Each interval is written as two points with the same value, one at the
+        interval start and one at its end, so a viewer can draw a horizontal
+        segment::
+
+            t = [0, 64.095, 64.095001, 184.095, 184.095001, …]
+            v = [122.2, 122.2, 122.0,   122.0,   121.8, …]
+
+        The gap *between* pairs is ~1 µs while the gap *within* a pair is the
+        interval length, which makes the encoding unambiguous.  Returns 2 when
+        the series is step-paired (take every other point) and 1 otherwise.
+        This is a Pronto convention, not part of IEEE 1159.3, so it is detected
+        rather than assumed.
+        """
+        if len(t) < 4 or len(t) % 2 != 0:
+            return 1
+        gaps = np.diff(t)
+        within = float(np.median(gaps[0::2]))
+        between = float(np.median(gaps[1::2]))
+        if within > 0 and 0 <= between <= 1e-3 * within:
+            return 2
+        return 1
+
+    #: PQDIF epoch (Annex A): timestamps count days from here.
+    _PQDIF_EPOCH = datetime(1900, 1, 1)
+
+    def _spec_times(self, obs, t: np.ndarray, units: int) -> np.ndarray:
+        """Convert a channel TIME series to absolute datetime64[ns].
+
+        The observation's tagTimeStart is the authoritative start of the
+        record.  Note that Pronto's *label* dates disagree with tagTimeStart by
+        a fixed two days on the files checked, which is why the old reader --
+        which scraped the date out of a waveform label -- dated every report
+        two days early.
+
+        ``units`` is the TIME series' ID_QU_* value: seconds relative to
+        tagTimeStart (the normal case), cycles relative to it, or absolute.
+        """
+        if units == pqdif.UNITS_TIMESTAMP:
+            base = np.datetime64(self._PQDIF_EPOCH, 'ns')
+            return base + (t * 1e9).astype('int64').view('timedelta64[ns]')
+
+        start = obs.start_time
+        if start is None:
+            log.warning(
+                "ProntoAdapter (spec): observation %r has no tagTimeStart; "
+                "timestamps will be relative to 1900-01-01.", obs.name,
+            )
+            start = self._PQDIF_EPOCH
+
+        # Cycles are relative to tagTimeStart too, at the nominal frequency.
+        seconds = (t / 60.0) if units == pqdif.UNITS_CYCLES else t
+        base = np.datetime64(start.replace(tzinfo=None), 'ns')
+        return base + (seconds * 1e9).astype('int64').view('timedelta64[ns]')
+
+    def _load_spec_interval(self, interval_obs: List) -> None:
+        """Build the interval channel set from every uniform-grid observation.
+
+        Pronto splits interval data across two records that share one time
+        base: 'Interval (avg)' holds the derived quantities (THD, harmonics,
+        power, flicker) and 'Interval (max-min)' holds the true RMS voltages
+        and currents with their per-interval MAX and MIN.  Both are needed, so
+        channels are pooled across them.
+        """
+        # The largest observation defines the grid; any observation whose grid
+        # matches contributes channels to the same pool.
+        interval_obs = sorted(interval_obs, key=lambda o: -len(o.channels))
+        primary = interval_obs[0]
+        reference = primary.channels[0].time
+        stride = self._step_pair_stride(reference)
+
+        obs_times = self._spec_times(primary, reference[0::stride],
+                                     primary.channels[0].time_units_id)
+        self._obs_ts = obs_times
+        n = len(obs_times)
+
+        pooled: List = []
+        for obs in interval_obs:
+            t = obs.channels[0].time
+            if len(t) != len(reference) or t[0] != reference[0] or t[-1] != reference[-1]:
+                log.warning(
+                    "ProntoAdapter (spec): observation %r has %d samples on a "
+                    "different time base than %r (%d); its channels are skipped.",
+                    obs.name, len(t), primary.name, len(reference),
+                )
+                continue
+            pooled.extend(obs.channels)
+
+        log.info(
+            "ProntoAdapter (spec): %d interval channels pooled from %d "
+            "observation(s), %d intervals%s",
+            len(pooled), len(interval_obs), n,
+            " (step-paired encoding)" if stride == 2 else "",
+        )
+
+        def measured(channel) -> Optional[np.ndarray]:
+            """The channel's average value series, deduplicated and padded.
+
+            Only AVG and VAL are accepted: a channel carrying just MAX and MIN
+            has no average, and substituting an extreme for one would silently
+            bias every downstream statistic.
+            """
+            values = channel.series.get('AVG', channel.series.get('VAL'))
+            if values is None:
+                return None
+            values = np.asarray(values, dtype=float)[0::stride]
+            if len(values) < n:
+                values = np.pad(values, (0, n - len(values)),
+                                constant_values=np.nan)
+            return values[:n]
+
+        ch_defs: List[Tuple] = []
+        arrays: List[np.ndarray] = []
+        canonical_index: Dict[str, int] = {}
+
+        def add(label: str, canonical: Optional[str], qt: str, qm: str,
+                phase: str, unit: str, values: np.ndarray) -> None:
+            index = len(ch_defs)
+            ch_defs.append((index, label, qt, qm, phase, unit))
+            arrays.append(values)
+            if canonical:
+                canonical_index[canonical] = index
+
+        # ── Scalar quantities, keyed on the file's own series metadata ────
+        seen: Set[Tuple[str, str, str]] = set()
+        harmonics: Dict[Tuple[str, int], np.ndarray] = {}
+        peaks: Dict[str, np.ndarray] = {}
+        mins: Dict[str, np.ndarray] = {}
+
+        for channel in pooled:
+            key = (channel.quantity_measured, channel.characteristic,
+                   channel.phase)
+            entry = self._SPEC_CHANNELS.get(key)
+            if entry is not None:
+                if key in seen:
+                    continue
+                values = measured(channel)
+                if values is None:
+                    continue
+                seen.add(key)
+                label, canonical, qt, qm, phase = entry
+                add(label, canonical, qt, qm, phase, channel.units, values)
+
+                # Per-interval extremes, where the instrument recorded them.
+                for value_type, sink in (('MAX', peaks), ('MIN', mins)):
+                    extreme = channel.series.get(value_type)
+                    if extreme is None:
+                        continue
+                    extreme = np.asarray(extreme, dtype=float)[0::stride]
+                    if len(extreme) < n:
+                        extreme = np.pad(extreme, (0, n - len(extreme)),
+                                         constant_values=np.nan)
+                    sink[canonical] = extreme[:n]
+                continue
+
+            # ── Individual harmonic orders ────────────────────────────────
+            match = self._HARM_NAME.match(channel.name)
+            if match and channel.characteristic in ('SPECTRA_HGROUP', 'SPECTRA',
+                                                    'HRMS'):
+                order, group = int(match.group(1)), match.group(2)
+                if (group, order) not in harmonics:
+                    values = measured(channel)
+                    if values is not None:
+                        harmonics[(group, order)] = values
+
+        # Emit the reported harmonic orders in a stable order.
+        for group, orders in self._HARM_REPORT.items():
+            qt = 'voltageharmonics' if group.startswith('V') else 'currentharmonics'
+            phase = {'Van': 'an', 'Vbn': 'bn', 'Vcn': 'cn',
+                     'Ia': 'an', 'Ib': 'bn', 'Ic': 'cn', 'In': 'neutral'}[group]
+            unit = 'V' if group.startswith('V') else 'A'
+            for order in orders:
+                values = harmonics.get((group, order))
+                if values is None:
+                    continue
+                canonical = (f"h{order}_voltage_{phase[0]}"
+                             if group.startswith('V')
+                             else (f"h{order}_current_neutral"
+                                   if phase == 'neutral'
+                                   else f"h{order}_current_{phase[0]}"))
+                add(f'H{order} {group}', canonical, qt, f'h{order}', phase,
+                    unit, values)
+
+        # ── Fall back to computed THD only where the meter reported none ──
+        # IEEE 519 defines THD against the fundamental, so H1 is the correct
+        # denominator.  The instrument's own TOTAL_THD channel is preferred:
+        # its characteristic is stated in the file, so there is no need to
+        # second-guess the label.
+        for group, phase, label, canonical, qt in (
+            ('Ia', 'an', 'THD Ia', 'thd_current_a', 'currentharmonics'),
+            ('Ib', 'bn', 'THD Ib', 'thd_current_b', 'currentharmonics'),
+            ('Ic', 'cn', 'THD Ic', 'thd_current_c', 'currentharmonics'),
+        ):
+            if canonical in canonical_index:
+                continue
+            h1 = harmonics.get((group, 1))
+            orders = [harmonics[(group, h)] ** 2
+                      for h in range(2, 51) if (group, h) in harmonics]
+            if h1 is None or not orders:
+                continue
+            denominator = np.where(h1 > 0.01, h1, np.nan)
+            log.info(
+                "ProntoAdapter (spec): %s not reported by the meter; "
+                "computed from %d harmonic orders.", label, len(orders),
+            )
+            add(label, canonical, qt, 'thd', phase, '%',
+                np.sqrt(sum(orders)) / denominator * 100.0)
+
+        self._raw_channels = [
+            RawChannelInfo(index, label, qt, qm, phase, unit)
+            for (index, label, qt, qm, phase, unit) in ch_defs
+        ]
+        self._obs_data = {cd[0]: arr for cd, arr in zip(ch_defs, arrays)}
+        self._interval_peaks = peaks
+        self._interval_mins = mins
+
+        interval_minutes = (
+            float(np.median(np.diff(obs_times).astype('int64'))) / 60e9
+            if n >= 2 else 0.0
+        )
+        log.info(
+            "ProntoAdapter (spec): %d channels, %d intervals of %.1f min "
+            "(%s → %s), %d peak / %d min series",
+            len(self._raw_channels), n, interval_minutes,
+            pd.Timestamp(obs_times[0]).strftime('%Y-%m-%d %H:%M') if n else '–',
+            pd.Timestamp(obs_times[-1]).strftime('%Y-%m-%d %H:%M') if n else '–',
+            len(peaks), len(mins),
+        )
+
+    def _load_spec_adaptive(self, obs) -> None:
+        """Build the variable-rate DataFrame.
+
+        Every channel has its own time base here, so each becomes a pandas
+        Series on its own index and the result is the outer join.  Channels are
+        named from their series metadata, which replaces the old approach of
+        correlating each unnamed channel against the interval averages.
+        """
+        columns: Dict[str, pd.Series] = {}
+        skipped: List[str] = []
+        for channel in obs.channels:
+            key = (channel.quantity_measured, channel.characteristic,
+                   channel.phase)
+            column = self._SPEC_ADAPTIVE.get(key)
+            if column is None or column in columns:
+                skipped.append(channel.name)
+                continue
+            t = channel.time
+            values = channel.series.get('AVG', channel.series.get('VAL'))
+            if t is None or values is None or len(t) == 0:
+                continue
+            size = min(len(t), len(values))
+            index = pd.DatetimeIndex(
+                self._spec_times(obs, t[:size], channel.time_units_id))
+            series = pd.Series(np.asarray(values[:size], dtype=float),
+                               index=index)
+            series = series[~series.index.duplicated(keep='first')]
+            columns[column] = series
+
+        if not columns:
+            log.warning(
+                "ProntoAdapter (spec): no recognised channels in variable-rate "
+                "observation %r; skipped.", obs.name,
+            )
+            return
+
+        df = pd.concat([s.rename(name) for name, s in columns.items()], axis=1)
+        df.sort_index(inplace=True)
+        df = df[~df.index.duplicated(keep='first')]
+        self._adaptive_df = df
+
+        span_hours = ((df.index[-1] - df.index[0]).total_seconds() / 3600
+                      if len(df) > 1 else 0.0)
+        log.info(
+            "ProntoAdapter (spec): variable-rate record %d rows × %d channels, "
+            "%.1f h span%s",
+            len(df), len(df.columns), span_hours,
+            f" ({len(skipped)} channels not mapped)" if skipped else "",
+        )
+        if skipped:
+            log.debug("ProntoAdapter (spec): unmapped variable-rate channels: %s",
+                      ", ".join(sorted(skipped)))
+
+    def _load_spec_waveforms(self, waveform_obs: List) -> None:
+        """Decode point-on-wave captures.
+
+        Each capture channel states its own phase and whether it is a voltage
+        or a current, so no amplitude-based guessing is needed.
+        """
+        for obs in waveform_obs:
+            voltages: Dict[str, np.ndarray] = {}
+            currents: Dict[str, np.ndarray] = {}
+            vne: Optional[np.ndarray] = None
+            times: Optional[np.ndarray] = None
+
+            for channel in obs.channels:
+                samples = channel.value('VAL', 'INSTANTANEOUS')
+                if samples is None or channel.time is None:
+                    continue
+                samples = np.asarray(samples, dtype=float)
+                if times is None or len(channel.time) > len(times):
+                    times = np.asarray(channel.time, dtype=float)
+                phase = channel.phase
+                if channel.quantity_measured == 'voltage':
+                    if phase == 'ng':
+                        vne = samples
+                    elif phase in ('an', 'bn', 'cn'):
+                        voltages[phase[0]] = samples
+                elif channel.quantity_measured == 'current':
+                    currents['n' if phase == 'ng' else phase[0]] = samples
+
+            if not voltages or times is None or len(times) < 2:
+                continue
+            dt = float(np.median(np.diff(times)))
+            self._waveforms.append({
+                "timestamp": obs.start_time,
+                "label":     obs.name,
+                "t":         times,
+                "fs_hz":     (1.0 / dt) if dt > 0 else None,
+                "voltages":  voltages,
+                "vne":       vne,
+                "currents":  currents,
+            })
+
+        if self._waveforms:
+            self._waveforms.sort(key=lambda w: w["timestamp"])
+            first = self._waveforms[0]
+            log.info(
+                "ProntoAdapter (spec): %d point-on-wave captures "
+                "(%d V / %d I channels, %.1f kHz, ~%.0f samples/cycle)",
+                len(self._waveforms), len(first["voltages"]),
+                len(first["currents"]), (first["fs_hz"] or 0) / 1000,
+                (first["fs_hz"] or 0) / 60.0,
+            )
 
     def _build_timestamps(
         self, obs1_body: bytes, base_date: datetime
@@ -1931,17 +2476,17 @@ class PQDataset:
             group_counts.append(f"other({len(other)})")
 
         lines.append(
-            f"  Interval avg     (obs[23]): {len(avg_cols):3d} ch  "
+            f"  Interval avg               : {len(avg_cols):3d} ch  "
             f"[{', '.join(group_counts)}]"
         )
         if pk_cols or mn_cols:
             sample = ", ".join(pk_cols[:3]) + (" …" if len(pk_cols) > 3 else "")
             lines.append(
-                f"  Interval max/min (obs[24]): {len(pk_cols):3d} peak / "
+                f"  Interval max/min           : {len(pk_cols):3d} peak / "
                 f"{len(mn_cols):3d} min  [{sample}]"
             )
         else:
-            lines.append("  Interval max/min (obs[24]): not present")
+            lines.append("  Interval max/min           : not present")
 
         if self.has_adaptive:
             adf = self.adaptive_df
@@ -1951,11 +2496,11 @@ class PQDataset:
                 if len(adf) > 1 else 0.0
             )
             lines.append(
-                f"  Adaptive events  (obs[25]): {len(adf):,} rows  "
+                f"  Variable-rate (adaptive)   : {len(adf):,} rows  "
                 f"[{len(adf.columns)} ch, cycle-level, {adur:.1f} h span]"
             )
         else:
-            lines.append("  Adaptive events  (obs[25]): not present")
+            lines.append("  Variable-rate (adaptive)   : not present")
 
         if self.has_waveforms:
             wf = self.waveforms

@@ -216,8 +216,10 @@ pq-analyzer folder.
 python-docx is missing.  Run `pip install python-docx`.
 
 **File won't load / "No interval data found"**
-The tool supports Pronto-format `.pqd` files (obs[23] interval average record).
-Other PQDIF variants are not guaranteed to parse correctly.
+The reader implements IEEE Std 1159.3-2019 (PQDIF), so any standards-compliant
+`.pqd` file should load, from Pronto or another vendor.  The error means no
+observation record with a common time base across its channels was found.  Run
+with `--verbose` to see the observation records the file actually contains.
 
 **Report opens but harmonic signature section is empty**
 Per-order harmonic channels (h3_current_a, h5_current_a, etc.) are not present
