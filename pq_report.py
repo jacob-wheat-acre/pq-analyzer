@@ -2734,18 +2734,35 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     # ── Visible flicker ───────────────────────────────────────────────────
     if fl.get("available") and fl.get("overall_pass") is False:
         pst = fl.get("pst_max")
+        limit = fl["pst_limit"]
+        # The flicker scale is meaningless to a customer without its basis: the
+        # instrument is calibrated so that 1.0 is the conventional threshold of
+        # irritability, the level at which about half of observers in laboratory
+        # testing judged the flicker annoying. Quoting the number alone invites
+        # "is 4.98 a lot?", so the multiple of that threshold is given too.
+        if pst is not None:
+            multiple = pst / limit if limit else 0
+            scale = (
+                f"Flicker measured {pst:.2f} on the international scale used for "
+                f"this. The scale is set so that {limit:.1f} is the point at which "
+                "roughly half the people in laboratory testing judged the flicker "
+                "in their lights annoying — it is a measure of irritation, not of "
+                "damage. Your reading is about "
+                + (f"{multiple:.0f} times" if multiple >= 1.5
+                   else "the same as")
+                + " that level.")
+        else:
+            scale = ("Flicker exceeded the level at which roughly half of people "
+                     "find it annoying.")
         out.append({
             "headline": "The lights were flickering enough to be noticeable",
-            "measured": (
-                f"Flicker measured {pst:.2f} on the standard scale for this, where "
-                f"{fl['pst_limit']:.1f} is the level at which a typical person "
-                "begins to notice it."
-                if pst is not None else
-                "Flicker exceeded the level at which a typical person notices it."),
+            "measured": scale,
             "means": (
                 "This measures how much the light output varies, not how much power "
-                "you use. It does not damage equipment, but a standard exists for it "
-                "because people find it genuinely bothersome."),
+                "you use, and it does not harm your equipment. It is measured "
+                "because flicker at this level is a recognized nuisance: it is the "
+                "kind of thing people notice as eye strain or restlessness in a "
+                "room without necessarily realizing the lighting is the cause."),
             "symptom": _SYMPTOMS["flicker"],
         })
 
@@ -2835,8 +2852,7 @@ def generate_customer_letter(
         "recording meter at your service for the period shown above. It measured "
         "the voltage and current many times a second and stored a summary every "
         "few minutes. This letter explains what those measurements show, in plain "
-        "terms. A separate technical report accompanies it, which your electrician "
-        "is welcome to read.")
+        "terms.")
 
     # ── What we found ─────────────────────────────────────────────────────
     _section_heading(doc, "What we found", level=1)
@@ -2933,8 +2949,10 @@ def generate_customer_letter(
         + ("Email " + engineer_email + ". " if engineer_email else "")
         + "Please quote your service address when you get in touch.")
     _body(doc,
-        "The technical report accompanying this letter covers the same measurements "
-        "in engineering terms. That is the document to hand to an electrician.")
+        "The measurements behind this letter were recorded and reviewed in detail. "
+        "If you engage an electrician and they would find the underlying "
+        "measurements useful, ask the engineer named above and they can discuss "
+        "them directly.")
 
     sign = doc.add_paragraph()
     _normal(sign, engineer_name or "[Engineer Name]", size_pt=11)

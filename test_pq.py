@@ -1556,6 +1556,35 @@ class TestCustomerLetter:
         lst = [{"type": "voltage_sag"}, {"type": "flicker_pst"}]
         assert _event_counts({"events": lst}) == {"voltage_sag": 1, "flicker_pst": 1}
 
+    def test_flicker_number_is_given_a_scale_the_reader_can_use(self, tmp_path):
+        # "4.98" means nothing without the basis of the scale: 1.0 is the
+        # conventional threshold of irritability, so the multiple of it is what
+        # makes the reading interpretable.
+        from docx import Document
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        text = " ".join(p.text for p in Document(str(out)).paragraphs)
+        if "flickering" not in text:
+            pytest.skip("fixture did not exceed the flicker limit")
+        assert "annoying" in text
+        assert "times that level" in text or "same as that level" in text
+        # It must say what flicker is not, so nobody reads it as damage or usage.
+        assert "not of damage" in text or "does not harm" in text
+
+    def test_letter_does_not_promise_the_engineering_report(self, tmp_path):
+        # The engineering document is shared at Xcel's discretion, so the letter
+        # must not tell the customer one is attached or owed to them.
+        from docx import Document
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        text = " ".join(p.text for p in Document(str(out)).paragraphs).lower()
+        for promise in ("report accompanies", "accompanying this letter",
+                        "attached report", "enclosed report",
+                        "document to hand to an electrician"):
+            assert promise not in text, f"letter promises {promise!r}"
+
     def test_clean_service_gets_a_clear_no_problem_letter(self, tmp_path):
         from docx import Document
         from pq_report import generate_customer_letter
