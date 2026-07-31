@@ -368,13 +368,76 @@ def check_voltage_compliance(
     return result
 
 
+#: Meter-aggregate harmonic RMS columns, by phase suffix.
+HRMS_CURRENT_COLS = {"a": "hrms_current_a", "b": "hrms_current_b",
+                     "c": "hrms_current_c", "neutral": "hrms_current_neutral"}
+
+
+def harmonic_current_rms(
+    df: pd.DataFrame, phase: str
+) -> Tuple[Optional[pd.Series], str]:
+    """Harmonic RMS current for one phase, in amps, with its provenance.
+
+    Prefers the meter's own aggregate (hrms_current_*).  It is computed inside
+    the instrument at full precision, whereas summing the reported per-order
+    magnitudes loses whatever the display resolution rounded away: on a real
+    light-load file the per-order sum gives 0.245 A against the meter's 0.300 A,
+    a 22% understatement that propagates directly into TDD.  The gap closes at
+    heavier load, where each order is large relative to the 0.1 A resolution.
+
+    Returns (series, source) where source is 'meter', 'per-order sum', or ''.
+    """
+    col = HRMS_CURRENT_COLS.get(phase)
+    if col and col in df.columns:
+        s = df[col].dropna()
+        if not s.empty:
+            return s, "meter"
+
+    orders = [c for c in df.columns
+              if _HARMONIC_COL.match(c) and c.endswith(f"_current_{phase}")]
+    if orders:
+        squared = df[orders].pow(2).sum(axis=1, min_count=1).dropna()
+        if not squared.empty:
+            return np.sqrt(squared), "per-order sum"
+    return None, ""
+
+
+def fundamental_current(
+    df: pd.DataFrame, phase: str, harm_rms: Optional[pd.Series]
+) -> Optional[pd.Series]:
+    """Fundamental current for one phase, from the true RMS and the harmonic RMS.
+
+    I1 = sqrt(Irms² − Ih²).  IEEE 519-2022 defines both THD and the demand
+    current IL against the fundamental, so the RMS channel on its own is not
+    the right denominator -- it is larger by sqrt(1 + THD²).
+    """
+    col = f"current_{phase}"
+    if col not in df.columns:
+        return None
+    rms = df[col].dropna()
+    if rms.empty:
+        return None
+    if harm_rms is None:
+        return rms
+    aligned = pd.concat([rms.rename("rms"), harm_rms.rename("h")],
+                        axis=1, join="inner").dropna()
+    if aligned.empty:
+        return rms
+    # Noise can push the reported harmonic RMS above the total at very light
+    # load; clamp rather than take the root of a negative number.
+    squared = (aligned["rms"] ** 2 - aligned["h"] ** 2).clip(lower=0.0)
+    return np.sqrt(squared)
+
+
 def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """IEEE 519-2022 compliance: voltage THD and current TDD.
 
     Voltage: standard THD (relative to fundamental), limit from thresh.thd_voltage_limit.
     Current: TDD (relative to maximum demand current IL) whenever RMS current
       channels are present — ISC is not required to compute TDD itself:
-      TDD(t) = THD%(t) × Irms(t) / IL   where IL = max demand current in recording.
+      TDD(t) = 100 × Ih(t) / IL, where Ih is the harmonic RMS current (the
+      meter's own aggregate where available, else the per-order sum) and IL is
+      the maximum demand *fundamental* current in the recording.
       The TDD class limit is selected from IEEE 519-2022 Table 2 via the ISC/IL
       ratio when thresh.isc_amps is set; without ISC the most restrictive class
       (ISC/IL < 20, 5.0%) is assumed — conservative, since the true limit can
@@ -392,9 +455,26 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     }
 
     # ── Determine current limit and IL ────────────────────────────────────────
+    # IEEE 519-2022 defines IL as the maximum demand load current at the
+    # fundamental frequency, so it is derived per phase from the RMS and the
+    # harmonic RMS rather than read straight off the RMS channel.
     i_cols = [c for c in ["current_a", "current_b", "current_c"] if c in df.columns]
+    phases = [c[-1] for c in i_cols]
+    harm_rms: Dict[str, pd.Series] = {}
+    harm_source: Dict[str, str] = {}
+    fundamental: Dict[str, pd.Series] = {}
+    for ph in phases:
+        h, src = harmonic_current_rms(df, ph)
+        if h is not None:
+            harm_rms[ph], harm_source[ph] = h, src
+        f1 = fundamental_current(df, ph, h)
+        if f1 is not None and not f1.empty:
+            fundamental[ph] = f1
+
     il_amps: Optional[float] = None
-    if i_cols:
+    if fundamental:
+        il_amps = float(max(f1.max() for f1 in fundamental.values()))
+    elif i_cols:
         il_amps = float(df[i_cols].max(axis=1).max())
 
     if il_amps and il_amps > 0:
@@ -465,19 +545,33 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     # ── Current TDD (or THD fallback) ─────────────────────────────────────────
     i_thd_cols = [c for c in ["thd_current_a", "thd_current_b", "thd_current_c"]
                   if c in df.columns]
-    if i_thd_cols:
-        if use_tdd:
-            # TDD(t) = thd_pct(t) × Irms(t) / IL_max
-            # Using per-phase pairing where possible; fall back to THD col alone
+    hrms_sources = sorted(set(harm_source.values()))
+    if i_thd_cols or (harm_rms and use_tdd):
+        if use_tdd and harm_rms:
+            # TDD(t) = 100 × Ih(t) / IL, straight from the IEEE 519-2022
+            # definition. The previous form, THD%(t) × Irms(t) / IL, was exact
+            # only while the RMS current channel actually held the fundamental;
+            # against a true RMS channel it overstates TDD by sqrt(1 + THD²).
+            worst = pd.concat(
+                [h * 100.0 / il_amps for h in harm_rms.values()], axis=1
+            ).max(axis=1).dropna()
+            metric = "tdd"
+        elif use_tdd:
+            # No harmonic RMS at all: fall back to the THD channel, but against
+            # the derived fundamental rather than the RMS current.
             tdd_cols: List[pd.Series] = []
             for col in i_thd_cols:
-                phase   = col[-1]
-                i_col   = f"current_{phase}"
-                aligned = df[[col, i_col]].dropna() if i_col in df.columns else None
-                if aligned is not None and len(aligned):
-                    tdd_cols.append(aligned[col] * aligned[i_col] / il_amps)
+                phase = col[-1]
+                base = fundamental.get(phase)
+                if base is None:
+                    tdd_cols.append(df[col].dropna())
+                    continue
+                aligned = pd.concat([df[col].rename("thd"), base.rename("i1")],
+                                    axis=1, join="inner").dropna()
+                if len(aligned):
+                    tdd_cols.append(aligned["thd"] * aligned["i1"] / il_amps)
                 else:
-                    tdd_cols.append(df[col].dropna())  # graceful degradation
+                    tdd_cols.append(df[col].dropna())
             worst = pd.concat(tdd_cols, axis=1).max(axis=1).dropna()
             metric = "tdd"
         else:
@@ -513,13 +607,29 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "mean_thd_pct":           float(worst.mean()),
                 "pct_exceeding":          float(exceed.mean() * 100),
                 "light_load_filtered":    light_load_filtered if not use_tdd else False,
+                "harmonic_rms_source":    ", ".join(hrms_sources) or None,
+                "il_amps":                round(il_amps, 2) if il_amps else None,
                 "violation_timestamps":   worst.index[exceed].tolist(),
             }
             result["available"] = True
 
-            # Peak TDD — uses per-interval maximum THD from the max-min record if available
+            # Peak TDD within each interval.  Prefer the harmonic RMS peak where
+            # the meter recorded it; otherwise use the peak THD channel.
+            pk_hrms = {ph: f"{HRMS_CURRENT_COLS[ph]}_peak" for ph in harm_rms
+                       if f"{HRMS_CURRENT_COLS.get(ph, '')}_peak" in df.columns}
+            if pk_hrms and use_tdd and il_amps:
+                pk_worst = pd.concat(
+                    [df[c].dropna() * 100.0 / il_amps for c in pk_hrms.values()],
+                    axis=1,
+                ).max(axis=1).dropna()
+                if not pk_worst.empty:
+                    pk_exceed = pk_worst > current_limit
+                    result["current"]["peak_max_tdd_pct"] = round(float(pk_worst.max()), 2)
+                    result["current"]["peak_pct_exceeding"] = round(
+                        float(pk_exceed.mean() * 100), 2)
             pk_thd_cols = [f"{c}_peak" for c in i_thd_cols if f"{c}_peak" in df.columns]
-            if pk_thd_cols and use_tdd and il_amps:
+            if (pk_thd_cols and use_tdd and il_amps
+                    and "peak_max_tdd_pct" not in result["current"]):
                 pk_tdd_series: List[pd.Series] = []
                 for col in pk_thd_cols:
                     base_col = col.replace("_peak", "")

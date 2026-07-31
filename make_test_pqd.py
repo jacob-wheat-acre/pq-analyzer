@@ -378,6 +378,11 @@ _NAMED_CHANNELS = [
 ]
 
 
+#: Display resolution of a Pronto meter, in volts and amps alike -- real files
+#: report 122.2 V and 0.3 A, never more precision than this.
+METER_RESOLUTION = 0.1
+
+
 def _step_pairs(values: np.ndarray) -> np.ndarray:
     """Repeat every sample, matching Pronto's step-pair interval encoding."""
     return np.repeat(np.asarray(values, dtype=float), 2)
@@ -442,7 +447,11 @@ def scenario_channels(labels: list[str], arrays: list[np.ndarray],
             group, order = parts[3], int(parts[1])
             phase, _rms_name, units = _PHASE_SUFFIX[group]
             measured = 'voltage' if group.startswith('V') else 'current'
-            series_values = values
+            # Reported per-order magnitudes are quantised to the display
+            # resolution; the aggregates above are not. `harmonics` keeps the
+            # unrounded values, which is what the meter computes from.
+            series_values = np.round(np.asarray(values, dtype=float)
+                                     / METER_RESOLUTION) * METER_RESOLUTION
             if order == 1 and measured == 'voltage':
                 # The scenario's array is the true RMS; the fundamental is
                 # smaller by sqrt(1 + THD^2).
@@ -536,6 +545,24 @@ def scenario_channels(labels: list[str], arrays: list[np.ndarray],
                 continue
             add_avg(name, phase, measured, characteristic, '',
                     np.asarray(base, dtype=float) * factor)
+
+    # ── Aggregate harmonic RMS, as the meter reports it ───────────────────
+    # A real meter computes this internally at full precision but rounds the
+    # per-order magnitudes to its display resolution, so summing the reported
+    # orders gives slightly less than the reported aggregate. Emitting the
+    # orders rounded (see METER_RESOLUTION above) and the aggregate unrounded
+    # reproduces that automatically, and to the right degree: negligible when a
+    # harmonic is many multiples of the resolution, large when it is comparable
+    # to it, which is why the understatement bites at light load.
+    for group, (phase, _rms_name, units) in _PHASE_SUFFIX.items():
+        squares = [np.asarray(v, dtype=float) ** 2
+                   for (g, order), v in harmonics.items()
+                   if g == group and order >= 2]
+        if not squares:
+            continue
+        measured = 'voltage' if group.startswith('V') else 'current'
+        add_avg(f'Hrms {group}', phase, measured, 'HRMS', units,
+                np.sqrt(sum(squares)))
 
     # ── Current THD, computed from the harmonics the fixture carries ──────
     for group in ('Ia', 'Ib', 'Ic', 'In'):

@@ -1211,3 +1211,106 @@ class TestFrequency:
     def test_unavailable_without_channel(self):
         from pq_analysis import check_frequency
         assert check_frequency(_frame(voltage_a=[120.0] * 5), Thresholds())["available"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. TDD from the meter's harmonic RMS (IEEE 519-2022)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHarmonicCurrentRMS:
+    def test_meter_aggregate_is_preferred_over_the_per_order_sum(self):
+        from pq_analysis import harmonic_current_rms
+        # Per-order sum would give 5.0 A; the meter reports 6.0 A because the
+        # orders it displays are rounded and the aggregate is not.
+        df = _frame(hrms_current_a=[6.0] * 5,
+                    h3_current_a=[3.0] * 5, h5_current_a=[4.0] * 5)
+        series, source = harmonic_current_rms(df, "a")
+        assert source == "meter"
+        assert series.iloc[0] == 6.0
+
+    def test_falls_back_to_the_per_order_sum(self):
+        from pq_analysis import harmonic_current_rms
+        df = _frame(h3_current_a=[3.0] * 5, h5_current_a=[4.0] * 5)
+        series, source = harmonic_current_rms(df, "a")
+        assert source == "per-order sum"
+        assert series.iloc[0] == pytest.approx(5.0)
+
+    def test_aggregate_columns_are_not_mistaken_for_orders(self):
+        from pq_analysis import harmonic_current_rms
+        # hrms_current_a must not also be summed in as if it were an order.
+        df = _frame(h3_current_a=[3.0] * 5, h5_current_a=[4.0] * 5,
+                    hrms_current_a=[float("nan")] * 5)
+        series, source = harmonic_current_rms(df, "a")
+        assert source == "per-order sum" and series.iloc[0] == pytest.approx(5.0)
+
+    def test_no_channels_at_all(self):
+        from pq_analysis import harmonic_current_rms
+        assert harmonic_current_rms(_frame(voltage_a=[120.0] * 3), "a") == (None, "")
+
+
+class TestFundamentalCurrent:
+    def test_derived_from_rms_and_harmonic_rms(self):
+        from pq_analysis import fundamental_current
+        # 5-12-13 triangle: I1=12 when Irms=13 and Ih=5.
+        df = _frame(current_a=[13.0] * 5)
+        import pandas as pd
+        h = pd.Series([5.0] * 5, index=df.index)
+        assert fundamental_current(df, "a", h).iloc[0] == pytest.approx(12.0)
+
+    def test_noise_above_the_total_is_clamped_not_square_rooted(self):
+        from pq_analysis import fundamental_current
+        import pandas as pd
+        df = _frame(current_a=[1.0] * 5)
+        h = pd.Series([2.0] * 5, index=df.index)   # impossible, but happens at ~0 A
+        out = fundamental_current(df, "a", h)
+        assert (out == 0.0).all() and out.notna().all()
+
+
+class TestTDDDefinition:
+    def _thresh(self):
+        return Thresholds(nominal_voltage=120.0, isc_amps=10000.0)
+
+    def test_tdd_is_harmonic_current_over_il(self):
+        from pq_analysis import check_thd
+        # Ih = 5 A on every interval, IL = fundamental max = 12 A → TDD = 41.67 %.
+        df = _frame(current_a=[13.0] * 10, hrms_current_a=[5.0] * 10,
+                    thd_current_a=[41.667] * 10)
+        r = check_thd(df, self._thresh())["current"]
+        assert r["metric"] == "tdd"
+        assert r["harmonic_rms_source"] == "meter"
+        assert r["il_amps"] == pytest.approx(12.0, abs=0.01)
+        assert r["max_thd_pct"] == pytest.approx(100 * 5.0 / 12.0, rel=1e-6)
+
+    def test_an_inconsistent_thd_channel_no_longer_inflates_tdd(self):
+        # The old form, THD% x Irms / IL, multiplied the THD ratio by current, so
+        # an interval where the meter's THD contradicts its own RMS and harmonic
+        # RMS was amplified. Reading the harmonic current directly cannot be.
+        from pq_analysis import check_thd
+        thd = [12.8] * 9 + [111.7]          # last interval is the anomaly
+        df = _frame(current_a=[5.5] * 10, hrms_current_a=[0.7] * 10,
+                    thd_current_a=thd)
+        r = check_thd(df, self._thresh())["current"]
+        il = np.sqrt(5.5 ** 2 - 0.7 ** 2)          # fundamental, not the 5.5 A RMS
+        assert r["max_thd_pct"] == pytest.approx(100 * 0.7 / il, rel=1e-6)
+        # The anomalous interval contributes nothing beyond the others.
+        assert r["max_thd_pct"] == pytest.approx(r["mean_thd_pct"], rel=1e-9)
+        # For contrast: the old form would have reached 111.7 x 5.5 / IL here.
+        assert r["max_thd_pct"] < 20.0
+
+    def test_falls_back_to_the_thd_channel_against_the_fundamental(self):
+        from pq_analysis import check_thd
+        # No harmonic RMS anywhere: TDD comes from THD x I1 / IL, where I1 is the
+        # RMS channel (the best available) rather than being confused with it.
+        df = _frame(current_a=[10.0] * 10, thd_current_a=[20.0] * 10)
+        r = check_thd(df, self._thresh())["current"]
+        assert r["metric"] == "tdd"
+        assert r["harmonic_rms_source"] is None
+        assert r["max_thd_pct"] == pytest.approx(20.0, rel=1e-6)
+
+    def test_il_uses_the_fundamental_not_the_rms(self):
+        from pq_analysis import check_thd
+        df = _frame(current_a=[13.0] * 10, hrms_current_a=[5.0] * 10,
+                    thd_current_a=[41.667] * 10)
+        r = check_thd(df, self._thresh())["current"]
+        # IEEE 519 defines IL at the fundamental: 12 A here, not the 13 A RMS.
+        assert r["il_amps"] == pytest.approx(12.0, abs=0.01)

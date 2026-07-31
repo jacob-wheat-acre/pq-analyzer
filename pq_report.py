@@ -327,6 +327,10 @@ def print_report(report: dict) -> None:
         ll_tag = "  [light-load intervals excluded]" if td.get("light_load_filtered") else ""
         print(f"  {label}: max={td['max_thd_pct']:.2f}%  mean={td['mean_thd_pct']:.2f}%  "
               f"limit={td['limit_pct']:.1f}%  exceed={td['pct_exceeding']:.2f}%  [{sym}]{ll_tag}")
+        if key == "current" and td.get("harmonic_rms_source"):
+            print(f"  Harmonic RMS source: {td['harmonic_rms_source']}"
+                  + (f"   IL={td['il_amps']:.1f} A (fundamental)"
+                     if td.get("il_amps") else ""))
         if key == "current" and "peak_max_tdd_pct" in td:
             pk_sym = "PASS" if td["peak_pct_exceeding"] == 0 else "FAIL"
             print(f"  {label} (peak within interval): max={td['peak_max_tdd_pct']:.2f}%  "

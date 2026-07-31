@@ -1274,17 +1274,30 @@ class ProntoAdapter:
             if canonical in canonical_index:
                 continue
             h1 = harmonics.get((group, 1))
-            orders = [harmonics[(group, h)] ** 2
-                      for h in range(2, 51) if (group, h) in harmonics]
-            if h1 is None or not orders:
+            if h1 is None:
                 continue
+            # Prefer the meter's harmonic RMS aggregate for the numerator: it is
+            # computed at full precision inside the instrument, whereas summing
+            # the reported orders loses whatever the display resolution rounded
+            # off -- badly at light load, where each order is comparable to the
+            # resolution itself.
+            hrms_index = canonical_index.get(f'hrms_current_{phase}')
+            if hrms_index is not None:
+                numerator, source = arrays[hrms_index], 'meter harmonic RMS'
+            else:
+                orders = [harmonics[(group, h)] ** 2
+                          for h in range(2, 51) if (group, h) in harmonics]
+                if not orders:
+                    continue
+                numerator = np.sqrt(sum(orders))
+                source = f'{len(orders)} harmonic orders'
             denominator = np.where(h1 > 0.01, h1, np.nan)
             log.info(
                 "ProntoAdapter (spec): %s not reported by the meter; "
-                "computed from %d harmonic orders.", label, len(orders),
+                "computed from %s.", label, source,
             )
             add(label, canonical, qt, 'thd', phase, '%',
-                np.sqrt(sum(orders)) / denominator * 100.0)
+                numerator / denominator * 100.0)
 
         self._raw_channels = [
             RawChannelInfo(index, label, qt, qm, phase, unit)
