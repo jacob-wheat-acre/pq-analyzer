@@ -929,7 +929,7 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
     h{n}_current_{ph} columns are present in df, computes:
 
       Z_h   = mean(V_h_ph) / mean(I_h_ph)   [Ω], averaged across available phases
-      corr_h = Pearson r between interval V_h and I_h time series
+      corr_h = correlation between the interval harmonic voltage and current
       Z_ratio = Z_h / Z_linear_h             where Z_linear_h = a × h fits through origin
 
     Resonance: Z_ratio > 2.5 at any order → parallel resonance suspect.
@@ -1057,7 +1057,7 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "overall":         overall,
         "significance":    significance,
         "note": (
-            "Attribution is indicative — Pearson r between V_h and I_h interval series. "
+            "Attribution is indicative — correlation between the harmonic voltage and harmonic current over the recording. "
             "Exact source direction requires waveform phasor measurements."
         ),
     }
@@ -1077,7 +1077,7 @@ def check_spectral_shape(df: pd.DataFrame, thresh: Thresholds, source_harm: dict
       1. Elevation: mean voltage THD is a meaningful fraction of the IEEE 519 limit
          (thresh.spectral_elevation_ratio), not just noise-level distortion.
       2. Flatness: the per-order voltage harmonic spectrum (H3, H5, H7, H11, H13) has
-         a low coefficient of variation (thresh.spectral_flatness_cv) -- no single
+         a low relative variability (coefficient of variation) (thresh.spectral_flatness_cv) -- no single
          order dominates.
 
     Never returns "broadband_consistent" when check_harmonic_sources already flagged
@@ -2018,7 +2018,7 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
     if np.linalg.norm(measured) == 0:
         return []
 
-    # H5 inter-interval variability (coefficient of variation)
+    # H5 inter-interval variability (relative variability (coefficient of variation))
     h5_cols = [f"h5_current_{p}" for p in "abc" if f"h5_current_{p}" in scope.columns]
     h5_cv = 0.0
     if h5_cols:

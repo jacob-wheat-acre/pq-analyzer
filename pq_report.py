@@ -444,7 +444,7 @@ def print_report(report: dict) -> None:
         resonant = sh.get("resonant_orders", [])
         if resonant:
             print(f"  Resonance suspects: {', '.join('H'+str(h) for h in sorted(resonant))}")
-        print(f"  {'Order':<6}  {'Z_h(Ω)':>8}  {'Z_ratio':>8}  {'Pearson_r':>10}  Attribution")
+        print(f"  {'Order':<6}  {'Z_h(Ω)':>8}  {'Z_ratio':>8}  {'Correlation':>10}  Attribution")
         for h, od in sorted(sh["orders"].items()):
             ratio_s = f"{od['z_ratio']:.2f}×" if od["z_ratio"] is not None else "   n/a"
             corr_s  = f"{od['corr']:.2f}"     if od["corr"]    is not None else "   n/a"
@@ -1712,7 +1712,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         sh_tbl.style = 'Table Grid'
         _set_col_widths(sh_tbl, [1.5, 2.5, 2.5, 2.5, 3.5])
         for cell, text in zip(sh_tbl.rows[0].cells,
-                               ["Order", "Z_h (Ω)", "Z_ratio", "Pearson r", "Attribution"]):
+                               ["Order", "Apparent Z (Ω)", "Z_ratio", "Pearson r", "Attribution"]):
             _cell_shade(cell, "E8F1FA")
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
@@ -2549,6 +2549,10 @@ def generate_word_report(
 
     _word_exec_summary(doc, report, thresh, df, key_findings, actions)
     _word_key_findings(doc, key_findings)
+    # Definitions go after the findings but before the detailed sections: a
+    # reader who bounces off "total demand distortion" in Key Findings meets the
+    # definition immediately, without a glossary at the back nobody reaches.
+    _word_terms_panel(doc, report)
     _word_engineering_assessment(doc, report)
     _word_recommended_actions(doc, actions)
     _word_measurement_review(doc, report, thresh, df, outdir, stem)
@@ -2612,7 +2616,7 @@ _SYMPTOMS = {
         "failing repeatedly in some rooms but not others. Electronics failing "
         "with no obvious cause."),
     "imbalance": (
-        "One part of the house noticeably affected while the rest seems "
+        "One part of the installation noticeably affected while the rest seems "
         "normal."),
 }
 
@@ -2637,16 +2641,62 @@ def _event_counts(event_result: dict) -> Dict[str, int]:
     return counts
 
 
+#: Service classes that get the plain-language letter, and what to call the site.
+#: The classes above these get the engineering report instead, since a facilities
+#: reader can act on distortion and transformer loading and writing down to them
+#: costs credibility.
+_LETTER_CLASSES = {"r": "your home", "c": "your business"}
+
+
+def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
+    """Wording that has to change between a house and a small business.
+
+    Two things vary: what to call the premises, and how to explain the neutral.
+    A house is split-phase, so the neutral is the shared return between two
+    120-volt halves; a three-phase business has a neutral shared by three phases,
+    and describing it as two halves would simply be wrong.
+    """
+    site = _LETTER_CLASSES.get(thresh.customer_class, "your premises")
+    topology = (report.get("file_summary") or {}).get("topology", "")
+    if topology == "3-phase":
+        neutral_measured = (
+            f"{site.capitalize()} is supplied by three separate live wires that "
+            "share one return wire, called the neutral. Our measurements show "
+            "the voltage on those wires moving in opposite directions to each "
+            "other, which is what happens when the shared connection is loose, "
+            "corroded or broken.")
+        neutral_symptom = (
+            "Equipment on one part of the site behaving oddly while the rest "
+            "seems normal, often changing when large equipment switches on. "
+            "Lamps failing repeatedly in some areas but not others. Electronic "
+            "equipment failing with no obvious cause.")
+    else:
+        neutral_measured = (
+            f"{site.capitalize()} is supplied by two 120-volt halves that share "
+            "one return wire, called the neutral. Our measurements show the two "
+            "halves moving in opposite directions -- one rising as the other "
+            "falls -- which is what happens when that shared connection is "
+            "loose, corroded or broken.")
+        neutral_symptom = _SYMPTOMS["neutral"]
+    return {"site": site, "neutral_measured": neutral_measured,
+            "neutral_symptom": neutral_symptom,
+            "is_business": thresh.customer_class == "c"}
+
+
 def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
-    """Conditions worth telling a residential customer about, in plain terms."""
+    """Conditions worth telling a residential or small-business customer about."""
     out: List[dict] = []
     vc = report.get("voltage_compliance") or {}
     fl = report.get("flicker") or {}
     nh = report.get("neutral_health") or {}
     ci = report.get("current_imbalance") or {}
     itic = report.get("itic") or {}
+    pfr = report.get("power_factor") or {}
+    thd = report.get("thd_compliance") or {}
     counts = _event_counts(report.get("events") or {})
     hours = (report.get("file_summary") or {}).get("duration_hours") or 0
+    vocab = _customer_vocabulary(report, thresh)
+    site = vocab["site"]
 
     # ── Voltage outside the allowed range ─────────────────────────────────
     if vc.get("available") and vc.get("total_pct_out_of_bounds", 0) > 0:
@@ -2656,7 +2706,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
         pct = vc["total_pct_out_of_bounds"]
         if worst_low is not None and worst_low < lo:
             out.append({
-                "headline": "The voltage at your home dropped below the normal range",
+                "headline": f"The voltage at {site} dropped below the normal range",
                 "measured": (
                     f"The lowest reading was {worst_low:.0f} volts. Normal service is "
                     f"{thresh.nominal_voltage:.0f} volts, and the allowed range is "
@@ -2664,13 +2714,15 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                     f"during {pct:.1f}% of the {hours:.0f} hours we recorded."),
                 "means": (
                     "Low voltage makes motors work harder than they were designed to. "
-                    "Over time that shortens the life of refrigerators, freezers, air "
-                    "conditioners and well pumps."),
+                    "Over time that shortens the life of "
+                    + ("refrigeration, compressors, pumps and air conditioning plant."
+                       if vocab["is_business"] else
+                       "refrigerators, freezers, air conditioners and well pumps.")),
                 "symptom": _SYMPTOMS["under_voltage"],
             })
         if worst_high is not None and worst_high > hi:
             out.append({
-                "headline": "The voltage at your home rose above the normal range",
+                "headline": f"The voltage at {site} rose above the normal range",
                 "measured": (
                     f"The highest reading was {worst_high:.0f} volts, against an "
                     f"allowed maximum of {hi:.0f} volts."),
@@ -2684,19 +2736,14 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     if nh.get("available") and nh.get("severity") in ("caution", "warning", "critical"):
         out.insert(0, {
             "headline": "We found signs of a problem with the neutral connection",
-            "measured": (
-                "Your home is supplied by two 120-volt halves that share one return "
-                "wire, called the neutral. Our measurements show the two halves "
-                "moving in opposite directions -- one rising as the other falls -- "
-                "which is what happens when that shared connection is loose, "
-                "corroded or broken."),
+                        "measured": vocab["neutral_measured"],
             "means": (
                 "This is the most important item in this letter. A failing neutral "
-                "lets the voltage on one half of your home climb well above normal "
-                "while the other half drops, which can damage appliances and "
-                "electronics on the high side. It is also a shock and fire hazard, "
-                "and it does not repair itself."),
-            "symptom": _SYMPTOMS["neutral"],
+                "lets the voltage on part of the installation climb well above "
+                "normal while the rest drops, which can damage equipment on the "
+                "high side. It is also a shock and fire hazard, and it does not "
+                "repair itself."),
+            "symptom": vocab["neutral_symptom"],
             "safety": True,
         })
 
@@ -2716,8 +2763,8 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                          f"{'s' if n_sag != 1 else ''}.{detail}"),
             "means": (
                 "Brief dips are usually caused by a large load starting up, either "
-                "in your home or nearby. Most appliances ride through them; clocks "
-                "and electronics without battery backup may not."),
+                f"at {site} or nearby. Most equipment rides through them; clocks, "
+                "controls and electronics without battery backup may not."),
             "symptom": _SYMPTOMS["sag_events"],
         })
     if n_swell:
@@ -2766,12 +2813,73 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
             "symptom": _SYMPTOMS["flicker"],
         })
 
-    # ── Load balance between the two halves ───────────────────────────────
+    # ── Small business only: things that cost money or appear on a bill ───
+    # A homeowner is not billed for power factor and cannot act on distortion, so
+    # neither appears in a residential letter. A small business is billed for one
+    # and can often trace the other to specific equipment.
+    if vocab["is_business"]:
+        if pfr.get("available") and pfr.get("pct_below_limit", 0) > 0:
+            sched = "SG" if thresh.customer_class == "sg" else "C"
+            out.append({
+                "headline": "Your power factor is below the level the tariff requires",
+                "measured": (
+                    f"Power factor averaged {pfr['mean_pf']:.2f} and fell as low as "
+                    f"{pfr['min_pf']:.2f}. The tariff requires 0.90 or better."),
+                "means": (
+                    "Power factor describes how much of the current you draw does "
+                    "useful work. At a low power factor you draw more current for "
+                    "the same output, which loads your wiring and ours without "
+                    "producing anything extra. Under PSCo Electric Tariff Sheet R73 "
+                    f"(Schedule {sched}) a power factor below 0.90 can attract a "
+                    "billing adjustment, so this one usually pays for itself to fix. "
+                    "The normal remedy is power factor correction capacitors, which "
+                    "an electrical contractor can size and install."),
+                "symptom": (
+                    "Nothing you would see or hear. This shows up on the bill "
+                    "rather than in how equipment behaves."),
+            })
+
+        # Distortion, stated plainly and without per-order detail: enough to know
+        # whether it matters and what causes it, not enough to invite questions
+        # this letter cannot answer.
+        v_thd = (thd.get("voltage") or {})
+        i_thd = (thd.get("current") or {})
+        if (v_thd.get("available") and v_thd.get("pct_exceeding", 0) > 0) or \
+           (i_thd.get("available") and i_thd.get("pct_exceeding", 0) > 0):
+            which = []
+            if v_thd.get("pct_exceeding", 0) > 0:
+                which.append("the voltage supplied to you")
+            if i_thd.get("pct_exceeding", 0) > 0:
+                which.append("the current your equipment draws")
+            out.append({
+                "headline": "The shape of the electrical waveform is more distorted than the standard allows",
+                "measured": (
+                    "Mains electricity should be a smooth repeating wave. We "
+                    "measured distortion of that shape in "
+                    + " and in ".join(which)
+                    + ", beyond the level the applicable standard permits."),
+                "means": (
+                    "Distortion is produced by equipment that draws current in "
+                    "pulses rather than smoothly — variable speed drives, battery "
+                    "chargers, LED and fluorescent lighting, computer power "
+                    "supplies, welders. It does not usually stop equipment "
+                    "working, but it makes transformers and neutral conductors run "
+                    "hotter than their rating assumes, which shortens their life. "
+                    "Identifying which equipment is responsible needs a site "
+                    "survey; the engineer named below can advise on whether that "
+                    "is worthwhile here."),
+                "symptom": (
+                    "Transformers or conductors running hot. Nuisance tripping of "
+                    "breakers that are not obviously overloaded. In some cases an "
+                    "audible hum from a transformer or panel."),
+            })
+
+    # ── Load balance across the service ───────────────────────────────────
     if ci.get("available") and ci.get("pct_exceeding", 0) > 0:
         out.append({
-            "headline": "The electrical load is unevenly split between the two halves of your home",
+            "headline": f"The electrical load is unevenly split across {site}",
             "measured": (
-                f"The two halves of your service differed by an average of "
+                f"The parts of your service differed in load by an average of "
                 f"{ci['mean_imbalance_pct']:.0f}%, and at times by "
                 f"{ci['max_imbalance_pct']:.0f}%."),
             "means": (
@@ -2796,23 +2904,30 @@ def generate_customer_letter(
     engineer_phone: str = "",
     engineer_email: str = "",
 ) -> Optional[Path]:
-    """Write the plain-language residential customer letter.
+    """Write the plain-language customer letter.
 
-    Residential only: the other service classes need their own version, since a
-    facility manager can act on distortion and transformer loading where a
-    homeowner cannot. Returns None for any other class.
+    Residential and small commercial (under 50 kW) only. Above that the
+    engineering report is the customer document: a facilities reader can act on
+    distortion and transformer loading, and writing down to them costs
+    credibility. Returns None for the classes that get the report instead.
+
+    The two supported classes differ in vocabulary and in two extra conditions:
+    a small business is billed for power factor and can usually trace waveform
+    distortion to specific equipment, where a homeowner can do neither.
     """
     if not _DOCX_AVAILABLE:
         log.warning("python-docx not installed — skipping customer letter.")
         return None
-    if thresh.customer_class != "r":
+    if thresh.customer_class not in _LETTER_CLASSES:
         log.info(
-            "Customer letter is residential-only; service class %r gets the "
-            "engineering report alone.", thresh.customer_class)
+            "No plain-language letter for service class %r: at that scale the "
+            "engineering report is the customer document, with its terms defined "
+            "in place.", thresh.customer_class)
         return None
 
     import datetime
     fs = report["file_summary"]
+    vocab = _customer_vocabulary(report, thresh)
     conditions = _customer_conditions(report, thresh)
     doc = _DocxDocument()
 
@@ -2829,7 +2944,8 @@ def generate_customer_letter(
     hdr = doc.add_paragraph()
     _bold(hdr, "Xcel Energy — Power Quality Review", color=_XE_BLUE, size_pt=15)
     sub = doc.add_paragraph()
-    _normal(sub, "What we measured at your home, and what it means", size_pt=11)
+    _normal(sub, f"What we measured at {vocab['site']}, and what it means",
+            size_pt=11)
 
     intro = doc.add_table(rows=3, cols=2)
     intro.style = "Table Grid"
@@ -2848,7 +2964,8 @@ def generate_customer_letter(
     # ── Why you received this ─────────────────────────────────────────────
     _section_heading(doc, "Why you received this", level=1)
     _body(doc,
-        "You contacted us about the electricity supply at your home. We fitted a "
+        f"You contacted us about the electricity supply at {vocab['site']}. We "
+        "fitted a "
         "recording meter at your service for the period shown above. It measured "
         "the voltage and current many times a second and stored a summary every "
         "few minutes. This letter explains what those measurements show, in plain "
@@ -2858,7 +2975,8 @@ def generate_customer_letter(
     _section_heading(doc, "What we found", level=1)
     if not conditions:
         _body(doc,
-            "We did not find a problem with the electricity supplied to your home "
+            f"We did not find a problem with the electricity supplied to "
+            f"{vocab['site']} "
             "during this period. The voltage stayed within the normal range, and we "
             "did not record dips, surges or flicker beyond what is expected on a "
             "healthy supply.")
@@ -2924,7 +3042,8 @@ def generate_customer_letter(
     _body(doc,
         "These measurements have been reviewed by an engineer, whose name is at the "
         "end of this letter. Where the results point to something on our equipment, "
-        "we follow it up. Where they point to wiring or equipment inside your home, "
+        f"we follow it up. Where they point to wiring or equipment inside "
+        f"{vocab['site']}, "
         "a licensed electrician is the right person to look at it. The engineer's "
         "notes below say which applies in your case.")
 
@@ -2971,3 +3090,126 @@ def generate_customer_letter(
     log.info("Customer letter saved → %s  (%d condition(s) reported)",
              path, len(conditions))
     return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plain-language definitions for the engineering report
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The engineering report keeps its technical terms -- an engineer needs them and
+# vaguer language would cost precision -- but a report that goes to a customer,
+# or to a colleague outside power quality, has to define them where they are
+# actually read. So the recurring terms are glossed once, near the front, and
+# only the ones this particular report uses are listed.
+
+#: (term, plain definition, report key that has to be present for it to apply).
+#: A report key of None means the term always applies.
+_TERM_DEFINITIONS: List[Tuple[str, str, Optional[str]]] = [
+    ("RMS voltage",
+     "The effective voltage — what a meter reads and what equipment responds "
+     "to, as distinct from the peak of the waveform.", None),
+    ("ANSI C84.1 Range A",
+     "The voltage band a distribution system is expected to hold in normal "
+     "operation: within 5% either side of nominal. Range B is a wider band "
+     "tolerated only briefly.", None),
+    ("Sag / swell",
+     "A short drop or rise in voltage, lasting from half a cycle up to about a "
+     "minute. Distinct from a sustained voltage that is simply too low or high.",
+     "events"),
+    ("Total harmonic distortion (THD)",
+     "How far the waveform departs from a clean sine wave, as a percentage of "
+     "the fundamental 60 Hz component. Applied to voltage here.",
+     "thd_compliance"),
+    ("Total demand distortion (TDD)",
+     "Harmonic current as a percentage of the site's maximum demand current. "
+     "IEEE 519 limits current this way rather than as THD so that light-load "
+     "periods, where harmonic current is small but the fundamental is smaller "
+     "still, do not inflate the result.", "thd_compliance"),
+    ("IL",
+     "The maximum demand current during the recording, at the fundamental "
+     "frequency. This is the reference TDD is measured against.",
+     "thd_compliance"),
+    ("ISC",
+     "The short-circuit current available at the service point. The ratio "
+     "ISC/IL selects which of the IEEE 519 limit classes applies — a stiffer "
+     "supply tolerates more harmonic current.", "_isc"),
+    ("Harmonic order (H3, H5, …)",
+     "A component of the waveform at a whole multiple of 60 Hz. H3 is 180 Hz, "
+     "H5 is 300 Hz, and so on.", "individual_harmonics"),
+    ("Triplen harmonics",
+     "The orders divisible by three (H3, H9, H15). On a four-wire system these "
+     "add together in the neutral conductor instead of cancelling, which is why "
+     "neutral current can exceed phase current.", "neutral_harmonics"),
+    ("K-factor",
+     "Harmonic current weighted by frequency, indicating the additional heating "
+     "a transformer experiences beyond a sinusoidal load of the same size. A "
+     "standard transformer is rated K=1.", "kfactor"),
+    ("Pst and Plt",
+     "Short-term (10-minute) and long-term (2-hour) flicker severity. The scale "
+     "is set so that 1.0 is the level at which roughly half of observers judge "
+     "light flicker annoying; it measures irritation, not damage.", "flicker"),
+    ("Power factor",
+     "Real power divided by apparent power. A low power factor means more "
+     "current is drawn for the same useful work, loading conductors and "
+     "transformers without doing more of it.", "power_factor"),
+    ("ITIC (CBEMA) curve",
+     "An industry reference curve describing how deep and how long a voltage "
+     "dip can be before typical electronic equipment misoperates. Events "
+     "plotted outside it are the ones likely to have caused trouble.", "itic"),
+    ("Point-on-wave capture",
+     "A short recording of the actual waveform shape, rather than a summary "
+     "value over an interval. Used to see the shape of a disturbance.",
+     "_waveforms"),
+]
+
+
+def _applicable_terms(report: dict) -> List[Tuple[str, str]]:
+    """The defined terms this report actually uses.
+
+    A residential report that never mentions TDD should not define it, and a
+    report run without ISC should not define a ratio it never computed.
+    """
+    events = report.get("events") or {}
+    thd = report.get("thd_compliance") or {}
+
+    def present(key: Optional[str]) -> bool:
+        if key is None:
+            return True
+        if key == "_isc":
+            return bool((thd.get("tdd_info") or {}).get("isc_provided"))
+        if key == "_waveforms":
+            return bool(events.get("waveform_captures"))
+        if key == "events":
+            return bool(events.get("event_count"))
+        if key == "thd_compliance":
+            # Only if the section produced a usable result for either quantity.
+            return bool((thd.get("voltage") or {}).get("available")
+                        or (thd.get("current") or {}).get("available"))
+        section = report.get(key)
+        return isinstance(section, dict) and bool(section.get("available"))
+
+    return [(t, d) for t, d, key in _TERM_DEFINITIONS if present(key)]
+
+
+def _word_terms_panel(doc, report: dict) -> None:
+    """Define the report's recurring terms once, before they are first used."""
+    terms = _applicable_terms(report)
+    if not terms:
+        return
+    _section_heading(doc, "Terms used in this report", level=1)
+    _body(doc,
+        "This report is written for an engineering reader but is also shared with "
+        "customers. The terms below are the ones it relies on; the measurements "
+        "that follow assume them rather than re-explaining them.")
+    tbl = doc.add_table(rows=len(terms), cols=2)
+    tbl.style = "Table Grid"
+    _set_col_widths(tbl, [4.8, 11.7])
+    for i, (term, definition) in enumerate(terms):
+        cl, cr = tbl.rows[i].cells
+        _cell_shade(cl, "F2F6FA")
+        run = cl.paragraphs[0].add_run(term)
+        run.bold = True
+        run.font.size = Pt(9)
+        dr = cr.paragraphs[0].add_run(definition)
+        dr.font.size = Pt(9)
+    doc.add_paragraph()

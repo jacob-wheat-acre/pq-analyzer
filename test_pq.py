@@ -1509,11 +1509,72 @@ class TestCustomerLetter:
         assert out is not None and out.exists()
         assert out.name.endswith("_customer_letter.docx")
 
-    @pytest.mark.parametrize("cls", ["c", "sg", "pg"])
-    def test_not_written_for_other_classes(self, tmp_path, cls):
+    def test_written_for_small_commercial(self, tmp_path):
         from pq_report import generate_customer_letter
-        rep, th = self._report(Path("test_data/test_residential.pqd"), customer_class=cls)
-        assert generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t") is None
+        rep, th = self._report(Path("test_data/test_commercial_small.pqd"),
+                               customer_class="c")
+        out = generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t")
+        assert out is not None and out.exists()
+
+    @pytest.mark.parametrize("cls", ["sg", "pg"])
+    def test_not_written_above_50kw(self, tmp_path, cls):
+        # At that scale the engineering report is the customer document.
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_commercial_large.pqd"),
+                               customer_class=cls, nominal=277.0)
+        assert generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t") is None
+
+    def test_business_letter_covers_power_factor_and_distortion(self):
+        from pq_report import _customer_conditions
+        rep, th = self._report(Path("test_data/test_commercial_small.pqd"),
+                               customer_class="c")
+        heads = " ".join(c["headline"].lower() for c in _customer_conditions(rep, th))
+        assert "power factor" in heads
+        assert "distorted" in heads
+
+    def test_residential_letter_omits_power_factor_and_distortion(self):
+        # A homeowner is not billed for power factor and cannot act on distortion.
+        from pq_report import _customer_conditions
+        rep, th = self._report(Path("test_data/test_commercial_small.pqd"),
+                               customer_class="r")
+        heads = " ".join(c["headline"].lower() for c in _customer_conditions(rep, th))
+        assert "power factor" not in heads
+        assert "distorted" not in heads
+
+    def test_business_letter_carries_no_residential_wording(self, tmp_path):
+        from docx import Document
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_commercial_small.pqd"),
+                               customer_class="c")
+        out = generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t")
+        text = " ".join(p.text for p in Document(str(out)).paragraphs)
+        for residential in ("your home", "the house", "refrigerators, freezers",
+                            "well pumps"):
+            assert residential not in text, f"business letter says {residential!r}"
+        assert "your business" in text
+
+    def test_business_letter_names_the_tariff_schedule(self, tmp_path):
+        from docx import Document
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_commercial_small.pqd"),
+                               customer_class="c")
+        out = generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t")
+        text = " ".join(p.text for p in Document(str(out)).paragraphs)
+        # Power factor is the one item with a direct billing consequence, so the
+        # schedule it comes from is worth naming.
+        assert "Schedule C" in text and "R73" in text
+
+    def test_neutral_wording_follows_the_service_topology(self):
+        # "Two 120-volt halves" is true of a house and false of a three-phase site.
+        from pq_report import _customer_vocabulary
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        v = _customer_vocabulary(rep, th)
+        assert "two 120-volt halves" in v["neutral_measured"]
+        rep3, th3 = self._report(Path("test_data/test_commercial_small.pqd"),
+                                 customer_class="c")
+        v3 = _customer_vocabulary(rep3, th3)
+        assert "three separate live wires" in v3["neutral_measured"]
+        assert "your business" == v3["site"]
 
     def test_states_no_attribution_and_no_commitment(self, tmp_path):
         from docx import Document
