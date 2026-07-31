@@ -1465,3 +1465,108 @@ class TestHarmonicSignificanceGate:
         df = self._frame(1.1, 0.2).drop(columns=["current_a"])
         r = harmonic_spectrum_significance(df, Thresholds())
         assert r["usable"] is False and r["load_verified"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Residential customer letter
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
+class TestCustomerLetter:
+    """The second, customer-facing document.
+
+    It must be residential-only, must state no attribution, and must commit
+    Xcel Energy to nothing.
+    """
+
+    def _report(self, path, customer_class="r", nominal=120.0):
+        import pq_analysis as An
+        from pq_report import generate_report
+        ds = extract_dataset(ProntoAdapter(path), ChannelMapper())
+        th = Thresholds(nominal_voltage=nominal, customer_class=customer_class)
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th),
+            An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th),
+        )
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        return rep, th
+
+    def test_written_for_residential(self, tmp_path):
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        assert out is not None and out.exists()
+        assert out.name.endswith("_customer_letter.docx")
+
+    @pytest.mark.parametrize("cls", ["c", "sg", "pg"])
+    def test_not_written_for_other_classes(self, tmp_path, cls):
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_residential.pqd"), customer_class=cls)
+        assert generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t") is None
+
+    def test_states_no_attribution_and_no_commitment(self, tmp_path):
+        from docx import Document
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        text = "\n".join(p.text for p in Document(str(out)).paragraphs).lower()
+        for banned in ("xcel energy will", "customer's responsibility",
+                       "utility responsibility", "customer-side", "utility-side",
+                       "your responsibility", "at fault"):
+            assert banned not in text, f"letter asserts {banned!r}"
+
+    def test_omits_engineering_concepts_a_homeowner_cannot_act_on(self, tmp_path):
+        from docx import Document
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        text = "\n".join(p.text for p in Document(str(out)).paragraphs).lower()
+        for jargon in ("thd", "tdd", "k-factor", "harmonic", "resonance",
+                       "ansi c84", "ieee 519", "iec 61000", "per-order",
+                       "spectral", "impedance"):
+            assert jargon not in text, f"letter uses {jargon!r}"
+
+    def test_every_condition_pairs_a_number_with_meaning_and_symptom(self):
+        from pq_report import _customer_conditions
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        conditions = _customer_conditions(rep, th)
+        assert conditions, "residential fixture should surface conditions"
+        for c in conditions:
+            assert c["headline"] and c["measured"] and c["means"] and c["symptom"]
+
+    def test_event_counts_handles_dataframe_and_list(self):
+        from pq_report import _event_counts
+        import pandas as pd
+        assert _event_counts({}) == {}
+        assert _event_counts({"events": None}) == {}
+        assert _event_counts({"events": pd.DataFrame()}) == {}
+        df = pd.DataFrame({"type": ["voltage_sag", "voltage_sag", "voltage_swell"]})
+        assert _event_counts({"events": df}) == {"voltage_sag": 2, "voltage_swell": 1}
+        lst = [{"type": "voltage_sag"}, {"type": "flicker_pst"}]
+        assert _event_counts({"events": lst}) == {"voltage_sag": 1, "flicker_pst": 1}
+
+    def test_clean_service_gets_a_clear_no_problem_letter(self, tmp_path):
+        from docx import Document
+        from pq_report import generate_customer_letter
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        # Blank every condition source so the letter takes its no-findings path.
+        for k in ("voltage_compliance", "flicker", "neutral_health",
+                  "current_imbalance", "itic", "events"):
+            rep[k] = {"available": False}
+        rep["root_causes"] = []
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        text = "\n".join(p.text for p in Document(str(out)).paragraphs)
+        assert "did not find a problem" in text
+        # And it must not overclaim: an intermittent fault can fall outside a window.
+        assert "only the days it ran" in text

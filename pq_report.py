@@ -496,12 +496,13 @@ def print_report(report: dict) -> None:
         for finding in sorted(rca, key=lambda f: _sev_rank.get(f["severity"], 9)):
             sev   = finding["severity"].upper()
             conf  = finding["confidence"].upper()
-            resp  = finding["responsibility"].upper()
             title = finding["title"]
-            print(f"\n  [{sev}] [{conf} confidence] [{resp}]  {title}")
+            print(f"\n  [{sev}] [{conf} confidence]  {title}")
             print(f"    Finding:       {finding['finding']}")
             print(f"    Likely cause:  {finding['cause']}")
-            print(f"    Action:        {finding['recommendation']}")
+            if finding.get("origin_evidence"):
+                print(f"    Bearing on origin: {finding['origin_evidence']}")
+            print(f"    Candidate action:  {finding['recommendation']}")
 
     # ── Events ────────────────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -927,8 +928,8 @@ _PF_FRIENDLY = {
 }
 
 _PRIORITY_FROM_SEV = {"critical": "High", "warning": "Medium", "info": "Low"}
-_GROUP_FROM_RESP   = {"customer": "customer", "utility": "utility",
-                      "shared": "joint", "unknown": "joint"}
+# Actions are no longer grouped by who owns them: the tool reports evidence and
+# the reviewing engineer writes the attribution.
 
 
 def _phase_label(ph: str) -> str:
@@ -1097,8 +1098,14 @@ def _purpose_from_title(title: str) -> str:
 
 
 def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
-    """Assemble recommended actions as dicts with recommendation, purpose,
-    priority (High/Medium/Low), and group (customer/utility/joint)."""
+    """Assemble recommended actions as dicts with recommendation, purpose and
+    priority (High/Medium/Low).
+
+    Actions are deliberately not grouped by who owns them. The tool reports what
+    the measurements support and the reviewing engineer assigns responsibility;
+    grouping actions under 'Customer' and 'Utility' headings assigned it by
+    implication, and nothing here can commit Xcel Energy to an action.
+    """
     pf  = report["pass_fail"]
     rca = report.get("root_causes", [])
     sev_rank = {"critical": 0, "warning": 1, "info": 2}
@@ -1111,7 +1118,7 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
             "recommendation": f["recommendation"],
             "purpose":        _purpose_from_title(f.get("title", "the identified condition")),
             "priority":       _PRIORITY_FROM_SEV.get(f.get("severity"), "Low"),
-            "group":          _GROUP_FROM_RESP.get(f.get("responsibility", "unknown"), "joint"),
+            "origin_evidence": f.get("origin_evidence"),
         })
 
     covered = " ".join(a["recommendation"].lower() for a in actions)
@@ -1129,7 +1136,7 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
         actions.append({"recommendation": rec,
                         "purpose":  "Meet the tariff power factor requirement and avoid "
                                     "penalty or discontinuance exposure.",
-                        "priority": "High", "group": "customer"})
+                        "priority": "High"})
 
     if not any(k in covered for k in ("harmonic", "vfd", "rectifier")):
         if pf.get("thd_current") is False:
@@ -1138,7 +1145,7 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
                                   "(VFDs, rectifiers, UPS). Consider passive or active "
                                   "harmonic filters, or 12-pulse drive topologies.",
                 "purpose":  "Bring current distortion within IEEE 519-2022 limits.",
-                "priority": "High", "group": "customer"})
+                "priority": "High"})
         if pf.get("individual_harmonics") is False:
             actions.append({
                 "recommendation": "Perform a detailed harmonic study with individual "
@@ -1146,7 +1153,7 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
                                   "exceeding IEEE 519-2022 per-order limits.",
                 "purpose":  "Identify and correct the sources of the specific harmonic "
                             "orders that exceed their limits.",
-                "priority": "High", "group": "customer"})
+                "priority": "High"})
 
     if (pf["current_imbalance"] is False
             and not any(k in covered for k in ("imbalance", "balance"))):
@@ -1155,22 +1162,22 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
                               "whether triplen harmonics are contributing to elevated "
                               "neutral current.",
             "purpose":  "Reduce current imbalance and neutral current.",
-            "priority": "High", "group": "customer"})
+            "priority": "High"})
 
     if pf.get("transformer_loading") is False and "transformer upgrade" not in covered:
         actions.append({
             "recommendation": "Contact your Xcel Energy Area Engineer to discuss an "
                               "upgrade of the overloaded serving transformer.",
             "purpose":  "Prevent thermal overload and premature transformer failure.",
-            "priority": "High", "group": "joint"})
+            "priority": "High"})
 
-    if pf["voltage"] is False and not any(a["group"] == "utility" for a in actions):
+    if pf["voltage"] is False and "voltage excursion" not in covered:
         actions.append({
-            "recommendation": "Xcel Energy will investigate the distribution system for "
-                              "the steady-state voltage excursions outside ANSI C84.1 "
-                              "Range A.",
+            "recommendation": "Steady-state voltage excursions outside ANSI C84.1 Range A "
+                              "warrant a distribution system review of secondary voltage, "
+                              "service conductor length and tap settings.",
             "purpose":  "Return service voltage to within ANSI C84.1 Range A.",
-            "priority": "High", "group": "utility"})
+            "priority": "High"})
 
     return actions
 
@@ -1208,32 +1215,21 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
     risky = sorted((f for f in rca if f.get("severity") in sev_rank),
                    key=lambda f: sev_rank[f["severity"]])
     if risky:
-        top  = risky[0]
-        resp = {"utility": "utility system", "customer": "customer equipment",
-                "shared": "both utility and customer systems"}.get(
-                    top.get("responsibility"), "undetermined equipment")
+        top = risky[0]
         bullets.append(
             f"Principal concern: {top['title']} "
-            f"({top.get('confidence', 'low')} confidence, involves {resp}).")
+            f"({top.get('confidence', 'low')} confidence). Attribution is left to "
+            "the reviewing engineer; the evidence bearing on it is given with the "
+            "finding.")
 
     if actions:
-        groups = {a["group"] for a in actions}
-        parts  = []
-        if "customer" in groups:
-            parts.append("the customer")
-        if "utility" in groups:
-            parts.append("Xcel Energy")
-        if "joint" in groups:
-            parts.append("joint investigation")
         n_high   = sum(1 for a in actions if a["priority"] == "High")
         high_txt = f", {n_high} of them high priority" if n_high else ""
-        who      = (" and ".join(parts) if len(parts) <= 2
-                    else ", ".join(parts[:-1]) + ", and " + parts[-1])
         n_act    = len(actions)
         act_txt  = "action is" if n_act == 1 else "actions are"
         bullets.append(
-            f"{n_act} recommended {act_txt} identified for "
-            f"{who}{high_txt} — see Recommended Actions.")
+            f"{n_act} candidate {act_txt} supported by the measurements"
+            f"{high_txt} — see Recommended Actions.")
     else:
         bullets.append("No corrective actions are required at this time.")
 
@@ -2095,9 +2091,8 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
             _body(doc,
                 f"Voltage imbalance exceeded 3% during {imb['pct_exceeding']:.1f}% of the recording "
                 f"(max {imb['max_imbalance_pct']:.2f}%, mean {imb['mean_imbalance_pct']:.2f}%). "
-                "Xcel Energy will investigate and correct voltage imbalance caused by the distribution system. "
-                "Measurements should be repeated with all customer loads disconnected to distinguish "
-                "utility-side from load-side imbalance."
+                "Distinguishing a supply asymmetry from an unbalanced load requires "
+                "repeating the measurement with all customer loads disconnected."
             )
 
     if ci["available"]:
@@ -2125,7 +2120,8 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
             _body(doc,
                 f"Current imbalance exceeded 10% during {ci['pct_exceeding']:.1f}% of the recording "
                 f"(max {ci['max_imbalance_pct']:.2f}%, mean {ci['mean_imbalance_pct']:.2f}%). "
-                f"Load imbalance is the customer's responsibility to correct.{nc_text}"
+                f"Correcting current imbalance requires redistributing single-phase "
+                f"load across the phases.{nc_text}"
             )
     _embed_plot(doc, outdir, stem, "imbalance.png",
                 "Voltage and current imbalance against limits, with neutral current.")
@@ -2240,28 +2236,21 @@ def _word_engineering_assessment(doc, report) -> None:
         "Supporting measurements are presented in the sections that follow.")
 
     _conf_rank = {"high": 0, "medium": 1, "low": 2}
-    _resp_rank = {"utility": 0, "shared": 1, "customer": 2, "unknown": 3}
     _sev_rank  = {"critical": 0, "warning": 1, "info": 2}
     _sev_label = {"critical": "Critical", "warning": "Warning", "info": "Observation"}
-    _resp_label = {"utility": "Utility system",
-                   "customer": "Customer system",
-                   "shared": "Shared / both systems",
-                   "unknown": "Responsibility TBD"}
     ordered = sorted(rca, key=lambda f: (
-        _conf_rank.get(f.get("confidence", "low"), 3),
-        _resp_rank.get(f.get("responsibility", "unknown"), 4),
         _sev_rank.get(f.get("severity"), 9),
+        _conf_rank.get(f.get("confidence", "low"), 3),
     ))
     for finding in ordered:
         sev  = finding["severity"]
-        resp = finding.get("responsibility", "unknown")
         conf = finding.get("confidence", "")
         p = doc.add_paragraph()
         _bold(p, f"{_sev_label.get(sev, sev).upper()}: {finding['title']}",
               color=(_FAIL_CLR if sev == "critical" else
                      RGBColor(0xCC, 0x66, 0x00) if sev == "warning" else _XE_BLUE),
               size_pt=10)
-        tag_txt = f"[{conf.capitalize()} confidence  |  {_resp_label.get(resp, resp)}]"
+        tag_txt = f"[{conf.capitalize()} confidence]"
         tag = p.add_run(f"  {tag_txt}")
         tag.font.size = Pt(9)
         tag.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
@@ -2279,6 +2268,26 @@ def _word_engineering_assessment(doc, report) -> None:
         run_c.bold = True
         run_c.font.size = Pt(10)
         body_p2.add_run(finding["cause"]).font.size = Pt(10)
+
+        if finding.get("origin_evidence"):
+            body_p3 = doc.add_paragraph()
+            body_p3.paragraph_format.left_indent = Cm(0.5)
+            run_e = body_p3.add_run("Evidence bearing on origin:  ")
+            run_e.bold = True
+            run_e.font.size = Pt(10)
+            body_p3.add_run(finding["origin_evidence"]).font.size = Pt(10)
+
+        # The tool states evidence; attribution is the reviewing engineer's to
+        # write, so the document carries an explicit place for it rather than
+        # pre-empting it.
+        assess = doc.add_paragraph()
+        assess.paragraph_format.left_indent = Cm(0.5)
+        run_a = assess.add_run("Engineer's assessment:  ")
+        run_a.bold = True
+        run_a.font.size = Pt(10)
+        blank = assess.add_run("_" * 78)
+        blank.font.size = Pt(10)
+        blank.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
 
         doc.add_paragraph()
 
@@ -2298,32 +2307,30 @@ def _word_recommended_actions(doc, actions: List[dict]) -> None:
     _prio_clr  = {"High": _FAIL_CLR,
                   "Medium": RGBColor(0xCC, 0x66, 0x00),
                   "Low": _XE_BLUE}
-    for gkey, glabel in (("customer", "Customer Actions"),
-                         ("utility",  "Utility Actions"),
-                         ("joint",    "Joint Investigation Actions")):
-        g_actions = sorted((a for a in actions if a["group"] == gkey),
-                           key=lambda a: _prio_rank.get(a["priority"], 3))
-        if not g_actions:
-            continue
-        _section_heading(doc, glabel, level=2)
-        for a in g_actions:
-            p = doc.add_paragraph()
-            _bold(p, "Recommendation:  ", size_pt=10)
-            _normal(p, a["recommendation"], size_pt=10)
-            p2 = doc.add_paragraph()
-            p2.paragraph_format.left_indent = Cm(0.5)
-            _bold(p2, "Purpose:  ", size_pt=10)
-            _normal(p2, a["purpose"], size_pt=10)
-            p3 = doc.add_paragraph()
-            p3.paragraph_format.left_indent = Cm(0.5)
-            _bold(p3, "Priority:  ", size_pt=10)
-            prio_run = p3.add_run(a["priority"])
-            prio_run.bold = True
-            prio_run.font.size = Pt(10)
-            clr = _prio_clr.get(a["priority"])
-            if clr:
-                prio_run.font.color.rgb = clr
-            doc.add_paragraph()
+    # One list, ordered by priority. Which side of the meter each action falls to
+    # follows from the action itself and is the engineer's call to record.
+    _body(doc,
+        "Candidate actions supported by the measurements, in priority order. "
+        "Assignment of these actions between the utility and the customer is left "
+        "to the reviewing engineer.")
+    for a in sorted(actions, key=lambda a: _prio_rank.get(a["priority"], 3)):
+        p = doc.add_paragraph()
+        _bold(p, "Recommendation:  ", size_pt=10)
+        _normal(p, a["recommendation"], size_pt=10)
+        p2 = doc.add_paragraph()
+        p2.paragraph_format.left_indent = Cm(0.5)
+        _bold(p2, "Purpose:  ", size_pt=10)
+        _normal(p2, a["purpose"], size_pt=10)
+        p3 = doc.add_paragraph()
+        p3.paragraph_format.left_indent = Cm(0.5)
+        _bold(p3, "Priority:  ", size_pt=10)
+        prio_run = p3.add_run(a["priority"])
+        prio_run.bold = True
+        prio_run.font.size = Pt(10)
+        clr = _prio_clr.get(a["priority"])
+        if clr:
+            prio_run.font.color.rgb = clr
+        doc.add_paragraph()
 
 
 def _word_appendix(doc, report, thresh, df) -> None:
@@ -2562,3 +2569,387 @@ def generate_word_report(
         ) from exc
     log.info("Word report saved → %s", out_path)
     return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Residential customer letter
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A separate document for the customer, written to be read by someone with no
+# electrical training. The governing rule is that no number appears without what
+# it means and what follows from it -- otherwise the engineer rewrites it before
+# it can be sent, which defeats the purpose.
+#
+# Deliberately omitted for residential: harmonics, THD, TDD, K-factor, resonance
+# and load-signature matching. A homeowner owns no transformer and cannot act on
+# distortion. Voltage level, dips and swells, neutral integrity and visible
+# flicker are what a house actually experiences.
+#
+# Also deliberately absent: any statement of who is responsible, and any
+# commitment on Xcel Energy's behalf. Both are the reviewing engineer's to add.
+
+#: What a customer would have noticed, for each condition the analysis detects.
+_SYMPTOMS = {
+    "under_voltage": (
+        "Lights dimmer than usual, especially in the evening. Motors in "
+        "refrigerators, freezers and air conditioners laboring on start-up, "
+        "running hot, or tripping their overload protection."),
+    "over_voltage": (
+        "Lights brighter than usual. Bulbs failing sooner than they should. "
+        "Electronics running warm."),
+    "sag_events": (
+        "Lights dipping or blinking. Clocks on ovens and microwaves resetting. "
+        "Computers, routers or televisions restarting for no apparent reason."),
+    "swell_events": (
+        "A brief flare in the lights. Occasionally a surge protector clamping, "
+        "or an appliance shutting itself off to protect its electronics."),
+    "flicker": (
+        "A visible flutter or shimmer in the lights, often most noticeable in "
+        "the corner of your eye or on a lit wall."),
+    "neutral": (
+        "Lights in one part of the house dimming while lights elsewhere "
+        "brighten, often the moment a large appliance switches on. Bulbs "
+        "failing repeatedly in some rooms but not others. Electronics failing "
+        "with no obvious cause."),
+    "imbalance": (
+        "One part of the house noticeably affected while the rest seems "
+        "normal."),
+}
+
+
+def _event_counts(event_result: dict) -> Dict[str, int]:
+    """Count detected events by type.
+
+    detect_events returns a DataFrame when it has adaptive data to work from and
+    a list of dicts otherwise, so both are handled.
+    """
+    events = (event_result or {}).get("events")
+    if events is None:
+        return {}
+    if isinstance(events, pd.DataFrame):
+        if events.empty or "type" not in events.columns:
+            return {}
+        return {str(k): int(v) for k, v in events["type"].value_counts().items()}
+    counts: Dict[str, int] = {}
+    for e in events:
+        key = e.get("type", "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
+    """Conditions worth telling a residential customer about, in plain terms."""
+    out: List[dict] = []
+    vc = report.get("voltage_compliance") or {}
+    fl = report.get("flicker") or {}
+    nh = report.get("neutral_health") or {}
+    ci = report.get("current_imbalance") or {}
+    itic = report.get("itic") or {}
+    counts = _event_counts(report.get("events") or {})
+    hours = (report.get("file_summary") or {}).get("duration_hours") or 0
+
+    # ── Voltage outside the allowed range ─────────────────────────────────
+    if vc.get("available") and vc.get("total_pct_out_of_bounds", 0) > 0:
+        lo, hi = vc["range_v"]
+        worst_low = min((s["min_v"] for s in vc["phases"].values()), default=None)
+        worst_high = max((s["max_v"] for s in vc["phases"].values()), default=None)
+        pct = vc["total_pct_out_of_bounds"]
+        if worst_low is not None and worst_low < lo:
+            out.append({
+                "headline": "The voltage at your home dropped below the normal range",
+                "measured": (
+                    f"The lowest reading was {worst_low:.0f} volts. Normal service is "
+                    f"{thresh.nominal_voltage:.0f} volts, and the allowed range is "
+                    f"{lo:.0f} to {hi:.0f} volts. Readings fell outside that range "
+                    f"during {pct:.1f}% of the {hours:.0f} hours we recorded."),
+                "means": (
+                    "Low voltage makes motors work harder than they were designed to. "
+                    "Over time that shortens the life of refrigerators, freezers, air "
+                    "conditioners and well pumps."),
+                "symptom": _SYMPTOMS["under_voltage"],
+            })
+        if worst_high is not None and worst_high > hi:
+            out.append({
+                "headline": "The voltage at your home rose above the normal range",
+                "measured": (
+                    f"The highest reading was {worst_high:.0f} volts, against an "
+                    f"allowed maximum of {hi:.0f} volts."),
+                "means": (
+                    "Sustained high voltage shortens the life of light bulbs and of "
+                    "the electronics inside appliances."),
+                "symptom": _SYMPTOMS["over_voltage"],
+            })
+
+    # ── Neutral integrity: the safety-relevant one, so it leads ───────────
+    if nh.get("available") and nh.get("severity") in ("caution", "warning", "critical"):
+        out.insert(0, {
+            "headline": "We found signs of a problem with the neutral connection",
+            "measured": (
+                "Your home is supplied by two 120-volt halves that share one return "
+                "wire, called the neutral. Our measurements show the two halves "
+                "moving in opposite directions -- one rising as the other falls -- "
+                "which is what happens when that shared connection is loose, "
+                "corroded or broken."),
+            "means": (
+                "This is the most important item in this letter. A failing neutral "
+                "lets the voltage on one half of your home climb well above normal "
+                "while the other half drops, which can damage appliances and "
+                "electronics on the high side. It is also a shock and fire hazard, "
+                "and it does not repair itself."),
+            "symptom": _SYMPTOMS["neutral"],
+            "safety": True,
+        })
+
+    # ── Short dips and surges ─────────────────────────────────────────────
+    n_sag = counts.get("voltage_sag", 0)
+    n_swell = counts.get("voltage_swell", 0)
+    if n_sag:
+        worst = itic.get("worst") or {}
+        detail = ""
+        if worst.get("pct_nominal") and worst.get("duration_ms"):
+            secs = worst["duration_ms"] / 1000.0
+            detail = (f" The deepest fell to {worst['pct_nominal']:.0f}% of normal "
+                      f"voltage and lasted {secs:.1f} seconds.")
+        out.append({
+            "headline": "The voltage dipped briefly on several occasions",
+            "measured": (f"We recorded {n_sag} short voltage dip"
+                         f"{'s' if n_sag != 1 else ''}.{detail}"),
+            "means": (
+                "Brief dips are usually caused by a large load starting up, either "
+                "in your home or nearby. Most appliances ride through them; clocks "
+                "and electronics without battery backup may not."),
+            "symptom": _SYMPTOMS["sag_events"],
+        })
+    if n_swell:
+        out.append({
+            "headline": "The voltage rose briefly on several occasions",
+            "measured": (f"We recorded {n_swell} short voltage rise"
+                         f"{'s' if n_swell != 1 else ''}."),
+            "means": (
+                "Brief rises often follow a large load switching off. Surge "
+                "protection on sensitive electronics is worthwhile."),
+            "symptom": _SYMPTOMS["swell_events"],
+        })
+
+    # ── Visible flicker ───────────────────────────────────────────────────
+    if fl.get("available") and fl.get("overall_pass") is False:
+        pst = fl.get("pst_max")
+        out.append({
+            "headline": "The lights were flickering enough to be noticeable",
+            "measured": (
+                f"Flicker measured {pst:.2f} on the standard scale for this, where "
+                f"{fl['pst_limit']:.1f} is the level at which a typical person "
+                "begins to notice it."
+                if pst is not None else
+                "Flicker exceeded the level at which a typical person notices it."),
+            "means": (
+                "This measures how much the light output varies, not how much power "
+                "you use. It does not damage equipment, but a standard exists for it "
+                "because people find it genuinely bothersome."),
+            "symptom": _SYMPTOMS["flicker"],
+        })
+
+    # ── Load balance between the two halves ───────────────────────────────
+    if ci.get("available") and ci.get("pct_exceeding", 0) > 0:
+        out.append({
+            "headline": "The electrical load is unevenly split between the two halves of your home",
+            "measured": (
+                f"The two halves of your service differed by an average of "
+                f"{ci['mean_imbalance_pct']:.0f}%, and at times by "
+                f"{ci['max_imbalance_pct']:.0f}%."),
+            "means": (
+                "An uneven split is common and is not a fault in itself. It does make "
+                "low voltage and neutral problems worse, so it is worth correcting if "
+                "an electrician is already working in your panel."),
+            "symptom": _SYMPTOMS["imbalance"],
+        })
+
+    return out
+
+
+def generate_customer_letter(
+    report: dict,
+    thresh: Thresholds,
+    site_address: str,
+    engineer_name: str,
+    outdir: Path,
+    stem: str,
+    *,
+    engineer_title: str = "",
+    engineer_phone: str = "",
+    engineer_email: str = "",
+) -> Optional[Path]:
+    """Write the plain-language residential customer letter.
+
+    Residential only: the other service classes need their own version, since a
+    facility manager can act on distortion and transformer loading where a
+    homeowner cannot. Returns None for any other class.
+    """
+    if not _DOCX_AVAILABLE:
+        log.warning("python-docx not installed — skipping customer letter.")
+        return None
+    if thresh.customer_class != "r":
+        log.info(
+            "Customer letter is residential-only; service class %r gets the "
+            "engineering report alone.", thresh.customer_class)
+        return None
+
+    import datetime
+    fs = report["file_summary"]
+    conditions = _customer_conditions(report, thresh)
+    doc = _DocxDocument()
+
+    for section in doc.sections:
+        section.top_margin = section.bottom_margin = Cm(2.0)
+        section.left_margin = section.right_margin = Cm(2.5)
+        fp = section.footer.paragraphs[0]
+        fp.clear()
+        fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = fp.add_run("Xcel Energy — Power Quality Review  |  page ")
+        r.font.size = Pt(8)
+        r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+    hdr = doc.add_paragraph()
+    _bold(hdr, "Xcel Energy — Power Quality Review", color=_XE_BLUE, size_pt=15)
+    sub = doc.add_paragraph()
+    _normal(sub, "What we measured at your home, and what it means", size_pt=11)
+
+    intro = doc.add_table(rows=3, cols=2)
+    intro.style = "Table Grid"
+    _set_col_widths(intro, [4.5, 12.0])
+    for i, (label, value) in enumerate([
+        ("Service address", site_address or "—"),
+        ("Dates measured", f"{fs['start_time']} to {fs['end_time']}"),
+        ("Length of recording", f"{fs['duration_hours']:.0f} hours"),
+    ]):
+        cl, cr = intro.rows[i].cells
+        _cell_shade(cl, "E8F1FA")
+        cl.paragraphs[0].add_run(label).bold = True
+        cr.paragraphs[0].add_run(value)
+    doc.add_paragraph()
+
+    # ── Why you received this ─────────────────────────────────────────────
+    _section_heading(doc, "Why you received this", level=1)
+    _body(doc,
+        "You contacted us about the electricity supply at your home. We fitted a "
+        "recording meter at your service for the period shown above. It measured "
+        "the voltage and current many times a second and stored a summary every "
+        "few minutes. This letter explains what those measurements show, in plain "
+        "terms. A separate technical report accompanies it, which your electrician "
+        "is welcome to read.")
+
+    # ── What we found ─────────────────────────────────────────────────────
+    _section_heading(doc, "What we found", level=1)
+    if not conditions:
+        _body(doc,
+            "We did not find a problem with the electricity supplied to your home "
+            "during this period. The voltage stayed within the normal range, and we "
+            "did not record dips, surges or flicker beyond what is expected on a "
+            "healthy supply.")
+        _body(doc,
+            "That does not mean nothing happened. A recording covers only the days "
+            "it ran, and an intermittent fault can easily fall outside it. If the "
+            "problem you reported continues, please contact us again and say when "
+            "it happens, because a longer or repeated recording may be needed.")
+    else:
+        _body(doc,
+            f"We found {len(conditions)} thing"
+            f"{'s' if len(conditions) != 1 else ''} worth bringing to your "
+            "attention. Each is explained below: what we measured, what it means, "
+            "and what you may have noticed.")
+
+    safety = [c for c in conditions if c.get("safety")]
+    for idx, cond in enumerate(conditions, start=1):
+        doc.add_paragraph()
+        p = doc.add_paragraph()
+        _bold(p, f"{idx}. {cond['headline']}",
+              color=(_FAIL_CLR if cond.get("safety") else _XE_BLUE), size_pt=11)
+        for label, key in (("What we measured:  ", "measured"),
+                           ("What this means:  ", "means"),
+                           ("What you may have noticed:  ", "symptom")):
+            q = doc.add_paragraph()
+            q.paragraph_format.left_indent = Cm(0.6)
+            _bold(q, label, size_pt=10)
+            _normal(q, cond[key], size_pt=10)
+
+    # ── Safety ────────────────────────────────────────────────────────────
+    doc.add_paragraph()
+    _section_heading(doc, "Is this a safety concern?", level=1)
+    if safety:
+        _body(doc,
+            "Yes — one of the findings above needs prompt attention. A damaged or "
+            "loose neutral connection can put well above normal voltage on part of "
+            "your wiring, and it is a shock and fire risk as well as a risk to your "
+            "appliances. Please arrange for a licensed electrician to inspect your "
+            "main panel and service connections, and tell them this letter reports "
+            "signs of a neutral problem.")
+        _body(doc,
+            "If you smell burning, see scorch marks around outlets or the panel, or "
+            "notice lights surging brightly, treat it as urgent: stop using the "
+            "affected circuits and call us immediately on the emergency number on "
+            "your bill.")
+    elif conditions:
+        _body(doc,
+            "We did not find anything in these measurements that suggests an "
+            "immediate safety risk. The items above affect how well your equipment "
+            "works and how long it lasts, rather than presenting a hazard. If you "
+            "ever smell burning or see scorch marks near outlets or your panel, "
+            "treat that as urgent and call the emergency number on your bill.")
+    else:
+        _body(doc,
+            "We did not find anything in these measurements that suggests a safety "
+            "risk. If you ever smell burning or see scorch marks near outlets or "
+            "your panel, treat that as urgent and call the emergency number on your "
+            "bill.")
+
+    # ── What happens next ─────────────────────────────────────────────────
+    doc.add_paragraph()
+    _section_heading(doc, "What happens next", level=1)
+    _body(doc,
+        "These measurements have been reviewed by an engineer, whose name is at the "
+        "end of this letter. Where the results point to something on our equipment, "
+        "we follow it up. Where they point to wiring or equipment inside your home, "
+        "a licensed electrician is the right person to look at it. The engineer's "
+        "notes below say which applies in your case.")
+
+    note = doc.add_paragraph()
+    _bold(note, "Engineer's notes for this service:", size_pt=10)
+    for _ in range(4):
+        line = doc.add_paragraph()
+        line.paragraph_format.left_indent = Cm(0.6)
+        blank = line.add_run("_" * 88)
+        blank.font.size = Pt(10)
+        blank.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+
+    # ── Questions ─────────────────────────────────────────────────────────
+    doc.add_paragraph()
+    _section_heading(doc, "If you have questions", level=1)
+    contact_bits = [b for b in (engineer_name, engineer_title) if b]
+    _body(doc,
+        "The engineer who reviewed your measurements is "
+        + (", ".join(contact_bits) if contact_bits else "listed below")
+        + ". "
+        + ("Telephone " + engineer_phone + ". " if engineer_phone else "")
+        + ("Email " + engineer_email + ". " if engineer_email else "")
+        + "Please quote your service address when you get in touch.")
+    _body(doc,
+        "The technical report accompanying this letter covers the same measurements "
+        "in engineering terms. That is the document to hand to an electrician.")
+
+    sign = doc.add_paragraph()
+    _normal(sign, engineer_name or "[Engineer Name]", size_pt=11)
+    if engineer_title:
+        t = doc.add_paragraph()
+        _normal(t, engineer_title, size_pt=10)
+    d = doc.add_paragraph()
+    _normal(d, str(datetime.date.today()), size_pt=10)
+
+    path = Path(outdir) / f"{stem}_customer_letter.docx"
+    try:
+        doc.save(str(path))
+    except PermissionError:
+        log.error("Cannot write %s — it is open in Word. Close it and re-run.", path)
+        return None
+    log.info("Customer letter saved → %s  (%d condition(s) reported)",
+             path, len(conditions))
+    return path

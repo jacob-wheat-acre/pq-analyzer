@@ -95,6 +95,7 @@ try:
         check_frequency,
         check_flicker,
         kfactor_by_phase,
+        generate_customer_letter,
     )
     _BOOK_AVAILABLE = True
 except Exception as _import_exc:
@@ -844,6 +845,26 @@ class PQApp(tk.Tk):
             engineer_phone=params["engineer_phone"],
             engineer_email=params["engineer_email"],
         )
+
+        # Separate customer-facing letter, residential only.
+        letter = generate_customer_letter(
+            report=report,
+            thresh=thresh,
+            site_address=params["address"] or params["site"] or stem,
+            engineer_name=params["engineer"],
+            outdir=outdir,
+            stem=stem,
+            engineer_title=params["engineer_title"],
+            engineer_phone=params["engineer_phone"],
+            engineer_email=params["engineer_email"],
+        )
+        if letter:
+            self._log_write(
+                "\nCustomer letter written alongside the engineering report.\n")
+        else:
+            self._log_write(
+                "\nNo customer letter: the plain-language version is residential-only "
+                "so far.\n")
 
         self._log_write("\nDone.  Word report and plots saved to pq_output/\n", tag="done")
         self._open_report(stem)

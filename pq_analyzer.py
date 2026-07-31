@@ -62,6 +62,7 @@ from pq_report import (
     generate_report,
     print_report,
     export_results,
+    generate_customer_letter,
     generate_word_report,
 )
 from pq_plots import (
@@ -377,6 +378,19 @@ def main():
             meter_id=args.meter_id or "",
             feeder=args.feeder or "",
             substation=args.substation or "",
+            engineer_title=args.engineer_title or "",
+            engineer_phone=args.engineer_phone or "",
+            engineer_email=args.engineer_email or "",
+        )
+        # Second, separate document: the plain-language letter for the customer.
+        # Residential only; other service classes get the engineering report alone.
+        generate_customer_letter(
+            report=report,
+            thresh=thresh,
+            site_address=args.site_address or args.site_name or stem,
+            engineer_name=args.engineer or "",
+            outdir=outdir,
+            stem=stem,
             engineer_title=args.engineer_title or "",
             engineer_phone=args.engineer_phone or "",
             engineer_email=args.engineer_email or "",

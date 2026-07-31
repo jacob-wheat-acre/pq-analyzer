@@ -392,7 +392,7 @@ def _step_times(t_sec: np.ndarray, interval: float) -> np.ndarray:
     """Interleave interval start and end times.
 
     The end of one interval sits 1 us before the start of the next, which is the
-    gap ProntoAdapter._step_pair_stride() looks for to recognise the encoding.
+    gap ProntoAdapter._step_pair_stride() looks for to recognize the encoding.
     """
     starts = np.asarray(t_sec, dtype=float)
     ends = starts + interval - 1e-6
@@ -447,7 +447,7 @@ def scenario_channels(labels: list[str], arrays: list[np.ndarray],
             group, order = parts[3], int(parts[1])
             phase, _rms_name, units = _PHASE_SUFFIX[group]
             measured = 'voltage' if group.startswith('V') else 'current'
-            # Reported per-order magnitudes are quantised to the display
+            # Reported per-order magnitudes are quantized to the display
             # resolution; the aggregates above are not. `harmonics` keeps the
             # unrounded values, which is what the meter computes from.
             series_values = np.round(np.asarray(values, dtype=float)

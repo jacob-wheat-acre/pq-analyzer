@@ -56,7 +56,7 @@ FLICKER_COLS = {
 LL_COLS = {"voltage_ab": "A-B", "voltage_bc": "B-C", "voltage_ca": "C-A"}
 
 #: Standard ANSI C84.1 line-to-line nominal voltages, used to snap the inferred
-#: nominal to a recognisable value for the report.
+#: nominal to a recognizable value for the report.
 _STANDARD_LL_NOMINAL = [208, 240, 380, 400, 415, 480, 600, 2400, 4160, 4800,
                         12470, 13200, 13800, 22860, 24940, 34500]
 
@@ -299,12 +299,12 @@ def check_frequency(df: pd.DataFrame, thresh: Thresholds) -> dict:
 
 
 #: Current-channel display resolution of the meter, in amps. Reported per-order
-#: harmonic magnitudes are quantised to this.
+#: harmonic magnitudes are quantized to this.
 CURRENT_RESOLUTION_A = 0.1
 
 #: A spectrum is only classified when its dominant order stands this many
-#: resolution steps clear of the quantisation floor. At 5 steps the largest order
-#: carries ~10% quantisation error and the small orders far more, which is the
+#: resolution steps clear of the quantization floor. At 5 steps the largest order
+#: carries ~10% quantization error and the small orders far more, which is the
 #: point where ratios like H5/H7 stop meaning anything.
 _MIN_RESOLUTION_STEPS = 5
 
@@ -323,7 +323,7 @@ def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict
     a resonance -- is only meaningful when the orders are well clear of the
     meter's 0.1 A reporting resolution and the service is actually loaded. On a
     1.1 A residential service with 0.2 A of third harmonic, each order carries
-    25-50% quantisation error, every ratio built from them is noise, and a
+    25-50% quantization error, every ratio built from them is noise, and a
     classifier will nonetheless return a confident answer: this is what had a
     house reported as an electric arc furnace at 94% similarity.
 
@@ -357,7 +357,7 @@ def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict
             out["reason"] = (
                 f"Only {out['loaded_intervals']} interval(s) reached {floor:.1f} A "
                 f"(10% of the {il_amps:.1f} A maximum demand); too little loaded "
-                "data to characterise the harmonic spectrum."
+                "data to characterize the harmonic spectrum."
             )
             return out
         scope = df[loaded]
@@ -374,7 +374,7 @@ def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict
         out["reason"] = (
             f"The largest harmonic order averages {dominant:.2f} A, only "
             f"{steps:.1f} times the meter's {CURRENT_RESOLUTION_A} A reporting "
-            "resolution. The spectrum is dominated by quantisation, so its shape "
+            "resolution. The spectrum is dominated by quantization, so its shape "
             "cannot identify a load type or a resonance."
         )
         return out
@@ -939,7 +939,7 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """
     # Z_h and the ratios built from it are only interpretable when the harmonic
     # orders stand clear of the meter's reporting resolution. Below that the
-    # impedance estimate is a ratio of two quantised near-zero numbers, which is
+    # impedance estimate is a ratio of two quantized near-zero numbers, which is
     # what produced a 13x "resonance" on a 1.1 A residential service.
     significance = harmonic_spectrum_significance(df, thresh)
 
@@ -2101,7 +2101,11 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
             "title":          f"{rank_labels[rank]}: {sig['title']}",
             "finding":        finding_text,
             "cause":          sig["cause"],
-            "responsibility": sig["responsibility"],
+            "origin_evidence": (
+                "Load signatures describe equipment downstream of the meter. "
+                "This is a match on spectral shape, not a measurement of "
+                "direction."
+            ),
             "recommendation": sig["recommendation"],
             "confidence":     conf,
             "evidence":       {
@@ -2230,7 +2234,11 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "cause":          ("Current harmonic load is close to the IEEE 519-2022 class limit. "
                                    "Additional VFDs, rectifiers, or other nonlinear loads could "
                                    "push TDD over the limit."),
-                "responsibility": "shared",
+                "origin_evidence": (
+                    "Harmonic current is injected by load while the resulting "
+                    "voltage distortion depends on supply impedance; interval "
+                    "data alone does not separate the two."
+                ),
                 "recommendation": ("Document existing harmonic sources. Before adding significant "
                                    "nonlinear loads, perform a harmonic study to verify continued "
                                    "compliance. Consider adding input reactors to existing VFDs to "
@@ -2336,7 +2344,11 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                    f"peaking at {in_max:.1f}% (see Voltage and Current Imbalance "
                                    f"above for measured amps)."),
                 "cause":          cause_text,
-                "responsibility": "customer",
+                "origin_evidence": (
+                    "Neutral current is the sum of the phase currents, so it "
+                    "follows from how load is distributed across the legs and "
+                    "from triplen harmonic content downstream of the meter."
+                ),
                 "recommendation": rec_text,
                 "confidence":     "high" if nh_avail else "medium",
                 "evidence":       evidence,
@@ -2364,19 +2376,18 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
             if thresh.customer_class == "r":
                 res_cause = (
                     "Parallel resonance forms when feeder or service-entrance inductance resonates "
-                    "with capacitance on the distribution system (utility PF correction banks, "
-                    "neighbor's capacitors, or cable charging capacitance). Residential customers "
-                    "do not typically own capacitor banks, so this resonance originates on the "
-                    f"utility side of the meter.{cap_note}"
+                    "with capacitance on the system (power-factor correction banks, a neighboring "
+                    "customer's capacitors, or cable charging capacitance). Residential "
+                    "services do not typically include capacitor banks, which bears on where "
+                    "the capacitance is likely to sit.{cap_note}"
                 )
                 res_rec = (
-                    "Contact the Xcel Energy distribution engineering team to investigate whether "
-                    "feeder capacitor banks or line-side PF correction equipment are creating a "
+                    "If confirmed, this would warrant a distribution engineering review of "
+                    "feeder capacitor banks and line-side PF correction equipment for a "
                     f"resonance at {', '.join(str(h * 60) for h in sorted(resonant))} Hz. "
-                    "A harmonic impedance frequency sweep at the service entrance will confirm "
-                    "the resonant frequency and identify the source."
+                    "A harmonic impedance frequency sweep at the service entrance would "
+                    "confirm the resonant frequency and locate the source."
                 )
-                res_responsibility = "utility"
             else:
                 res_cause = (
                     "Parallel resonance forms when the system (transformer + feeder) inductance "
@@ -2391,7 +2402,6 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                     "of bank kVAR), or switch to a harmonic filter bank tuned below H5 (282 Hz). "
                     "Until resolved, do not add more capacitors without a harmonic study."
                 )
-                res_responsibility = "shared"
 
             findings.append({
                 "category":       "harmonics",
@@ -2404,7 +2414,13 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                     "inductance and capacitor banks at that harmonic frequency."
                 ),
                 "cause":          res_cause,
-                "responsibility": res_responsibility,
+                "origin_evidence": (
+                    "A parallel resonance requires both system inductance and "
+                    "capacitance. Capacitor banks on the distribution system "
+                    "and power-factor correction within the facility are both "
+                    "candidates; the impedance signature does not distinguish "
+                    "them."
+                ),
                 "recommendation": res_rec,
                 "confidence":     "medium",
                 "evidence":       z_evidence,
@@ -2421,7 +2437,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 findings.append({
                     "category":       "harmonics",
                     "severity":       "info",
-                    "title":          "Harmonic currents confirmed as customer-side injection",
+                    "title":          "Harmonic voltage and current rise together",
                     "finding":        (
                         f"Voltage and current harmonics are strongly correlated across all "
                         f"measured orders (mean Pearson r = {mean_corr:.2f}). "
@@ -2433,7 +2449,12 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                         "harmonic currents that develop harmonic voltages across the source "
                         "impedance — causing V_h and I_h to rise and fall together."
                     ),
-                    "responsibility": "customer",
+                    "origin_evidence": (
+                        "Voltage and current at these orders rise and fall "
+                        "together, which is the pattern expected when a "
+                        "downstream load injects the harmonic current. "
+                        "Confirming direction requires phasor measurement."
+                    ),
                     "recommendation": (
                         "Focus mitigation on customer loads. Options: input reactors on VFDs, "
                         "active harmonic filters, or 12-pulse / 18-pulse drive upgrades. "
@@ -2444,7 +2465,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                        "orders_tested": list(source_harm["orders"].keys())},
                 })
 
-    # ── Current imbalance — utility vs. customer ──────────────────────────────
+    # ── Current imbalance, with the discriminating evidence ───────────────────
     if pf_flags.get("current_imbalance") is False:
         vi_mean = volt_imb.get("mean_imbalance_pct", 0)
         ci_mean = ci.get("mean_imbalance_pct", 0)
@@ -2452,15 +2473,20 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
             findings.append({
                 "category":       "imbalance",
                 "severity":       "warning",
-                "title":          "Current imbalance — customer load origin",
+                "title":          "Current imbalance with balanced supply voltage",
                 "finding":        (f"Current imbalance mean {ci_mean:.1f}%, "
                                    f"max {ci.get('max_imbalance_pct', 0):.1f}% "
                                    f"(limit 10%). Voltage imbalance is low ({vi_mean:.2f}%), "
                                    "indicating balanced supply voltage."),
-                "cause":          ("The utility supply voltage is well balanced but current is "
-                                   "not, indicating the imbalance originates from unequal "
-                                   "single-phase load distribution on the customer side."),
-                "responsibility": "customer",
+                "cause":          ("Supply voltage is well balanced while current is not, "
+                                   "which is the pattern produced by unequal single-phase "
+                                   "load distribution rather than by a supply asymmetry."),
+                "origin_evidence": (
+                    "Supply voltage is balanced while current is not. A "
+                    "balanced voltage with unbalanced current is the "
+                    "signature of unequal single-phase load distribution "
+                    "rather than a supply condition."
+                ),
                 "recommendation": ("Survey single-phase loads (lighting, small appliances, "
                                    "plug loads, HVAC controls) and redistribute to balance "
                                    "phase currents. Target < 5% imbalance to reduce neutral "
@@ -2481,7 +2507,12 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                    "voltage (from the utility distribution system) will induce "
                                    "current imbalance in motor loads. Customer load imbalance "
                                    "may also be a contributing factor."),
-                "responsibility": "shared",
+                "origin_evidence": (
+                    "Both voltage and current are unbalanced, so a supply "
+                    "asymmetry and an unbalanced load would produce the same "
+                    "measurement. Measuring with load disconnected separates "
+                    "them."
+                ),
                 "recommendation": ("Measure voltage imbalance with all customer loads "
                                    "disconnected to isolate the utility contribution. "
                                    "If voltage imbalance exceeds 1% at no-load, Xcel Energy "
@@ -2491,13 +2522,13 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                    "voltage_imb_mean_pct": round(vi_mean, 2)},
             })
 
-    # ── Voltage imbalance — utility-side ─────────────────────────────────────
+    # ── Voltage imbalance, with the discriminating evidence ──────────────────
     if pf_flags.get("voltage_imbalance") is False:
         vi_max = volt_imb.get("max_imbalance_pct", 0)
         findings.append({
             "category":       "voltage",
             "severity":       "warning",
-            "title":          "Voltage imbalance — utility responsibility",
+            "title":          "Voltage imbalance with balanced load current",
             "finding":        (f"Voltage imbalance max {vi_max:.2f}%, "
                                f"mean {volt_imb.get('mean_imbalance_pct', 0):.2f}% "
                                f"(limit 3%)."),
@@ -2505,10 +2536,14 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                "by unbalanced distribution transformer loading, asymmetric "
                                "line impedances, a blown capacitor fuse on one phase, "
                                "or an open delta transformer configuration."),
-            "responsibility": "utility",
-            "recommendation": ("Xcel Energy will investigate. Measure with all customer loads "
-                               "disconnected to confirm utility-side origin. Check feeder "
-                               "capacitor bank fuses and transformer loading on adjacent services."),
+            "origin_evidence": (
+                "Voltage imbalance is present while current imbalance is low, "
+                "which is the pattern expected of an asymmetry upstream of "
+                "the meter rather than of load distribution."
+            ),
+            "recommendation": ("Confirming the origin requires measurement with all customer "
+                               "loads disconnected. Feeder capacitor bank fuses and "
+                               "transformer loading on adjacent services are worth checking."),
             "confidence":     "high",
             "evidence":       {"voltage_imb_max_pct":  round(vi_max, 2)},
         })
@@ -2534,7 +2569,12 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                        "voltage drop in the secondary service conductors or "
                                        "transformer impedance. This is more pronounced on long "
                                        "secondary runs or undersized conductors."),
-                    "responsibility": "utility" if corr < -0.7 else "shared",
+                    "origin_evidence": (
+                        "Voltage falls as load rises, which is the signature "
+                        "of series impedance between the source and the "
+                        "meter. The impedance may lie in the service "
+                        "conductors, the connections, or the transformer."
+                    ),
                     "recommendation": ("Review secondary conductor sizing and length. "
                                        "Calculate secondary voltage drop at peak load. "
                                        "If drop exceeds design criteria, conductor upgrade "
@@ -2567,7 +2607,11 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                "primarily motors, transformers, and inductive ballasts drawing "
                                "magnetizing current. VFDs with active front ends may improve "
                                "PF at the drive level but do not eliminate motor reactive demand."),
-            "responsibility": "customer",
+            "origin_evidence": (
+                "Reactive demand is set by the load's own characteristics, "
+                "and correction equipment is normally installed on the load "
+                "side of the meter."
+            ),
             "recommendation": (f"Install approximately {kvar_needed:.0f} kVAR of power factor "
                                f"correction capacitors to achieve PF ≥ {target_pf:.2f}. "
                                "Size capacitors in switched steps to avoid over-correction at "
@@ -2619,14 +2663,20 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "Common causes: loose neutral wire at meter socket, corroded split-bolt connector, "
                 "failed utility neutral splice, or broken neutral conductor."
             ),
-            "responsibility": "utility",
+            "origin_evidence": (
+                "Cross-leg voltage behaviour of this kind arises from a "
+                "neutral path shared by both legs. That path runs from the "
+                "transformer through the service drop and meter socket to the "
+                "main panel, so it spans both utility and customer equipment."
+            ),
             "recommendation": (
                 "Inspect and tighten all neutral connections from the meter socket through the "
                 "service entrance to the main panel. Check for corrosion at split-bolt connectors "
                 "and wire nut splices. Measure neutral-to-ground voltage at the panel — > 1 V "
                 "under load confirms neutral resistance. If the service neutral is overhead, "
-                "inspect the drip loop and weatherhead connection. File a trouble call with "
-                "Xcel Energy to inspect the utility secondary and meter socket neutral lug."
+                "inspect the drip loop and weatherhead connection. Because the neutral path "
+                "spans both sides of the meter, inspection of the utility secondary and the "
+                "meter socket neutral lug is also indicated."
             ),
             "confidence":     "high" if n_coinc >= 2 or (vne_avail and vne_max > 2.0) else "medium",
             "evidence":       {
@@ -2682,7 +2732,11 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                    "is significantly greater than for a sinusoidal load at "
                                    "the same kVA, increasing winding temperature and accelerating "
                                    "insulation degradation."),
-                "responsibility": "customer",
+                "origin_evidence": (
+                    "Transformer heating follows the harmonic current the "
+                    "load draws; the transformer's rating is a separate "
+                    "matter from what causes the heating."
+                ),
                 "recommendation": (
                     (f"Derate the transformer or replace with a K-{_k_rating} "
                      "or higher rated unit. " if _k_rating else _k_wording + " ")
