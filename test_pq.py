@@ -948,3 +948,104 @@ class TestSpecChannelTable:
         # The RMS channels must not be mistaken for harmonic orders.
         assert ProntoAdapter._HARM_NAME.match('RMS Van (V1)') is None
         assert ProntoAdapter._HARM_NAME.match('Hrms Van (V1)') is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. test_data fixtures are valid PQDIF and exercise the spec reader
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FIXTURES = sorted((Path(__file__).parent / "test_data").glob("*.pqd"))
+
+
+@pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
+class TestFixturesAreCompliant:
+    """The fixtures exist to exercise the same path real Pronto files take.
+
+    Regenerate them with `python make_test_pqd.py` after changing the writer.
+    """
+
+    @pytest.fixture(params=_FIXTURES, ids=lambda p: p.stem)
+    def path(self, request):
+        return request.param
+
+    def test_parses_as_standard_pqdif(self, path):
+        f = pqdif.PQDIFFile(path)
+        assert f.version[:2] == (1, 5)
+        assert f.compressed is True
+        assert f.definitions
+
+    def test_uses_the_spec_reader_not_the_legacy_fallback(self, path):
+        adapter = ProntoAdapter(path)
+        assert adapter._spec is not None, (
+            f"{path.name} fell back to the legacy offset reader"
+        )
+
+    def test_every_guid_is_a_standard_identifier(self, path):
+        # A vendor-private GUID would be legal but these fixtures should model
+        # what real Pronto files contain, which is standard IDs throughout.
+        f = pqdif.PQDIFFile(path)
+        for defn in f.definitions:
+            assert defn.quantity_type in ("VALUELOG", "PHASOR", "WAVEFORM")
+            assert defn.quantity_measured in ("voltage", "current", "power")
+            for series in defn.series:
+                assert series.characteristic in pqdif.CHARACTERISTIC_NAMES.values()
+                assert series.value_type in pqdif.VALUE_TYPE_NAMES.values()
+
+    def test_interval_records_share_one_time_base(self, path):
+        f = pqdif.PQDIFFile(path)
+        grids = {
+            len(obs.channels[0].time)
+            for obs in f.observations if obs.channels
+        }
+        assert len(grids) == 1, f"observations disagree on sample count: {grids}"
+
+    def test_step_pair_encoding_is_detected(self, path):
+        f = pqdif.PQDIFFile(path)
+        raw = f.observations[0].channels[0].time
+        assert ProntoAdapter._step_pair_stride(raw) == 2
+        # 288 intervals written as 576 points.
+        adapter = ProntoAdapter(path)
+        assert len(adapter._obs_ts) == len(raw) // 2
+
+    def test_voltage_comes_from_rms_not_the_fundamental(self, path):
+        # The regression this guards: 'Harm 1 of Van' (SPECTRA_HGROUP) is the
+        # fundamental and is smaller than the true RMS by sqrt(1 + THD^2). The
+        # mapped voltage_a column must be the RMS channel, not the fundamental.
+        f = pqdif.PQDIFFile(path)
+        by_name = {c.name: c for obs in f.observations for c in obs.channels}
+        rms_channel = by_name["RMS Van (V1)"]
+        fundamental_channel = by_name["Harm 1 of Van"]
+        assert rms_channel.characteristic == "RMS"
+        assert fundamental_channel.characteristic == "SPECTRA_HGROUP"
+
+        rms = rms_channel.series["AVG"][0::2]
+        fundamental = fundamental_channel.series["AVG"][0::2]
+        assert np.all(rms > fundamental), "fixture does not separate RMS from H1"
+
+        df = extract_dataset(ProntoAdapter(path), ChannelMapper()).df
+        assert np.allclose(df["voltage_a"].to_numpy(), rms, rtol=1e-9)
+        # And the difference is the physically expected factor.
+        thd = df["thd_voltage_a"].to_numpy()
+        assert np.allclose(fundamental, rms / np.sqrt(1.0 + (thd / 100.0) ** 2),
+                           rtol=1e-9)
+
+    def test_time_base_comes_from_tag_time_start(self, path):
+        import pandas as pd
+        adapter = ProntoAdapter(path)
+        expected = pqdif.PQDIFFile(path).observations[0].start_time
+        assert pd.Timestamp(adapter._obs_ts[0]).to_pydatetime() == expected
+
+    def test_min_le_avg_le_peak(self, path):
+        # Independent of any offset assumption: if MAX/MIN/AVG were assigned to
+        # the wrong series this ordering would break.
+        adapter = ProntoAdapter(path)
+        df = extract_dataset(adapter, ChannelMapper()).df
+        checked = 0
+        for col in df.columns:
+            if f"{col}_peak" not in df.columns:
+                continue
+            avg, peak, low = df[col], df[f"{col}_peak"], df[f"{col}_min"]
+            assert (peak >= avg - 1e-9).all(), f"{col}: peak < avg"
+            assert (low <= avg + 1e-9).all(), f"{col}: min > avg"
+            checked += 1
+        assert checked >= 2, "expected max-min columns on the fixtures"

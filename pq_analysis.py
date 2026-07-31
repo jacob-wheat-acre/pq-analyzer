@@ -255,7 +255,7 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
             }
             result["available"] = True
 
-            # Peak TDD — uses per-interval maximum THD from obs[24] if available
+            # Peak TDD — uses per-interval maximum THD from the max-min record if available
             pk_thd_cols = [f"{c}_peak" for c in i_thd_cols if f"{c}_peak" in df.columns]
             if pk_thd_cols and use_tdd and il_amps:
                 pk_tdd_series: List[pd.Series] = []
@@ -1030,7 +1030,7 @@ def check_demand(df: pd.DataFrame, thresh: Thresholds) -> dict:
             "mean_kvar": round(float(kvar.mean()), 1),
         }
 
-    # True interval peak current from obs[24] max-min record
+    # True interval peak current from the max-min record
     pk_i_cols = [f"current_{ph}_peak" for ph in ("a", "b", "c")
                  if f"current_{ph}_peak" in df.columns]
     if pk_i_cols:
@@ -1060,7 +1060,7 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
     When ``ds.has_adaptive`` is True, uses cycle-level (≈17 ms) adaptive
     records for higher-fidelity sag/swell detection and adds IEC 61000-3-3
     flicker events from PST/PLT channels.  Falls back to 5-minute interval
-    averages (augmented by obs[24] min/peak columns) when adaptive data is
+    averages (augmented by the max-min min/peak columns) when adaptive data is
     absent.
 
     Detects:
@@ -1159,7 +1159,7 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
                                "delta_a": float(diffs.loc[ts])})
 
     else:
-        # ── Interval fallback (5-min averages + obs[24] min/peak) ─────────────
+        # ── Interval fallback (interval averages + min/peak columns) ──────────
         df = ds.df
         for col in ["voltage_a", "voltage_b", "voltage_c"]:
             if col not in df.columns:

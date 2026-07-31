@@ -1302,7 +1302,7 @@ class PQApp(tk.Tk):
             "Voltage Compliance — ANSI C84.1",
             "Reports what percentage of 5-minute intervals fall inside Range A (±5% of\n"
             "nominal), Range B (±8.3%), or outside both bands.  When the meter's max-min\n"
-            "record (obs[24]) is available, peak and minimum voltage within each interval\n"
+            "max-min record is available, peak and minimum voltage within each interval\n"
             "are used to detect momentary exceedances that the interval average would mask.\n"
             "\n"
             "Split-phase services (120/240 V, no voltage_c channel) are automatically\n"

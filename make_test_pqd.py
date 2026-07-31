@@ -25,303 +25,491 @@ Produces one .pqd file per PSCo customer class, each with injected violations:
     - Voltage sag:   2160 V (−10 %) for 20 intervals
     - Voltage THD:   9 % (> 8 % limit)
 
-Binary format: Pronto proprietary extension of IEEE 1159.3 PQDIF.
+Binary format: IEEE Std 1159.3-2019 (PQDIF), written by the serializer below.
 
-Each file record wrapper (from _walk_records):
-  [+16] u32 tag     0x89738619=DataSource, 0x8973861A=Observation
-  [+32] u32 hdr     header size (body starts at pos+hdr)
-  [+36] u32 blen    compressed body length
-  [+40] u32 nxt     absolute offset of next record (0 = last)
+These fixtures are deliberately faithful to a real Pronto export, because the
+reader they exercise (pqdif.py + ProntoAdapter._load_spec) resolves everything
+through the standard's structure.  In particular each file reproduces:
 
-DataSource body — PQDIF element tree (IEEE 1159.3 §5):
-  top[0] ChannelDefinitions (guid4=0xB48D858D) → list of N ChannelDefinition elements
-  each ChannelDefinition → sub-list with label element (guid4=0xB48D8590)
-  label element: off → 4-byte length prefix + label bytes, sz = 4 + len(label)
+  * a container record declaring version 1.5 and record-level zlib compression,
+    followed by a data source record and several observation records, chained by
+    the absolute links in their 64-byte headers;
+  * channel identity carried in the series definitions -- quantity measured,
+    quantity characteristic, phase and units -- not in the channel name;
+  * interval data split across two observations that share one time base:
+    'Interval (avg)' with the derived quantities and 'Interval (max-min)' with
+    the true RMS voltages and currents plus their per-interval MIN and MAX;
+  * the step-pair encoding, where every interval is written twice (once at its
+    start time and once at its end) with the same value;
+  * 'Harm 1 of Van' as the *fundamental* (characteristic SPECTRA_HGROUP) and
+    'RMS Van (V1)' as the true RMS (characteristic RMS), differing by the
+    sqrt(1 + THD^2) factor exactly as a real meter reports them.  A reader that
+    confuses the two produces voltages that are low by that factor.
 
-"Interval (avg)" obs body (Pronto-specific layout):
-  [0-31]    top PQDIF element: ChannelInstances (guid4=0x3D786F91) → ci_off
-  [144-147] label_length (14 for "Interval (avg)")
-  [148-163] b'Interval (avg)' + 2 pad bytes
-  [164-187] zero padding
-  [188=ci_off] u32 count = N channels   (ci_off = entry_start − 4)
-  [192=entry_start] N × 28-byte ChannelInstance entries
-    entry[ci]+20 = abs offset of channel block in obs body
-  [channel blocks] for each ci:
-    [+0 ]  PQDIF sub-list: count=1, element guid4=0xB48D858F, off=DS_ci (inline)
-    [+32-179] zero padding
-    [+180] u32 ts_count_raw = 2*n
-    [+184] n × (f64 t_sec, f64 quality=0)  — timestamps
-    [+184+16n] 32-byte gap
-    [+216+16n] u32 data_count = 2*n
-    [+220+16n] n × (f64 value, f64 quality=0)  — measurements
-
-Stub obs bodies supply the base date parsed by _parse_v2_date (seeks MM/DD/YY in
-bytes 148-220 of each decompressed observation body).
+Run this module to regenerate test_data/*.pqd.
 """
 
 from __future__ import annotations
 
 import struct
+import uuid
 import zlib
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-# ── PQDIF GUID4 constants (first 4 bytes of 16-byte GUID, little-endian) ────
-# These identifiers are defined in the IEEE 1159.3-2019 PQDIF standard and
-# the Pronto vendor extension to that standard.
-_TAG_DS   = 0x89738619  # DataSource record (IEEE 1159.3 §6.2)
-_TAG_OBS  = 0x8973861A  # Observation record (IEEE 1159.3 §6.3)
-_CHAN_DEFS = 0xB48D858D  # ChannelDefinitions collection (IEEE 1159.3 §7.2.1)
-_CHAN_LBL  = 0xB48D8590  # ChannelDefinition label (IEEE 1159.3 §7.2.1.3)
-_CHAN_INST = 0x3D786F91  # ChannelInstances collection (IEEE 1159.3 §7.3.1)
-_DS_IDX    = 0xB48D858F  # DataSource channel index (Pronto extension, inline scalar)
+import pqdif
 
-# ── Pronto obs-body layout constants (must match ProntoAdapter) ─────────────
-_ENTRY_SZ  = 28   # bytes per ChannelInstance entry
-_BODY_OFF  = 20   # offset within entry of channel-block abs pointer (= e['off'])
-_TS_REL    = 180  # offset from channel-block start to ts_count_raw
-_HDR_SZ    = 48   # PQDIF record header size
+# Recording start written into every observation's tagTimeStart.  The reader
+# takes its time base from here, so nothing depends on the file name.
+START_TIME = datetime(2025, 6, 25, 0, 0, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Binary primitives
+# Annex B reverse lookups
 # ─────────────────────────────────────────────────────────────────────────────
+# Built by inverting pqdif.py's tables so the writer and the reader can never
+# disagree about an identifier.
 
-def _elem(guid4: int, etype: int, off: int, sz: int) -> bytes:
-    """One 28-byte PQDIF element: GUID(16) | type(4) | off(4) | sz(4)."""
-    return struct.pack('<I', guid4) + b'\x00' * 12 + struct.pack('<III', etype, off, sz)
-
-
-def _elem_list(elements: list[bytes]) -> bytes:
-    """PQDIF element list: u32 count + concatenated elements."""
-    return struct.pack('<I', len(elements)) + b''.join(elements)
-
-
-def _record(tag: int, body: bytes, next_off: int) -> bytes:
-    """PQDIF record with 48-byte header."""
-    hdr = bytearray(_HDR_SZ)
-    struct.pack_into('<I', hdr, 16, tag)
-    struct.pack_into('<I', hdr, 32, _HDR_SZ)
-    struct.pack_into('<I', hdr, 36, len(body))
-    struct.pack_into('<I', hdr, 40, next_off)
-    return bytes(hdr) + body
+_CHARACTERISTIC_IDS = {v: k for k, v in pqdif.CHARACTERISTIC_NAMES.items()}
+_VALUE_TYPE_IDS = {v: k for k, v in pqdif.VALUE_TYPE_NAMES.items()}
+_QUANTITY_TYPE_IDS = {v: k for k, v in pqdif.QUANTITY_TYPE_NAMES.items()}
+_MEASURED_IDS = {v: k for k, v in pqdif.QUANTITY_MEASURED_NAMES.items()}
+_PHASE_IDS = {
+    'none': 0, 'an': 1, 'bn': 2, 'cn': 3, 'ng': 4,
+    'ab': 5, 'bc': 6, 'ca': 7, 'total': 13,
+}
+_UNIT_IDS = {'': 0, 's': 2, 'V': 6, 'A': 7, 'VA': 8, 'W': 9, 'VAR': 10,
+             'Hz': 15, 'deg': 17, '%': 19}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DataSource record
+# Element-tree serializer (Annex A)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_datasource(labels: list[str]) -> bytes:
-    """Build DataSource body with N channel label definitions.
+class Collection:
+    """A collection element: an ordered list of (tag, node) children."""
 
-    Layout:
-      [0 ]    top element list → ChannelDefinitions at cd_off=32
-      [32]    ChannelDefinitions list (N elements → sub_list[i])
-      [32+4+N*28]  N sub-lists (32 bytes each) → string data
-      [32+4+N*28+N*32]  string data: u32 len + bytes (no null needed)
+    def __init__(self, children=None):
+        self.children: list[tuple[uuid.UUID, object]] = list(children or [])
+
+    def add(self, tag: uuid.UUID, node) -> "Collection":
+        self.children.append((tag, node))
+        return self
+
+
+class Scalar:
+    """A single value of one physical type."""
+
+    def __init__(self, physical_type: int, value):
+        self.physical_type = physical_type
+        self.value = value
+
+
+class Vector:
+    """An array of values of one physical type."""
+
+    def __init__(self, physical_type: int, values):
+        self.physical_type = physical_type
+        self.values = values
+
+
+def _scalar_bytes(physical_type: int, value) -> bytes:
+    if physical_type == 60:                       # GUID
+        return value.bytes_le
+    if physical_type == 50:                       # TIMESTAMPPQDIF
+        delta = value - datetime(1900, 1, 1)
+        return struct.pack('<Id', delta.days,
+                           delta.seconds + delta.microseconds / 1e6)
+    if physical_type == 32:
+        return struct.pack('<I', int(value))
+    if physical_type == 41:
+        return struct.pack('<d', float(value))
+    raise ValueError(f'unsupported scalar physical type {physical_type}')
+
+
+def _vector_bytes(physical_type: int, values) -> bytes:
+    if physical_type == 10:                       # CHAR1 -- NUL-terminated
+        raw = values.encode('latin-1') + b'\x00'
+        return struct.pack('<I', len(raw)) + raw
+    if physical_type == 41:
+        array = np.asarray(values, dtype='<f8')
+        return struct.pack('<I', len(array)) + array.tobytes()
+    if physical_type == 32:
+        array = np.asarray(values, dtype='<u4')
+        return struct.pack('<I', len(array)) + array.tobytes()
+    raise ValueError(f'unsupported vector physical type {physical_type}')
+
+
+def serialize_body(root: Collection) -> bytes:
+    """Lay out an element tree as a record body.
+
+    The body begins with the root collection at offset 0 (clause 4.2.2), so its
+    element table is reserved first and filled in once the children have been
+    appended.  All links are relative to the start of the body and every payload
+    is padded to a 4-byte multiple, as Annex A requires.
     """
-    N = len(labels)
-    cd_off         = 32
-    sub_base       = cd_off + 4 + N * 28
-    str_base       = sub_base + N * 32
+    buf = bytearray()
 
-    # Pre-compute string offsets and sizes
-    str_offs: list[int] = []
-    str_szs:  list[int] = []
-    cur = str_base
-    for lbl in labels:
-        raw = lbl.encode('latin-1')
-        str_offs.append(cur)
-        str_szs.append(4 + len(raw))  # sz = 4-byte prefix + raw bytes
-        cur += 4 + len(raw)
+    def reserve(size: int) -> int:
+        while len(buf) % 4:
+            buf.append(0)
+        offset = len(buf)
+        buf.extend(b'\x00' * size)
+        return offset
 
-    body = bytearray()
+    def append(payload: bytes) -> tuple[int, int]:
+        while len(buf) % 4:
+            buf.append(0)
+        offset = len(buf)
+        buf.extend(payload)
+        padded = (len(payload) + 3) & ~3
+        buf.extend(b'\x00' * (padded - len(payload)))
+        return offset, padded
 
-    # Top-level: one ChannelDefinitions element
-    body += _elem_list([_elem(_CHAN_DEFS, 1, cd_off, 0)])
-    assert len(body) == cd_off
+    def emit(node) -> tuple[int, int, bool, int, int]:
+        """Return (element_type, physical_type, embedded, link, size)."""
+        if isinstance(node, Collection):
+            offset = write_collection(node)
+            return pqdif.ELEMENT_COLLECTION, 0, False, offset, 4 + 28 * len(node.children)
+        if isinstance(node, Vector):
+            offset, size = append(_vector_bytes(node.physical_type, node.values))
+            return pqdif.ELEMENT_VECTOR, node.physical_type, False, offset, size
+        if isinstance(node, Scalar):
+            raw = _scalar_bytes(node.physical_type, node.value)
+            if len(raw) <= 8:
+                # Annex A: a scalar of eight bytes or fewer lives in the
+                # element's own link/size words (isEmbedded).
+                padded = raw.ljust(8, b'\x00')
+                link, size = struct.unpack('<II', padded)
+                return pqdif.ELEMENT_SCALAR, node.physical_type, True, link, size
+            offset, size = append(raw)
+            return pqdif.ELEMENT_SCALAR, node.physical_type, False, offset, size
+        raise TypeError(f'cannot serialize {node!r}')
 
-    # ChannelDefinitions list: N elements, each → its sub-list
-    body += _elem_list([_elem(_CHAN_DEFS, 1, sub_base + i * 32, 32) for i in range(N)])
-    assert len(body) == sub_base
+    def write_collection(node: Collection) -> int:
+        count = len(node.children)
+        offset = reserve(4 + 28 * count)
+        described = [(tag,) + emit(child) for tag, child in node.children]
+        struct.pack_into('<I', buf, offset, count)
+        for i, (tag, etype, ptype, embedded, link, size) in enumerate(described):
+            base = offset + 4 + i * 28
+            buf[base:base + 16] = tag.bytes_le
+            struct.pack_into('<4b', buf, base + 16,
+                             etype, ptype, 1 if embedded else 0, 0)
+            struct.pack_into('<II', buf, base + 20, link, size)
+        return offset
 
-    # Sub-lists: one label element per channel
-    for s_off, s_sz in zip(str_offs, str_szs):
-        body += _elem_list([_elem(_CHAN_LBL, 1, s_off, s_sz)])
-    assert len(body) == str_base
-
-    # String data: 4-byte length + label bytes (latin-1 preserves CP1253 φ=0xF8)
-    for lbl in labels:
-        raw = lbl.encode('latin-1')
-        body += struct.pack('<I', len(raw)) + raw
-
-    return bytes(body)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Observation records
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _make_stub_obs(date_str: str = "06/25/25") -> bytes:
-    """Minimal obs body with a date pattern in bytes 148–220 for _parse_v2_date.
-
-    _parse_v2_date searches decompressed obs bodies for r'(\\d\\d)/(\\d\\d)/(\\d\\d)'
-    in that byte window, treating it as MM/DD/YY.
-    """
-    label = f"Waveshape {date_str}".encode('ascii')
-    body = bytearray(256)
-    struct.pack_into('<I', body, 144, len(label))
-    body[148:148 + len(label)] = label
-    return bytes(body)
-
-
-def _ch_block_size(n: int) -> int:
-    """Byte size of one channel block for n samples."""
-    # 180 (sub-list+pad) + 4 (ts_count) + 2n*8 (ts pairs) + 32 (gap) + 4 (data_count) + 2n*8
-    return 180 + 4 + 2 * n * 8 + 32 + 4 + 2 * n * 8
+    assert write_collection(root) == 0, 'root collection must start the body'
+    return bytes(buf)
 
 
-def _make_channel_block(ds_ci: int, t_sec: np.ndarray, values: np.ndarray) -> bytes:
-    """One channel data block inside the Interval (avg) obs body.
-
-    The block must satisfy two independent readers in ProntoAdapter:
-      _build_label_map  — reads PQDIF sub-element list at block start to find DS_ci
-      read_v2           — reads timestamps at +_TS_REL=180 and data after the gap
-    """
-    n = len(values)
-    block = bytearray()
-
-    # PQDIF sub-element list: count=1, element with DS channel index (inline scalar)
-    # type=0 (scalar) means the value is stored in the 'off' field directly (IEEE 1159.3 §5.2)
-    block += _elem_list([_elem(_DS_IDX, 0, ds_ci, 0)])  # 32 bytes
-    block += b'\x00' * (_TS_REL - len(block))            # pad to offset 180
-    assert len(block) == _TS_REL
-
-    # Timestamps: u32 ts_count_raw = 2*n, then n pairs of (t_sec f64, quality f64)
-    ts_count_raw = 2 * n
-    block += struct.pack('<I', ts_count_raw)
-    ts_pairs = np.empty(ts_count_raw, dtype='<f8')
-    ts_pairs[0::2] = t_sec
-    ts_pairs[1::2] = 0.0
-    block += ts_pairs.tobytes()
-
-    block += b'\x00' * 32  # gap between timestamps and data
-
-    # Data: u32 data_count = 2*n, then n pairs of (value f64, quality f64)
-    data_count = 2 * n
-    block += struct.pack('<I', data_count)
-    data_pairs = np.empty(data_count, dtype='<f8')
-    data_pairs[0::2] = values
-    data_pairs[1::2] = 0.0
-    block += data_pairs.tobytes()
-
-    assert len(block) == _ch_block_size(n)
-    return bytes(block)
-
-
-def _make_interval_obs(labels: list[str], channel_arrays: list[np.ndarray],
-                       t_sec: np.ndarray) -> bytes:
-    """Build the 'Interval (avg)' observation body.
-
-    The obs body is consumed two ways:
-      _build_label_map: reads top PQDIF element (ChannelInstances → ci_off),
-                        then enumerates ChannelInstance entries (obs_ci → ch_block),
-                        then reads each block's PQDIF sub-list for DS_ci.
-      _load_v2 read_v2: reads channel block pointer at entry_start + ci*28 + 20,
-                        then timestamps at ch_block + _TS_REL, data after gap.
-    Both readers share the same 28-byte ChannelInstance entries; the 'off' field
-    at byte +20 of each entry is both the PQDIF pointer AND the raw channel-block
-    absolute offset.
-    """
-    assert len(labels) == len(channel_arrays)
-    N = len(labels)
-    n = len(t_sec)
-
-    obs_label      = b'Interval (avg)'   # searched by _load_v2
-    label_len      = len(obs_label)      # 14
-    aligned_len    = (label_len + 3) & ~3  # 16 (round up to 4-byte boundary)
-    entry_start    = 148 + aligned_len + 28  # = 192
-    ci_off         = entry_start - 4         # = 188  (count u32 lives here)
-
-    ch_blk_sz      = _ch_block_size(n)
-    ch_blocks_base = entry_start + N * _ENTRY_SZ   # channel blocks start here
-    ch_offsets     = [ch_blocks_base + i * ch_blk_sz for i in range(N)]
-
-    body = bytearray()
-
-    # [0-31] top-level element: ChannelInstances → ci_off
-    ci_block_sz = 4 + N * _ENTRY_SZ
-    body += _elem_list([_elem(_CHAN_INST, 1, ci_off, ci_block_sz)])
-    assert len(body) == 32
-
-    # [32-143] zero padding
-    body += b'\x00' * (144 - 32)
-
-    # [144-147] label_length
-    body += struct.pack('<I', label_len)
-
-    # [148 .. 148+aligned_len-1] obs label + zero padding
-    body += obs_label + b'\x00' * (aligned_len - label_len)
-    assert len(body) == 148 + aligned_len  # = 164
-
-    # [164-187] 24 bytes zero padding
-    body += b'\x00' * 24
-
-    # [188=ci_off] channel count (u32) — this is the "count" for _pqdif_elements(obs_body, ci_off)
-    body += struct.pack('<I', N)
-    assert len(body) == entry_start  # = 192
-
-    # [entry_start .. entry_start+N*28] ChannelInstance entries
-    # Each is a 28-byte PQDIF element where 'off' = absolute channel-block offset.
-    # type=1 satisfies _build_label_map's `if e['type'] != 1: continue` guard.
-    for ch_off in ch_offsets:
-        body += _elem(_CHAN_INST, 1, ch_off, ch_blk_sz)
-    assert len(body) == ch_blocks_base
-
-    # Channel data blocks
-    for i, values in enumerate(channel_arrays):
-        body += _make_channel_block(i, t_sec, values)
-
-    return bytes(body)
+def _record(tag: uuid.UUID, body: bytes, next_offset: int,
+            compress: bool) -> bytes:
+    """Wrap a body in a 64-byte record header (Annex A c_record_mainheader)."""
+    payload = zlib.compress(body) if compress else body
+    header = bytearray(pqdif.RECORD_HEADER_SIZE)
+    header[0:16] = pqdif.RECORD_SIGNATURE.bytes_le
+    header[16:32] = tag.bytes_le
+    struct.pack_into('<IIII', header, 32,
+                     pqdif.RECORD_HEADER_SIZE, len(payload), next_offset,
+                     zlib.crc32(payload) & 0xFFFFFFFF)
+    return bytes(header) + payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File assembler
+# Logical records
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_pqd(labels: list[str], arrays: list[np.ndarray],
-               t_sec: np.ndarray, date_str: str = "06/25/25") -> bytes:
-    """Assemble a complete Pronto PQDIF file from channel labels and data arrays.
+@dataclass
+class Series:
+    """One series of a channel: its value type and the samples themselves."""
+    value_type: str                  # TIME / AVG / MIN / MAX / VAL
+    characteristic: str
+    units: str
+    values: np.ndarray
 
-    Record chain: DataSource → StubObs × 3 → IntervalObs
-    _load_v2 requires ≥ 4 Observation records; the three stubs satisfy that
-    while also providing the base date that _parse_v2_date extracts.
+
+@dataclass
+class Channel:
+    """One channel definition and the single instance of it we write."""
+    name: str
+    phase: str
+    measured: str
+    quantity_type: str = 'VALUELOG'
+    series: list[Series] = field(default_factory=list)
+
+
+def _container(title: str) -> bytes:
+    root = Collection()
+    root.add(pqdif.TAG_VERSION_INFO, Vector(32, [1, 5, 1, 5]))
+    root.add(pqdif._u('89738608-f1c3-11cf-9d89-0080c72e70a3'),   # tagFileName
+             Vector(10, title))
+    root.add(pqdif._u('89738609-f1c3-11cf-9d89-0080c72e70a3'),   # tagCreation
+             Scalar(50, START_TIME))
+    root.add(pqdif.TAG_COMPRESSION_STYLE, Scalar(32, 2))          # RECORDLEVEL
+    root.add(pqdif.TAG_COMPRESSION_ALGORITHM, Scalar(32, 1))      # zlib
+    return serialize_body(root)
+
+
+def _data_source(name: str, channels: list[Channel]) -> bytes:
+    root = Collection()
+    root.add(pqdif.TAG_NAME_DS, Vector(10, name))
+    root.add(pqdif._u('b48d8581-f5f5-11cf-9d89-0080c72e70a3'),   # tagDataSourceTypeID
+             Scalar(60, pqdif._u('e2da5083-7fdb-11d3-9b39-0040052c2d28')))
+
+    definitions = Collection()
+    for channel in channels:
+        defn = Collection()
+        defn.add(pqdif.TAG_CHANNEL_NAME, Vector(10, channel.name))
+        defn.add(pqdif.TAG_PHASE_ID, Scalar(32, _PHASE_IDS[channel.phase]))
+        defn.add(pqdif.TAG_QUANTITY_TYPE_ID,
+                 Scalar(60, _QUANTITY_TYPE_IDS[channel.quantity_type]))
+        defn.add(pqdif.TAG_QUANTITY_MEASURED_ID,
+                 Scalar(32, _MEASURED_IDS[channel.measured]))
+
+        series_defns = Collection()
+        for series in channel.series:
+            sd = Collection()
+            sd.add(pqdif.TAG_VALUE_TYPE_ID,
+                   Scalar(60, _VALUE_TYPE_IDS[series.value_type]))
+            sd.add(pqdif.TAG_QUANTITY_UNITS_ID,
+                   Scalar(32, _UNIT_IDS[series.units]))
+            sd.add(pqdif.TAG_QUANTITY_CHARACTERISTIC_ID,
+                   Scalar(60, _CHARACTERISTIC_IDS[series.characteristic]))
+            sd.add(pqdif.TAG_STORAGE_METHOD_ID, Scalar(32, pqdif.METHOD_VALUES))
+            series_defns.add(pqdif.TAG_ONE_SERIES_DEFN, sd)
+        defn.add(pqdif.TAG_SERIES_DEFNS, series_defns)
+        definitions.add(pqdif.TAG_ONE_CHANNEL_DEFN, defn)
+
+    root.add(pqdif.TAG_CHANNEL_DEFNS, definitions)
+    return serialize_body(root)
+
+
+def _observation(name: str, channels: list[Channel],
+                 definition_indices: list[int]) -> bytes:
+    root = Collection()
+    root.add(pqdif.TAG_OBSERVATION_NAME, Vector(10, name))
+    root.add(pqdif.TAG_TIME_CREATE, Scalar(50, START_TIME))
+    root.add(pqdif.TAG_TIME_START, Scalar(50, START_TIME))
+    root.add(pqdif._u('3d786f8d-f76e-11cf-9d89-0080c72e70a3'),   # tagTriggerMethodID
+             Scalar(32, 1))
+
+    instances = Collection()
+    for channel, defn_index in zip(channels, definition_indices):
+        instance = Collection()
+        instance.add(pqdif.TAG_CHANNEL_DEFN_IDX, Scalar(32, defn_index))
+        series_instances = Collection()
+        for series in channel.series:
+            si = Collection()
+            si.add(pqdif.TAG_SERIES_VALUES, Vector(41, series.values))
+            series_instances.add(pqdif.TAG_ONE_SERIES_INSTANCE, si)
+        instance.add(pqdif.TAG_SERIES_INSTANCES, series_instances)
+        instances.add(pqdif.TAG_ONE_CHANNEL_INST, instance)
+
+    root.add(pqdif.TAG_CHANNEL_INSTANCES, instances)
+    return serialize_body(root)
+
+
+def build_file(site: str, observations: list[tuple[str, list[Channel]]]) -> bytes:
+    """Assemble container + data source + observations into one PQDIF file.
+
+    Channel definitions are pooled across observations, and each channel
+    instance references its definition by index, which is the definition/
+    instance split described in clause 5.4.
     """
-    ds_body  = _make_datasource(labels)
-    stub1    = zlib.compress(_make_stub_obs(date_str))
-    stub2    = zlib.compress(_make_stub_obs())
-    stub3    = zlib.compress(_make_stub_obs())
-    avg_body = zlib.compress(_make_interval_obs(labels, arrays, t_sec))
+    all_channels: list[Channel] = []
+    indices: list[list[int]] = []
+    for _name, channels in observations:
+        obs_indices = []
+        for channel in channels:
+            obs_indices.append(len(all_channels))
+            all_channels.append(channel)
+        indices.append(obs_indices)
 
-    ds_sz    = _HDR_SZ + len(ds_body)
-    s1_sz    = _HDR_SZ + len(stub1)
-    s2_sz    = _HDR_SZ + len(stub2)
-    s3_sz    = _HDR_SZ + len(stub3)
+    bodies = [
+        (pqdif.TAG_CONTAINER, _container(f'{site}.pqd'), False),
+        (pqdif.TAG_DATA_SOURCE, _data_source(site, all_channels), True),
+    ]
+    for (name, channels), obs_indices in zip(observations, indices):
+        bodies.append((pqdif.TAG_OBSERVATION,
+                       _observation(name, channels, obs_indices), True))
 
-    off0 = 0
-    off1 = off0 + ds_sz
-    off2 = off1 + s1_sz
-    off3 = off2 + s2_sz
-    off4 = off3 + s3_sz
+    # Two passes: the header of each record holds the absolute offset of the
+    # next one, so the compressed sizes must be known before any link is set.
+    payloads = [zlib.compress(body) if compress else body
+                for _tag, body, compress in bodies]
+    offsets, position = [], 0
+    for payload in payloads:
+        offsets.append(position)
+        position += pqdif.RECORD_HEADER_SIZE + len(payload)
 
-    return (
-        _record(_TAG_DS,  ds_body, off1) +
-        _record(_TAG_OBS, stub1,   off2) +
-        _record(_TAG_OBS, stub2,   off3) +
-        _record(_TAG_OBS, stub3,   off4) +
-        _record(_TAG_OBS, avg_body, 0)
-    )
+    out = bytearray()
+    for i, (tag, body, compress) in enumerate(bodies):
+        is_last = i == len(bodies) - 1
+        out += _record(tag, body, 0 if is_last else offsets[i + 1], compress)
+    return bytes(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scenario → channel specifications
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Suffix used in Pronto channel names → (phase, RMS channel name, units).
+_PHASE_SUFFIX = {
+    'Van': ('an', 'RMS Van (V1)', 'V'), 'Vbn': ('bn', 'RMS Vbn (V2)', 'V'),
+    'Vcn': ('cn', 'RMS Vcn (V3)', 'V'), 'Vne': ('ng', 'RMS Vne (V4)', 'V'),
+    'Ia': ('an', 'RMS Ia (I1)', 'A'), 'Ib': ('bn', 'RMS Ib (I2)', 'A'),
+    'Ic': ('cn', 'RMS Ic (I3)', 'A'), 'In': ('ng', 'RMS In (I4)', 'A'),
+}
+
+#: Characteristic and units for the non-harmonic interval channels, keyed by a
+#: distinctive fragment of the Pronto channel name.
+_NAMED_CHANNELS = [
+    ('Real Power',     'power',   'P',        'W'),
+    ('VA Reactive',    'power',   'Q',        'VAR'),
+    ('Apparent Power', 'power',   'S',        'VA'),
+    ('Power Factor',   'power',   'PF',       ''),
+    ('K-Factor',       'current', 'K_FACTOR', ''),
+    ('Flicker PST',    'voltage', 'FLKR_PST', ''),
+    ('Flicker PLT',    'voltage', 'FLKR_PLT', ''),
+]
+
+
+def _step_pairs(values: np.ndarray) -> np.ndarray:
+    """Repeat every sample, matching Pronto's step-pair interval encoding."""
+    return np.repeat(np.asarray(values, dtype=float), 2)
+
+
+def _step_times(t_sec: np.ndarray, interval: float) -> np.ndarray:
+    """Interleave interval start and end times.
+
+    The end of one interval sits 1 us before the start of the next, which is the
+    gap ProntoAdapter._step_pair_stride() looks for to recognise the encoding.
+    """
+    starts = np.asarray(t_sec, dtype=float)
+    ends = starts + interval - 1e-6
+    return np.stack([starts, ends], axis=1).reshape(-1)
+
+
+def scenario_channels(labels: list[str], arrays: list[np.ndarray],
+                      t_sec: np.ndarray, interval: float):
+    """Convert a scenario's label/array pairs into the two interval observations.
+
+    Returns (avg_channels, maxmin_channels).  The derived quantities keep the
+    names the scenario supplied; the true-RMS channels are synthesised the way a
+    real meter reports them, so that 'Harm 1 of Van' (the fundamental) and
+    'RMS Van (V1)' differ by exactly sqrt(1 + THD^2).
+    """
+    data = dict(zip(labels, arrays))
+    times = _step_times(t_sec, interval)
+    time_series = Series('TIME', 'INSTANTANEOUS', 's', times)
+
+    avg: list[Channel] = []
+    maxmin: list[Channel] = []
+
+    def add_avg(name, phase, measured, characteristic, units, values,
+                quantity_type='VALUELOG'):
+        avg.append(Channel(name, phase, measured, quantity_type, [
+            time_series,
+            Series('AVG', characteristic, units, _step_pairs(values)),
+        ]))
+
+    def add_rms(name, phase, measured, units, values):
+        # A real meter reports the interval average alongside the extremes
+        # actually seen inside it, so min <= avg <= max always holds.
+        values = np.asarray(values, dtype=float)
+        spread = np.maximum(np.abs(values) * 0.004, 1e-3)
+        maxmin.append(Channel(name, phase, measured, 'PHASOR', [
+            time_series,
+            Series('MAX', 'RMS', units, _step_pairs(values + spread)),
+            Series('MIN', 'RMS', units, _step_pairs(values - spread)),
+            Series('AVG', 'RMS', units, _step_pairs(values)),
+        ]))
+
+    # ── Harmonic magnitudes, and the THD the meter reports with them ──────
+    harmonics: dict[tuple[str, int], np.ndarray] = {}
+    for label, values in data.items():
+        parts = label.split()
+        if len(parts) == 4 and parts[0] == 'Harm' and parts[2] == 'of':
+            harmonics[(parts[3], int(parts[1]))] = np.asarray(values, dtype=float)
+
+    for label, values in data.items():
+        parts = label.split()
+        if len(parts) == 4 and parts[0] == 'Harm' and parts[2] == 'of':
+            group, order = parts[3], int(parts[1])
+            phase, _rms_name, units = _PHASE_SUFFIX[group]
+            measured = 'voltage' if group.startswith('V') else 'current'
+            series_values = values
+            if order == 1 and measured == 'voltage':
+                # The scenario's array is the true RMS; the fundamental is
+                # smaller by sqrt(1 + THD^2).
+                thd = _reported_thd(data, group)
+                series_values = np.asarray(values, dtype=float) / np.sqrt(
+                    1.0 + (thd / 100.0) ** 2)
+            add_avg(label, phase, measured, 'SPECTRA_HGROUP', units,
+                    series_values)
+            continue
+
+        if label.startswith('THD '):
+            group = label.split()[1]
+            phase, _rms_name, _units = _PHASE_SUFFIX[group]
+            measured = 'voltage' if group.startswith('V') else 'current'
+            add_avg(label, phase, measured, 'TOTAL_THD', '%', values)
+            continue
+
+        for fragment, measured, characteristic, units in _NAMED_CHANNELS:
+            if fragment in label:
+                phase = 'an' if 'Flicker' in fragment or 'K-Factor' in fragment \
+                    else 'none'
+                add_avg(label, phase, measured, characteristic, units, values)
+                break
+        else:
+            raise ValueError(f'no channel specification for {label!r}')
+
+    # ── True RMS channels, in the max-min observation ─────────────────────
+    for group, (phase, rms_name, units) in _PHASE_SUFFIX.items():
+        fundamental = harmonics.get((group, 1))
+        if fundamental is None:
+            continue
+        measured = 'voltage' if group.startswith('V') else 'current'
+        if measured == 'voltage':
+            rms = np.asarray(fundamental, dtype=float)
+        else:
+            # RMS of the fundamental and every harmonic the fixture carries.
+            squares = [np.asarray(v, dtype=float) ** 2
+                       for (g, order), v in harmonics.items()
+                       if g == group and order >= 2]
+            rms = np.sqrt(np.asarray(fundamental, dtype=float) ** 2
+                          + (sum(squares) if squares else 0.0))
+        add_rms(rms_name, phase, measured, units, rms)
+
+    # ── Current THD, computed from the harmonics the fixture carries ──────
+    for group in ('Ia', 'Ib', 'Ic', 'In'):
+        fundamental = harmonics.get((group, 1))
+        if fundamental is None or f'THD {group} (I1)' in data:
+            continue
+        squares = [np.asarray(v, dtype=float) ** 2
+                   for (g, order), v in harmonics.items()
+                   if g == group and order >= 2]
+        if not squares:
+            continue
+        phase, _rms_name, _units = _PHASE_SUFFIX[group]
+        denominator = np.where(np.asarray(fundamental) > 0.01, fundamental, np.nan)
+        add_avg(f'THD {group}', phase, 'current', 'TOTAL_THD', '%',
+                np.sqrt(sum(squares)) / denominator * 100.0)
+
+    return avg, maxmin
+
+
+def _reported_thd(data: dict, group: str) -> np.ndarray:
+    """The THD channel the scenario supplied for a voltage phase, or zero."""
+    for label, values in data.items():
+        if label.startswith(f'THD {group}'):
+            return np.asarray(values, dtype=float)
+    return np.zeros(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,7 +622,7 @@ def make_residential() -> tuple[list[str], list[np.ndarray]]:
     labels = [
         'Harm 1 of Van', 'Harm 1 of Vbn', 'Harm 1 of Vne',
         'Harm 1 of Ia', 'Harm 1 of Ib', 'Harm 1 of In',
-        f'3{PHI} 4w Real Power', f'3{PHI} 4w VA Reactive', f'3{PHI} 4w Power Factor',
+        f'2{PHI} 3w Real Power', f'2{PHI} 3w VA Reactive', f'2{PHI} 3w Power Factor',
         'THD Van (V1)', 'THD Vbn (V2)',
         'K-Factor Ia', 'Flicker PST Van (V1)', 'Flicker PLT Van (V1)',
         *_harm_labels('Van', _H_VOLT),
@@ -734,11 +922,14 @@ def make_commercial_primary() -> tuple[list[str], list[np.ndarray]]:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: Interval length in seconds (T_SEC is spaced by this).
+INTERVAL_SEC = 300.0
+
 SCENARIOS = [
-    ("test_residential.pqd",        make_residential,       "06/25/25"),
-    ("test_commercial_small.pqd",   make_commercial_small,  "06/25/25"),
-    ("test_commercial_large.pqd",   make_commercial_large,  "06/25/25"),
-    ("test_commercial_primary.pqd", make_commercial_primary,"06/25/25"),
+    ("test_residential.pqd",        make_residential),
+    ("test_commercial_small.pqd",   make_commercial_small),
+    ("test_commercial_large.pqd",   make_commercial_large),
+    ("test_commercial_primary.pqd", make_commercial_primary),
 ]
 
 
@@ -746,7 +937,7 @@ def main():
     out_dir = Path(__file__).parent / "test_data"
     out_dir.mkdir(exist_ok=True)
 
-    for fname, builder, date_str in SCENARIOS:
+    for fname, builder in SCENARIOS:
         labels, arrays = builder()
         assert len(labels) == len(arrays), \
             f"{fname}: label count ({len(labels)}) != array count ({len(arrays)})"
@@ -754,10 +945,21 @@ def main():
             assert len(arr) == N_SAMPLES, \
                 f"{fname}: channel {i} ({lbl!r}) has {len(arr)} samples, expected {N_SAMPLES}"
 
-        pqd_bytes = _build_pqd(labels, arrays, T_SEC, date_str)
+        site = Path(fname).stem
+        avg, maxmin = scenario_channels(labels, arrays, T_SEC, INTERVAL_SEC)
+        pqd_bytes = build_file(site, [
+            (f"{site} (general) - Interval (avg)", avg),
+            (f"{site} (general) - Interval (max-min)", maxmin),
+        ])
         path = out_dir / fname
         path.write_bytes(pqd_bytes)
-        print(f"  wrote {path}  ({len(pqd_bytes):,} bytes,  {len(labels)} channels)")
+
+        # Reading each file back is the only check that matters: it proves the
+        # fixture is valid PQDIF and takes the spec path in the real adapter.
+        parsed = pqdif.PQDIFFile(path)
+        print(f"  wrote {path}  ({len(pqd_bytes):,} bytes, "
+              f"{len(parsed.definitions)} channel definitions, "
+              f"{len(avg)} avg + {len(maxmin)} max-min channels)")
 
     print(f"\nSample CLI commands (run from repo root):\n")
     print("  python pq_analyzer.py test_data/test_residential.pqd \\")

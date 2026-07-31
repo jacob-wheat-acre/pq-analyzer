@@ -500,10 +500,12 @@ class ProntoAdapter:
         and currents.  Both are pooled.
 
     A legacy reverse-engineered reader (``_load_legacy`` and the ``_load_v2*``
-    methods) is retained for files that are not valid PQDIF -- notably the
-    synthetic fixtures in test_data/, which were generated to match this
-    adapter's original model of the format rather than the published standard.
-    It should not be needed for any file a Pronto meter produces.
+    methods) is retained as a fallback for anything that fails the PQDIF
+    signature check.  Nothing in the repository exercises it any more -- the
+    test_data/ fixtures are generated from the standard by make_test_pqd.py --
+    and no file a Pronto meter produces should reach it.  It is kept only in
+    case an older firmware writes something that is not valid PQDIF, since we
+    have no sample of such a file to verify against.
 
     Channels exposed (match CANONICAL names via _TAG_MAP):
         voltage_a/b/c (V), current_a/b/c (A),
@@ -623,10 +625,9 @@ class ProntoAdapter:
         """Read the file, preferring the spec-compliant path.
 
         Pronto's exports are fully IEEE 1159.3-2019 compliant, so pqdif.py
-        handles them without any offset guessing.  The legacy offset reader is
-        kept only for files that are not valid PQDIF -- notably the synthetic
-        fixtures in test_data/, which were generated to match this adapter's
-        original (mistaken) model of the format rather than the standard.
+        handles them without any offset guessing.  Falling back to the legacy
+        offset reader means the file failed the PQDIF signature check, which no
+        Pronto export should; the message says which check failed.
         """
         try:
             self._spec = pqdif.PQDIFFile(self.filepath)

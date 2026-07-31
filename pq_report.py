@@ -237,7 +237,7 @@ def print_report(report: dict) -> None:
         print(f"  Allowed range: {vc['range_v'][0]:.1f} – {vc['range_v'][1]:.1f} V  "
               f"(nominal {vc['nominal_v']} V ± {(vc['range_v'][1]/vc['nominal_v']-1)*100:.0f}%)")
         if _any_extremes:
-            print("  (min/max from obs[24] interval extremes; captures within-window excursions)")
+            print("  (min/max from the interval max-min record; captures within-window excursions)")
 
     # ── THD / TDD ─────────────────────────────────────────────────────────────
     print(f"\n{sep}")
