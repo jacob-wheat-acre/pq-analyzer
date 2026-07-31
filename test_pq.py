@@ -1314,3 +1314,65 @@ class TestTDDDefinition:
         r = check_thd(df, self._thresh())["current"]
         # IEEE 519 defines IL at the fundamental: 12 A here, not the 13 A RMS.
         assert r["il_amps"] == pytest.approx(12.0, abs=0.01)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. Truncated and damaged files
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
+class TestTruncatedFile:
+    """A file cut short must degrade, not fail outright.
+
+    Damage lands at the end of an interrupted export or copy, so the interval
+    records carrying the compliance data are usually intact and worth reading.
+    """
+
+    @pytest.fixture
+    def truncated(self, tmp_path):
+        src = Path(__file__).parent / "test_data" / "test_commercial_small.pqd"
+        raw = src.read_bytes()
+        out = tmp_path / "truncated.pqd"
+        out.write_bytes(raw[: len(raw) - 3000])
+        return out
+
+    def test_truncation_is_measured_not_just_reported_as_a_zlib_error(self, truncated):
+        f = pqdif.PQDIFFile(truncated)
+        assert f.missing_bytes == 3000
+
+    def test_intact_file_reports_no_missing_bytes(self):
+        src = Path(__file__).parent / "test_data" / "test_commercial_small.pqd"
+        f = pqdif.PQDIFFile(src)
+        assert f.missing_bytes == 0
+        assert f.unreadable_observations == []
+
+    def test_readable_records_still_load(self, truncated):
+        adapter = ProntoAdapter(truncated)
+        df = extract_dataset(adapter, ChannelMapper()).df
+        assert len(df) > 0
+        assert "voltage_a" in df.columns
+
+    def test_damage_is_recorded_on_the_dataset(self, truncated):
+        ds = extract_dataset(ProntoAdapter(truncated), ChannelMapper())
+        dq = ds.meta["data_quality"]
+        assert dq["missing_bytes"] == 3000
+
+    def test_intact_file_carries_a_clean_bill(self):
+        src = Path(__file__).parent / "test_data" / "test_commercial_small.pqd"
+        ds = extract_dataset(ProntoAdapter(src), ChannelMapper())
+        dq = ds.meta["data_quality"]
+        assert dq["missing_bytes"] == 0 and dq["unreadable_observations"] == 0
+
+    def test_a_file_with_no_readable_observation_still_raises(self, tmp_path):
+        # Degrading gracefully must not extend to inventing an empty analysis.
+        src = Path(__file__).parent / "test_data" / "test_commercial_small.pqd"
+        raw = bytearray(src.read_bytes())
+        f = pqdif.PQDIFFile(src)
+        for record in f.records:
+            if record.tag == pqdif.TAG_OBSERVATION:
+                start = record.position + record.header_size
+                raw[start:start + 8] = b"\x00" * 8      # destroy the zlib header
+        broken = tmp_path / "broken.pqd"
+        broken.write_bytes(bytes(raw))
+        with pytest.raises(pqdif.PQDIFError, match="could be read"):
+            _ = pqdif.PQDIFFile(broken).observations

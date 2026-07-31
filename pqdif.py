@@ -48,7 +48,7 @@ import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -587,23 +587,57 @@ class Record:
     next_position: int
     checksum: int
     raw_body: bytes
+    #: Bytes the header promised but the file does not contain. Non-zero means
+    #: the file was cut short -- an interrupted export or copy, not a format
+    #: the reader fails to understand.
+    missing_bytes: int = 0
 
     def body(self, compressed: bool) -> Element:
         """Root collection of this record's body, decompressing if needed.
 
         The container record is never compressed, even under record-level
         compression (clause 6.2).
+
+        A truncated file leaves the final record's body short, which zlib
+        reports as an incomplete stream.  Whatever did decompress is still
+        usable -- the elements that were fully written parse normally -- so a
+        partial inflate is attempted before giving up, and the shortfall is
+        named in the error either way.
         """
         data = self.raw_body
         if compressed and self.tag != TAG_CONTAINER:
             try:
                 data = zlib.decompress(data)
             except zlib.error as exc:
-                raise PQDIFError(
-                    f"record at {self.position} ({self.tag}) declared "
-                    f"record-level zlib compression but did not decompress: {exc}"
-                ) from exc
+                salvaged = self._partial_inflate()
+                shortfall = (
+                    f"; the header declares a {self.body_size}-byte body but "
+                    f"{self.missing_bytes} bytes are missing from the end of the "
+                    "file, so the file itself is truncated"
+                    if self.missing_bytes else ""
+                )
+                if salvaged is None:
+                    raise PQDIFError(
+                        f"record at {self.position} ({self.tag}) declared "
+                        f"record-level zlib compression but did not decompress: "
+                        f"{exc}{shortfall}"
+                    ) from exc
+                log.warning(
+                    "record at %d (%s) is incomplete (%s)%s; recovered %d bytes "
+                    "and reading what was fully written",
+                    self.position, self.tag, exc, shortfall, len(salvaged),
+                )
+                data = salvaged
         return Element(self.tag, ELEMENT_COLLECTION, 0, False, 0, len(data), data)
+
+    def _partial_inflate(self) -> Optional[bytes]:
+        """Inflate as much of a truncated body as zlib can produce."""
+        decompressor = zlib.decompressobj()
+        try:
+            out = decompressor.decompress(self.raw_body)
+        except zlib.error:
+            return None
+        return out or None
 
 
 def _walk_records(data: bytes) -> List[Record]:
@@ -625,11 +659,22 @@ def _walk_records(data: bytes) -> List[Record]:
                 f"{RECORD_SIGNATURE} — this is not a standard PQDIF file"
             )
         body_start = pos + header_size
+        body_end = body_start + body_size
+        missing = max(0, body_end - len(data))
+        if missing:
+            log.warning(
+                "%s record at offset %d declares a %d-byte body ending at %d, "
+                "but the file is only %d bytes: %d bytes are missing. The file "
+                "is truncated -- most likely the export or the copy was "
+                "interrupted.",
+                tag, pos, body_size, body_end, len(data), missing,
+            )
         records.append(Record(
             position=pos, signature=signature, tag=tag,
             header_size=header_size, body_size=body_size,
             next_position=next_pos, checksum=checksum,
-            raw_body=data[body_start:body_start + body_size],
+            raw_body=data[body_start:body_end],
+            missing_bytes=missing,
         ))
         if next_pos == 0:
             break
@@ -787,6 +832,17 @@ class PQDIFFile:
             r for r in self.records if r.tag == TAG_OBSERVATION
         ]
         self._observations: Optional[List[Observation]] = None
+        #: (offset, reason) for observation records that could not be read.
+        self.unreadable_observations: List[Tuple[int, str]] = []
+        #: Total bytes the headers promised that the file does not contain.
+        self.missing_bytes = sum(r.missing_bytes for r in self.records)
+        if self.missing_bytes:
+            log.warning(
+                "%s is truncated: %d bytes short of what its record headers "
+                "declare. Re-exporting or re-copying the file will recover the "
+                "missing data; the readable records are analysed meanwhile.",
+                self.path.name, self.missing_bytes,
+            )
 
     # ── data source ──────────────────────────────────────────────────────
     def _read_definitions(self) -> List[ChannelDefinition]:
@@ -874,11 +930,48 @@ class PQDIFFile:
     # ── observations ─────────────────────────────────────────────────────
     @property
     def observations(self) -> List[Observation]:
-        if self._observations is None:
-            self._observations = [
-                self._read_observation(i, r)
-                for i, r in enumerate(self._observation_records)
-            ]
+        """Every observation that could be read.
+
+        A record that cannot be read at all is skipped rather than failing the
+        file: damage is normally confined to the end of a truncated export, so
+        the interval records that carry the compliance data are usually intact
+        and worth analysing.  Skipped records are listed in
+        ``unreadable_observations`` and warned about individually, and a file
+        where nothing survives still raises.
+        """
+        if self._observations is not None:
+            return self._observations
+
+        out: List[Observation] = []
+        self.unreadable_observations: List[Tuple[int, str]] = []
+        for i, record in enumerate(self._observation_records):
+            try:
+                out.append(self._read_observation(i, record))
+            except (PQDIFError, zlib.error, struct.error) as exc:
+                self.unreadable_observations.append((record.position, str(exc)))
+                log.warning(
+                    "%s: skipping unreadable observation record %d of %d at "
+                    "offset %d — %s",
+                    self.path.name, i + 1, len(self._observation_records),
+                    record.position, exc,
+                )
+
+        if not out and self._observation_records:
+            detail = "; ".join(f"offset {pos}: {err}"
+                               for pos, err in self.unreadable_observations)
+            raise PQDIFError(
+                f"{self.path.name}: none of its "
+                f"{len(self._observation_records)} observation records could be "
+                f"read — {detail}"
+            )
+        if self.unreadable_observations:
+            log.warning(
+                "%s: %d of %d observation records were unreadable and have been "
+                "skipped; the analysis below covers the rest.",
+                self.path.name, len(self.unreadable_observations),
+                len(self._observation_records),
+            )
+        self._observations = out
         return self._observations
 
     def observation_names(self) -> List[str]:

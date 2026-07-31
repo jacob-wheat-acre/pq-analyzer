@@ -134,6 +134,7 @@ def generate_report(
             "channels":         sorted(df.columns.tolist()),
             "interval_minutes": ds.meta.get("interval_minutes", 5),
             "topology":         ds.meta.get("topology", "unknown"),
+            "data_quality":     ds.meta.get("data_quality", {}),
             "has_maxmin":       ds.has_maxmin,
             "has_adaptive":     ds.has_adaptive,
             "catalog":          ds.catalog(),
@@ -240,6 +241,21 @@ def print_report(report: dict) -> None:
                   f"8-hr peak={tx['peak_8h_kva']:.1f} kVA ({tx['pct_nameplate']:.1f}%)  [{sym}]")
         else:
             print("  (Pass --transformer-kva to check transformer loading)")
+
+    # ── File integrity ────────────────────────────────────────────────────────
+    dq = (report["file_summary"].get("data_quality") or {})
+    if dq.get("missing_bytes") or dq.get("unreadable_observations"):
+        print(f"\n{sep}")
+        print("  ⚠  SOURCE FILE INCOMPLETE")
+        if dq.get("missing_bytes"):
+            print(f"  The file is {dq['missing_bytes']:,} bytes shorter than its own "
+                  "record headers declare.")
+        if dq.get("unreadable_observations"):
+            print(f"  {dq['unreadable_observations']} observation record(s) could not "
+                  "be read and were skipped.")
+        print("  Everything below covers only the data that was readable. Re-export "
+              "or re-copy the")
+        print("  file and re-run before relying on these results.")
 
     # ── Voltage ───────────────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -654,6 +670,23 @@ def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, 
             + (", adaptive events" if fs.get("has_adaptive") else "")
         )),
     ]
+    # An incomplete source file belongs in the report header, not only in a log:
+    # the findings below are drawn from partial data and a reader has to know.
+    _dq = fs.get("data_quality") or {}
+    if _dq.get("missing_bytes") or _dq.get("unreadable_observations"):
+        _notes = []
+        if _dq.get("missing_bytes"):
+            _notes.append(f"{_dq['missing_bytes']:,} bytes short of the length its "
+                          "own record headers declare")
+        if _dq.get("unreadable_observations"):
+            _notes.append(f"{_dq['unreadable_observations']} observation record(s) "
+                           "unreadable and skipped")
+        rows_data.append((
+            "Source file integrity",
+            "INCOMPLETE — " + "; ".join(_notes)
+            + ". The findings below cover only the readable data; re-export the "
+              "file and re-run to confirm them.",
+        ))
     info_tbl = doc.add_table(rows=len(rows_data), cols=2)
     info_tbl.style = 'Table Grid'
     _set_col_widths(info_tbl, [5.0, 11.5])

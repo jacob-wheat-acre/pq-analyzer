@@ -686,6 +686,10 @@ class ProntoAdapter:
 
         if self._spec is not None:
             self._load_spec()
+            self.data_quality = {
+                "missing_bytes": self._spec.missing_bytes,
+                "unreadable_observations": len(self._spec.unreadable_observations),
+            }
             return
         self._load_legacy()
 
@@ -2750,6 +2754,9 @@ def extract_dataset(
     meta: dict = {
         "topology":         topology,
         "interval_minutes": interval_minutes,
+        # Non-zero means the file was incomplete; a compliance report built from
+        # it has to say so rather than read as though the record were whole.
+        "data_quality":     getattr(adapter, "data_quality", {}) or {},
         "start_time":       df.index[0].isoformat() if len(df) else None,
         "end_time":         df.index[-1].isoformat() if len(df) else None,
     }
