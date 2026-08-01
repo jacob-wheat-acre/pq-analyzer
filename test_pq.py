@@ -1835,3 +1835,113 @@ class TestDistortionClaim:
         # Presence must not depend on the flag, only the strength of the claim.
         assert self._distortion(5.0, 100.0, True) is not None
         assert self._distortion(5.0, 100.0, False) is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. Engineering report review fixes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
+class TestEngineeringReportReview:
+    """Defects found reading the >50 kW report end to end as its audience."""
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def doc(tmp_path_factory):
+        from docx import Document
+        import pq_analysis as An
+        from pq_report import generate_report, generate_word_report
+        out = tmp_path_factory.mktemp("sg")
+        ds = extract_dataset(
+            ProntoAdapter(Path("test_data/test_commercial_large.pqd")), ChannelMapper())
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                        isc_amps=5000.0, transformer_kva=300.0)
+        df, ev = ds.df, None
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th),
+            kfactor_result=An.kfactor_by_phase(df),
+            ll_volt_result=An.check_line_to_line_voltage(df, th),
+            frequency_result=An.check_frequency(df, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        path = generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", engineer_contact="", outdir=out, stem="sg")
+        return Document(str(path))
+
+    @staticmethod
+    def _text(doc):
+        t = " ".join(p.text for p in doc.paragraphs)
+        for tb in doc.tables:
+            t += " " + " ".join(c.text for r in tb.rows for c in r.cells)
+        return t
+
+    def test_thermal_claim_is_conditional_on_loading(self, doc):
+        # At 27% of nameplate a K-factor of 5 does not exceed the rating, and
+        # the report had recommended a replacement transformer on that basis.
+        t = self._text(doc)
+        assert "retains substantial thermal margin" in t
+        assert "significantly exceeds nameplate assumptions" not in t
+
+    def test_standards_tally_matches_the_table(self, doc):
+        import re
+        t = self._text(doc)
+        m = re.search(r"of the (\d+) power quality standards evaluated", t)
+        assert m, "standards tally sentence missing"
+        claimed = int(m.group(1))
+        rows = next(len(tb.rows) - 1 for tb in doc.tables
+                    if tb.rows[0].cells[0].text.strip() == "Standard")
+        assert claimed == rows, f"summary claims {claimed}, table shows {rows}"
+
+    def test_the_new_checks_have_table_rows(self, doc):
+        standards = next(
+            [r.cells[0].text for r in tb.rows[1:]] for tb in doc.tables
+            if tb.rows[0].cells[0].text.strip() == "Standard")
+        joined = " ".join(standards)
+        assert "Line-to-line voltage" in joined
+        assert "System frequency" in joined
+
+    def test_no_stale_attribution_or_dangling_reference(self, doc):
+        t = self._text(doc)
+        assert "identifies whose system is involved" not in t
+        assert "attached Pronto data" not in t
+
+    def test_statistical_margin_convention_is_explained(self, doc):
+        t = self._text(doc)
+        assert "A positive margin is headroom" in t
+        assert "exceeded by that amount" in t
+
+    def test_aggregate_statistical_row_is_tdd_when_a_tdd_limit_applies(self, doc):
+        # The row sits in a "% of IL" table and is measured against the TDD
+        # limit, so labelling it THD named a different quantity.
+        for tb in doc.tables:
+            labels = [r.cells[0].text.strip() for r in tb.rows]
+            if "TDD" in labels or "THD" in labels:
+                assert "THD" not in labels, "aggregate row still labelled THD"
+
+    def test_source_table_says_indication_not_attribution(self, doc):
+        for tb in doc.tables:
+            hdr = [c.text.strip() for c in tb.rows[0].cells]
+            if "Apparent Z (Ω)" in hdr:
+                assert "Indication" in hdr and "Attribution" not in hdr
+                assert "Pearson r" not in hdr
+                break
+        else:
+            pytest.fail("harmonic source table not found")
+
+    def test_overall_assessment_is_not_a_directive(self, doc):
+        t = self._text(doc)
+        assert "prompt corrective action is required" not in t
+
+    def test_low_accumulation_factor_is_explained(self, doc):
+        t = self._text(doc)
+        assert "largely cancelling in the neutral" in t

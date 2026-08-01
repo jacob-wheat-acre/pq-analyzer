@@ -429,7 +429,7 @@ def print_report(report: dict) -> None:
             tag = " [triplen]" if od["is_triplen"] else "          "
             print(f"  H{h:<3}{tag}  mean={od['mean_a']:.3f} A  max={od['max_a']:.3f} A")
 
-    # ── Harmonic source attribution ───────────────────────────────────────────
+    # ── Harmonic source indication ────────────────────────────────────────────
     sh = report.get("harmonic_sources", {})
     if sh.get("available"):
         print(f"\n{sep}")
@@ -444,7 +444,7 @@ def print_report(report: dict) -> None:
         resonant = sh.get("resonant_orders", [])
         if resonant:
             print(f"  Resonance suspects: {', '.join('H'+str(h) for h in sorted(resonant))}")
-        print(f"  {'Order':<6}  {'Z_h(Ω)':>8}  {'Z_ratio':>8}  {'Correlation':>10}  Attribution")
+        print(f"  {'Order':<6}  {'Z_h(Ω)':>8}  {'Z_ratio':>8}  {'Correlation':>10}  Indication")
         for h, od in sorted(sh["orders"].items()):
             ratio_s = f"{od['z_ratio']:.2f}×" if od["z_ratio"] is not None else "   n/a"
             corr_s  = f"{od['corr']:.2f}"     if od["corr"]    is not None else "   n/a"
@@ -457,7 +457,7 @@ def print_report(report: dict) -> None:
         print("  SPECTRAL SHAPE (single-visit classification, not a trend)")
         class_labels = {
             "broadband_consistent": "Broadband-consistent (elevated, flat across orders)",
-            "resonance_present":    "Resonance present (see source attribution above)",
+            "resonance_present":    "Resonance present (see source indication above)",
             "elevated_uneven":      "Elevated but concentrated (no order flagged resonant)",
             "not_elevated":         "Not meaningfully elevated",
         }
@@ -905,6 +905,32 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     else:
         add_row("Flicker within IEC 61000-3-3 limits (Pst ≤ 1.0, Plt ≤ 0.65)", "Not measured in this recording", None)
 
+    # Line-to-line voltage and frequency were being counted in the standards
+    # tally without appearing here, so the summary claimed more standards than
+    # the table showed.
+    llv = report.get("voltage_ll_compliance") or {}
+    if llv.get("available"):
+        worst = max(llv["pairs"].values(), key=lambda p: p["pct_out_of_bounds"])
+        meas = (f"Range {min(p['min_v'] for p in llv['pairs'].values()):.1f}–"
+                f"{max(p['max_v'] for p in llv['pairs'].values()):.1f} V "
+                f"(allowed {llv['range_v'][0]:.0f}–{llv['range_v'][1]:.0f} V)")
+        if worst["pct_out_of_bounds"] > 0:
+            meas += f"  |  worst pair {worst['pct_out_of_bounds']:.2f}% out of range"
+        add_row(f"Line-to-line voltage within ANSI C84.1 Range A "
+                f"({llv['nominal_v']:.0f} V nominal)", meas, llv.get("overall_pass"))
+    else:
+        add_row("Line-to-line voltage within ANSI C84.1 Range A",
+                llv.get("error", "Not evaluated"), None)
+
+    frq = report.get("frequency") or {}
+    if frq.get("available"):
+        meas = (f"{frq['min_hz']:.3f}–{frq['max_hz']:.3f} Hz  "
+                f"(allowed {frq['range_hz'][0]:.2f}–{frq['range_hz'][1]:.2f} Hz)")
+        add_row(f"System frequency within ±{(frq['range_hz'][1] - frq['nominal_hz']):.1f} Hz "
+                f"of {frq['nominal_hz']:.0f} Hz", meas, frq.get("overall_pass"))
+    else:
+        add_row("System frequency within tolerance", "No frequency channel", None)
+
     doc.add_paragraph()
 
 
@@ -925,6 +951,9 @@ _PF_FRIENDLY = {
     "harmonic_statistics":          "harmonic statistical limits (IEEE 519 Clause 5)",
     "neutral_health":               "neutral integrity",
     "itic_transients":              "voltage sags/swells (ITIC curve)",
+    "voltage_line_to_line":         "line-to-line voltage (ANSI C84.1)",
+    "frequency":                    "system frequency",
+    "flicker":                      "voltage flicker (IEC 61000-3-3)",
 }
 
 _PRIORITY_FROM_SEV = {"critical": "High", "warning": "Medium", "info": "Low"}
@@ -1192,7 +1221,9 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
         # Residential services are not subject to the power factor tariff clause
         evaluated.pop("power_factor", None)
     fl        = _flicker_status(df)
-    n_eval    = len(evaluated) + (1 if fl else 0)
+    # pass_fail already carries a "flicker" entry, so counting fl separately
+    # inflated the tally by one against the table.
+    n_eval    = len(evaluated) + (0 if "flicker" in evaluated else (1 if fl else 0))
     fails     = [_PF_FRIENDLY.get(k, k.replace("_", " "))
                  for k, v in evaluated.items() if v is False]
     if fl and fl["passes"] is False:
@@ -1239,7 +1270,7 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
     has_warning  = any(f.get("severity") == "warning" for f in rca)
     if fails and has_critical:
         overall = ("Overall assessment: significant power quality deficiencies exist at "
-                   "this service and prompt corrective action is required.")
+                   "this service and warrant prompt attention.")
     elif fails:
         overall = ("Overall assessment: power quality at this service is generally "
                    "acceptable, but the standards listed above are not met and targeted "
@@ -1533,7 +1564,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             f"The following individual harmonic orders exceeded their IEEE 519-2022 per-order limits: "
             + ", ".join(fail_orders) + ". "
             "Individual harmonic limits are more restrictive than TDD for higher-order harmonics. "
-            "See the harmonic spectrum table in the attached Pronto data (Page 7)."
+            "Per-order magnitudes for every phase are tabulated below."
         )
     elif ih.get("available"):
         h_ord = ih.get("worst_order")
@@ -1663,8 +1694,12 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                 f"Triplens (H3, H9, H15) are zero-sequence harmonics that add arithmetically in a "
                 f"4-wire wye neutral. Triplen content: {t_pct:.0f}% of total neutral harmonic current. "
                 f"Accumulation factor (H3-neutral ÷ mean H3-phase): {acc_str}. "
-                f"Factor > 3 indicates resonance amplification; factor ≈ 3 indicates full accumulation "
-                f"from balanced single-phase loads on all three phases."
+                "A factor near 3 indicates full accumulation from balanced "
+                "single-phase loads on all three phases, and above 3 indicates "
+                "resonance amplification. Well below 3 means the third harmonic "
+                "is largely cancelling in the neutral rather than adding, which "
+                "is the case when the load is predominantly three-phase — the "
+                "usual reading on a service with few single-phase nonlinear loads."
             )
 
         nh_tbl = doc.add_table(rows=1, cols=4)
@@ -1687,11 +1722,11 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             if od["is_triplen"]:
                 run.bold = True
 
-    # ── Harmonic source attribution ───────────────────────────────────────────
+    # ── Harmonic source indication ────────────────────────────────────────────
     if sh.get("available"):
         doc.add_paragraph()
         sh_hdr = doc.add_paragraph()
-        _bold(sh_hdr, "Harmonic Source Attribution (Indicative)", size_pt=10)
+        _bold(sh_hdr, "Harmonic Source Indication (Indicative)", size_pt=10)
 
         resonant  = sh.get("resonant_orders", [])
         overall   = sh.get("overall", "indeterminate")
@@ -1703,16 +1738,16 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             "indeterminate":    "Indeterminate",
         }
         doc.add_paragraph(
-            f"Overall attribution: {overall_labels.get(overall, overall)}. "
+            f"Overall indication: {overall_labels.get(overall, overall)}. "
             f"Resonance suspects: {res_str}. "
-            "Attribution is indicative; see the Appendix for the method and its limitations."
+            "This is an indication only; see the Appendix for the method and its limitations. It concerns the direction distortion appears to come from, not responsibility for it."
         )
 
         sh_tbl = doc.add_table(rows=1, cols=5)
         sh_tbl.style = 'Table Grid'
         _set_col_widths(sh_tbl, [1.5, 2.5, 2.5, 2.5, 3.5])
         for cell, text in zip(sh_tbl.rows[0].cells,
-                               ["Order", "Apparent Z (Ω)", "Z_ratio", "Pearson r", "Attribution"]):
+                               ["Order", "Apparent Z (Ω)", "Z_ratio", "Correlation", "Indication"]):
             _cell_shade(cell, "E8F1FA")
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
@@ -1747,7 +1782,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _bold(ss_hdr, "Spectral Shape Classification", size_pt=10)
         class_labels = {
             "broadband_consistent": "Broadband-consistent — elevated and flat across orders",
-            "resonance_present":    "Resonance present — see Harmonic Source Attribution above",
+            "resonance_present":    "Resonance present — see Harmonic Source Indication above",
             "elevated_uneven":      "Elevated but concentrated — no order flagged as resonant",
             "not_elevated":         "Not meaningfully elevated",
         }
@@ -1767,14 +1802,27 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             f"(ISC/IL = {hs['isc_il_ratio']:.0f}, class {hs['isc_class']}). "
             "See the Appendix for the statistical method and its limitations."
         )
+        # The bracketed figure is headroom against the limit, so a negative
+        # value marks an exceedance. Without saying so, the convention
+        # inverts on the reader: "7.86% (-0.86)" is over a 7.0% limit while
+        # "1.63% (+5.37)" is comfortably under it.
+        _body(doc,
+            "Each cell gives the measured percentile and, in brackets, its "
+            "margin against the limit. A positive margin is headroom; a "
+            "negative margin means the limit was exceeded by that amount.")
 
         ph_cols = [ph for ph in ("a", "b", "c")
                    if any(ph in hs["weekly"].get(k, {}) for k in hs["weekly"])]
         ph_labels = {"a": "L1", "b": "L2"} if is_split else {"a": "Phase A", "b": "Phase B", "c": "Phase C"}
+        # The aggregate row is measured against the current-distortion limit, so
+        # it is TDD wherever a TDD limit applies. Labelling it THD in a table of
+        # "% of IL" named a different quantity than the one tabulated.
+        _aggregate_label = "TDD" if tdd_info else "THD"
         stat_orders = [("h3", "H3"), ("h5", "H5"), ("h7", "H7"),
                        ("h9", "H9"), ("h11", "H11"), ("h13", "H13"),
                        ("h17", "H17"), ("h19", "H19"), ("h23", "H23"), ("h25", "H25"),
-                       ("thd", "THD")]
+                       ("thd", _aggregate_label)]
+
 
         def _stat_table(title: str, val_key: str, lim_key: str,
                         pass_key: str, lim_label: str) -> None:
@@ -1926,16 +1974,38 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         if dem.get("transformer"):
             tx     = dem["transformer"]
             pct_tx = tx.get("pct_nameplate", 0)
-            _body(doc,
-                f"With the transformer currently loaded to {pct_tx:.0f}% of its {tx['nameplate_kva']:.0f} kVA "
-                f"nameplate and a K-factor of {kf_med:.1f}, the effective thermal load on the "
-                f"transformer significantly exceeds nameplate assumptions. "
-                + (f"A K-{kf_rate} rated unit is recommended before any additional "
-                   "load is added."
-                   if kf_rate else
-                   "No standard K-rating covers a K-factor this high, so re-assess "
-                   "it under representative load before specifying a replacement.")
-            )
+            # Harmonic heating scales with load current, so a K-factor only puts
+            # a transformer near its thermal limit when the transformer is
+            # actually loaded. Stating otherwise recommended replacing a unit
+            # sitting at 27% of nameplate, in a report that had already called
+            # its loading acceptable two sections earlier.
+            if pct_tx > 70:
+                _body(doc,
+                    f"With the transformer loaded to {pct_tx:.0f}% of its "
+                    f"{tx['nameplate_kva']:.0f} kVA nameplate and a K-factor of "
+                    f"{kf_med:.1f}, the effective thermal load exceeds what the "
+                    "nameplate rating assumes. "
+                    + (f"A K-{kf_rate} rated unit is indicated before any "
+                       "additional load is added."
+                       if kf_rate else
+                       "No standard K-rating covers a K-factor this high, so "
+                       "re-assess it under representative load before specifying "
+                       "a replacement.")
+                )
+            else:
+                _body(doc,
+                    f"The transformer is loaded to {pct_tx:.0f}% of its "
+                    f"{tx['nameplate_kva']:.0f} kVA nameplate, so despite a "
+                    f"K-factor of {kf_med:.1f} it retains substantial thermal "
+                    "margin: harmonic losses scale with load current, and at this "
+                    "loading the additional heating is small in absolute terms. "
+                    + (f"The K-factor becomes the governing constraint if load "
+                       f"grows — a replacement at that point should be K-{kf_rate} "
+                       "rated rather than standard."
+                       if kf_rate else
+                       "Re-assess the K-factor under representative load before "
+                       "it drives any sizing decision.")
+                )
 
     doc.add_paragraph()
 
@@ -2232,7 +2302,9 @@ def _word_engineering_assessment(doc, report) -> None:
                      level=1)
     _body(doc,
         "The findings below describe the likely causes of the observed conditions. "
-        "Each is graded by confidence level and identifies whose system is involved. "
+        "Each is graded by confidence level and states the evidence bearing on "
+        "where the condition originates, leaving the attribution itself to the "
+        "reviewing engineer. "
         "Supporting measurements are presented in the sections that follow.")
 
     _conf_rank = {"high": 0, "medium": 1, "low": 2}

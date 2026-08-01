@@ -1034,7 +1034,7 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
             "overall":         "not_assessed",
             "significance":    significance,
             "note": (
-                "Source attribution and resonance screening were not performed: "
+                "Source indication and resonance screening were not performed: "
                 + significance["reason"]
                 + " The impedances above are reported as measured data only."
             ),
@@ -1057,7 +1057,7 @@ def check_harmonic_sources(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "overall":         overall,
         "significance":    significance,
         "note": (
-            "Attribution is indicative — correlation between the harmonic voltage and harmonic current over the recording. "
+            "This indicates the direction distortion appears to come from, not responsibility for it. Based on the correlation between the harmonic voltage and harmonic current over the recording. "
             "Exact source direction requires waveform phasor measurements."
         ),
     }
