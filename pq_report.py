@@ -2918,22 +2918,51 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
         # Distortion, stated plainly and without per-order detail: enough to know
         # whether it matters and what causes it, not enough to invite questions
         # this letter cannot answer.
+        #
+        # The current-side limit depends on how stiff the supply is at this
+        # service (the ISC/IL ratio). Without that figure the analysis falls back
+        # to the most restrictive class, which on one test file turns a 0.35%
+        # exceedance into 100%. That assumption is defensible in an engineering
+        # report where it is labelled, but a customer letter must not tell a
+        # business it breaches a standard on the strength of an assumed limit. So
+        # an exceedance is only asserted for the quantity whose limit is known:
+        # voltage distortion always (the limit is fixed), current distortion only
+        # when the short-circuit current was supplied.
         v_thd = (thd.get("voltage") or {})
         i_thd = (thd.get("current") or {})
-        if (v_thd.get("available") and v_thd.get("pct_exceeding", 0) > 0) or \
-           (i_thd.get("available") and i_thd.get("pct_exceeding", 0) > 0):
-            which = []
-            if v_thd.get("pct_exceeding", 0) > 0:
-                which.append("the voltage supplied to you")
-            if i_thd.get("pct_exceeding", 0) > 0:
-                which.append("the current your equipment draws")
+        isc_known = bool((thd.get("tdd_info") or {}).get("isc_provided"))
+        v_exceeds = bool(v_thd.get("available") and v_thd.get("pct_exceeding", 0) > 0)
+        i_exceeds = bool(i_thd.get("available") and i_thd.get("pct_exceeding", 0) > 0)
+        i_undetermined = bool(i_thd.get("available")) and not isc_known
+
+        which = []
+        if v_exceeds:
+            which.append("the voltage supplied to you")
+        if i_exceeds and isc_known:
+            which.append("the current your equipment draws")
+
+        if which or i_undetermined:
+            if which:
+                claim = ("We measured distortion of that shape in "
+                         + " and in ".join(which)
+                         + ", beyond the level the applicable standard permits.")
+            else:
+                claim = ("We measured distortion of that shape in the current your "
+                         "equipment draws.")
+            if i_undetermined:
+                claim += (
+                    " Whether the current distortion exceeds the limit that applies "
+                    "to you is not settled by this recording: that limit depends on "
+                    "the strength of the supply at your service, which has not been "
+                    "established yet. The engineer named below can complete that "
+                    "assessment.")
             out.append({
-                "headline": "The shape of the electrical waveform is more distorted than the standard allows",
+                "headline": (
+                    "The shape of the electrical waveform is more distorted than "
+                    "the standard allows" if which else
+                    "We measured distortion in the shape of the electrical waveform"),
                 "measured": (
-                    "Mains electricity should be a smooth repeating wave. We "
-                    "measured distortion of that shape in "
-                    + " and in ".join(which)
-                    + ", beyond the level the applicable standard permits."),
+                    "Mains electricity should be a smooth repeating wave. " + claim),
                 "means": (
                     "Distortion is produced by equipment that draws current in "
                     "pulses rather than smoothly — variable speed drives, battery "

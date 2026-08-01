@@ -1762,3 +1762,76 @@ class TestNeutralSeverityWording:
         conds = _customer_conditions(rep, Thresholds(nominal_voltage=120.0,
                                                      customer_class="r"))
         assert not any("neutral" in c["headline"].lower() for c in conds)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. Distortion is reported without depending on an assumed limit
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDistortionClaim:
+    """The current-side limit depends on ISC/IL.
+
+    Without ISC the analysis falls back to the most restrictive class, which on
+    one test file turns a 0.35% exceedance into 100%. That is fine in a labelled
+    engineering report and not fine in a letter telling a business it breaches a
+    standard, so the letter only asserts what its limits actually support.
+    """
+
+    @staticmethod
+    def _report(v_exceed, i_exceed, isc_provided):
+        return {
+            "file_summary": {"topology": "3-phase", "duration_hours": 24},
+            "voltage_compliance": {"available": False},
+            "flicker": {"available": False},
+            "neutral_health": {"available": False},
+            "current_imbalance": {"available": False},
+            "power_factor": {"available": False},
+            "itic": {}, "events": {},
+            "thd_compliance": {
+                "voltage": {"available": True, "pct_exceeding": v_exceed},
+                "current": {"available": True, "pct_exceeding": i_exceed},
+                "tdd_info": {"isc_provided": isc_provided},
+            },
+        }
+
+    def _distortion(self, v_exceed, i_exceed, isc_provided):
+        from pq_report import _customer_conditions
+        th = Thresholds(nominal_voltage=120.0, customer_class="c")
+        for c in _customer_conditions(self._report(v_exceed, i_exceed, isc_provided), th):
+            if "distort" in c["headline"].lower():
+                return c
+        return None
+
+    def test_asserts_both_when_isc_is_known(self):
+        c = self._distortion(5.0, 100.0, True)
+        assert "the voltage supplied to you" in c["measured"]
+        assert "the current your equipment draws" in c["measured"]
+        assert "not settled" not in c["measured"]
+
+    def test_withholds_the_current_claim_without_isc(self):
+        c = self._distortion(5.0, 100.0, False)
+        assert "the voltage supplied to you" in c["measured"]
+        # The 100% exceedance is against an assumed limit, so it is not asserted.
+        assert "and in the current your equipment draws, beyond" not in c["measured"]
+        assert "not settled by this recording" in c["measured"]
+
+    def test_still_reports_when_only_current_is_involved(self):
+        # The item must not vanish just because ISC was omitted — that was the
+        # dependency on the flag worth removing.
+        c = self._distortion(0.0, 100.0, False)
+        assert c is not None
+        assert "more distorted than the standard allows" not in c["headline"]
+        assert "not settled by this recording" in c["measured"]
+
+    def test_voltage_alone_is_enough_to_assert(self):
+        # The voltage limit is fixed and does not depend on ISC.
+        c = self._distortion(5.0, 0.0, False)
+        assert "beyond the level the applicable standard permits" in c["measured"]
+
+    def test_silent_when_nothing_exceeds_and_isc_is_known(self):
+        assert self._distortion(0.0, 0.0, True) is None
+
+    def test_fires_the_same_way_with_and_without_the_flag(self):
+        # Presence must not depend on the flag, only the strength of the claim.
+        assert self._distortion(5.0, 100.0, True) is not None
+        assert self._distortion(5.0, 100.0, False) is not None
