@@ -1660,3 +1660,105 @@ class TestCustomerLetter:
         assert "did not find a problem" in text
         # And it must not overclaim: an intermittent fault can fall outside a window.
         assert "only the days it ran" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. Neutral wording is scaled to what was measured
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNeutralSeverityWording:
+    """The neutral indicators move for ordinary reasons too.
+
+    A "caution" driven by a couple of volts of variation in the leg sum must not
+    read the same as legs actually opposing each other — the letter was declaring
+    a shock and fire hazard on the strength of a 2.8 V standard deviation.
+    """
+
+    @staticmethod
+    def _report(severity, corr, sum_std=2.8, asym=1.4):
+        return {
+            "file_summary": {"topology": "split-phase", "duration_hours": 68},
+            "voltage_compliance": {"available": False},
+            "flicker": {"available": False},
+            "current_imbalance": {"available": False},
+            "power_factor": {"available": False},
+            "thd_compliance": {},
+            "itic": {},
+            "events": {},
+            "neutral_health": {
+                "available": True, "severity": severity, "leg_correlation": corr,
+                "sum_mean_v": 238.0, "sum_std_v": sum_std, "asym_mean_v": asym,
+                "vne_max_v": 0.1,
+            },
+        }
+
+    def _neutral(self, severity, corr):
+        from pq_report import _customer_conditions
+        conds = _customer_conditions(self._report(severity, corr),
+                                     Thresholds(nominal_voltage=120.0,
+                                                customer_class="r"))
+        assert conds, f"{severity} produced no condition"
+        return conds
+
+    def test_caution_is_a_baseline_not_a_hazard(self):
+        c = self._neutral("caution", 0.82)[0]
+        assert c.get("safety") is False
+        assert "hazard" not in c["means"].lower()
+        assert "baseline" in c["means"]
+
+    def test_critical_keeps_the_urgent_language(self):
+        c = self._neutral("critical", -0.74)[0]
+        assert c["safety"] is True
+        assert "shock and fire hazard" in c["means"]
+
+    def test_only_warning_and_critical_lead_the_letter(self):
+        from pq_report import _customer_conditions
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        rep = self._report("caution", 0.82)
+        # Give it a second condition so ordering is observable.
+        rep["voltage_compliance"] = {
+            "available": True, "total_pct_out_of_bounds": 5.0,
+            "range_v": (114.0, 126.0),
+            "phases": {"voltage_a": {"min_v": 100.0, "max_v": 121.0}},
+        }
+        conds = _customer_conditions(rep, th)
+        assert "neutral" not in conds[0]["headline"].lower()
+        rep["neutral_health"]["severity"] = "critical"
+        rep["neutral_health"]["leg_correlation"] = -0.74
+        assert "neutral" in _customer_conditions(rep, th)[0]["headline"].lower()
+
+    def test_the_explainer_does_not_contradict_the_measurement(self):
+        # The explainer says what we look for; the data says what was found. It
+        # must not assert opposition when the legs measured +0.82.
+        c = self._neutral("caution", 0.82)[0]
+        assert "so that is the pattern we look for" in c["measured"]
+        assert "rose and fell together" in c["measured"]
+        assert "Our measurements show the two halves moving in opposite" not in c["measured"]
+
+    def test_indicators_are_always_reported_as_numbers(self):
+        for severity, corr in (("caution", 0.82), ("warning", -0.1), ("critical", -0.74)):
+            measured = self._neutral(severity, corr)[0]["measured"]
+            assert "correlation of" in measured
+            assert "238 volts" in measured
+            assert f"{corr:+.2f}" in measured
+
+    def test_correlation_sense_matches_its_sign(self):
+        from pq_report import _neutral_indicator_sentence
+        base = {"sum_mean_v": 240.0, "sum_std_v": 1.0, "asym_mean_v": 0.5}
+        assert "sound shared connection" in _neutral_indicator_sentence(
+            {**base, "leg_correlation": 0.9})
+        assert "only loosely" in _neutral_indicator_sentence(
+            {**base, "leg_correlation": 0.2})
+        assert "failing connection produces" in _neutral_indicator_sentence(
+            {**base, "leg_correlation": -0.6})
+
+    def test_caution_claims_no_symptom_the_customer_would_have_seen(self):
+        c = self._neutral("caution", 0.82)[0]
+        assert "Nothing in particular" in c["symptom"]
+
+    def test_normal_neutral_produces_no_condition_at_all(self):
+        from pq_report import _customer_conditions
+        rep = self._report("normal", 0.95)
+        conds = _customer_conditions(rep, Thresholds(nominal_voltage=120.0,
+                                                     customer_class="r"))
+        assert not any("neutral" in c["headline"].lower() for c in conds)

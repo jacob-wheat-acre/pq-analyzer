@@ -2661,10 +2661,10 @@ def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
     if topology == "3-phase":
         neutral_measured = (
             f"{site.capitalize()} is supplied by three separate live wires that "
-            "share one return wire, called the neutral. Our measurements show "
-            "the voltage on those wires moving in opposite directions to each "
-            "other, which is what happens when the shared connection is loose, "
-            "corroded or broken.")
+            "share one return wire, called the neutral. If that shared connection "
+            "loosens or corrodes, the voltages on those wires begin to move "
+            "against each other instead of holding steady, so that is the pattern "
+            "we look for.")
         neutral_symptom = (
             "Equipment on one part of the site behaving oddly while the rest "
             "seems normal, often changing when large equipment switches on. "
@@ -2673,14 +2673,51 @@ def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
     else:
         neutral_measured = (
             f"{site.capitalize()} is supplied by two 120-volt halves that share "
-            "one return wire, called the neutral. Our measurements show the two "
-            "halves moving in opposite directions -- one rising as the other "
-            "falls -- which is what happens when that shared connection is "
-            "loose, corroded or broken.")
+            "one return wire, called the neutral. If that shared connection "
+            "loosens or corrodes, the two halves begin to move in opposite "
+            "directions -- one rising as the other falls -- so that is the "
+            "pattern we look for.")
         neutral_symptom = _SYMPTOMS["neutral"]
     return {"site": site, "neutral_measured": neutral_measured,
             "neutral_symptom": neutral_symptom,
             "is_business": thresh.customer_class == "c"}
+
+
+def _neutral_indicator_sentence(nh: dict) -> str:
+    """State the neutral indicators as data, in terms a reader can weigh.
+
+    The severity alone does not tell an electrician what to look for, and a
+    "caution" driven by a couple of volts of variation reads very differently
+    from one driven by the two sides opposing each other. So the numbers go in
+    the letter regardless of how it is worded around them.
+    """
+    bits: List[str] = []
+    corr = nh.get("leg_correlation")
+    if corr is not None:
+        if corr >= 0.5:
+            sense = ("they rose and fell together, which is what a sound shared "
+                     "connection looks like")
+        elif corr >= 0:
+            sense = "they tracked each other only loosely"
+        else:
+            sense = ("they moved in opposite directions, which is the pattern a "
+                     "failing connection produces")
+        bits.append(f"the two sides moved with a correlation of {corr:+.2f}, meaning "
+                    + sense)
+    total, spread = nh.get("sum_mean_v"), nh.get("sum_std_v")
+    if total is not None and spread is not None:
+        bits.append(f"together they averaged {total:.0f} volts and varied by about "
+                    f"{spread:.1f} volts")
+    asym = nh.get("asym_mean_v")
+    if asym is not None:
+        bits.append(f"the two sides differed from each other by {asym:.1f} volts "
+                    "on average")
+    vne = nh.get("vne_max_v")
+    if vne is not None:
+        bits.append(f"the highest neutral-to-earth voltage was {vne:.1f} volts")
+    if not bits:
+        return ""
+    return "In detail: " + "; ".join(bits) + "."
 
 
 def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
@@ -2732,20 +2769,59 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                 "symptom": _SYMPTOMS["over_voltage"],
             })
 
-    # ── Neutral integrity: the safety-relevant one, so it leads ───────────
-    if nh.get("available") and nh.get("severity") in ("caution", "warning", "critical"):
-        out.insert(0, {
-            "headline": "We found signs of a problem with the neutral connection",
-                        "measured": vocab["neutral_measured"],
-            "means": (
-                "This is the most important item in this letter. A failing neutral "
-                "lets the voltage on part of the installation climb well above "
-                "normal while the rest drops, which can damage equipment on the "
-                "high side. It is also a shock and fire hazard, and it does not "
-                "repair itself."),
-            "symptom": vocab["neutral_symptom"],
-            "safety": True,
-        })
+    # ── Neutral integrity ─────────────────────────────────────────────────
+    # Scaled to what was actually measured. These indicators move for ordinary
+    # reasons as well as for a failing connection -- a couple of volts of
+    # variation in the leg sum is normal loading -- so only the severities that
+    # warrant it get urgent language, and the numbers are given either way so an
+    # electrician can weigh them.
+    severity = nh.get("severity") if nh.get("available") else None
+    if severity in ("caution", "warning", "critical"):
+        if severity == "critical":
+            entry = {
+                "headline": "We found signs of a problem with the neutral connection",
+                "means": (
+                    "This is the most important item in this letter. A failing "
+                    "neutral lets the voltage on part of the installation climb "
+                    "well above normal while the rest drops, which can damage "
+                    "equipment on the high side. It is also a shock and fire "
+                    "hazard, and it does not repair itself."),
+                "safety": True,
+            }
+        elif severity == "warning":
+            entry = {
+                "headline": "The shared neutral connection is not behaving quite as it should",
+                "means": (
+                    "A connection that is loosening or corroding shows up in these "
+                    "measurements before it causes obvious trouble, so this is "
+                    "worth having looked at rather than left. On what we measured "
+                    "here it is not an emergency."),
+                "safety": False,
+            }
+        else:
+            entry = {
+                "headline": "We took a close look at the shared neutral connection",
+                "means": (
+                    "We check this because a weakening neutral is one of the few "
+                    "faults that can damage equipment, and it shows in these "
+                    "measurements before it becomes obvious. What we found sits "
+                    "within the range that ordinary changes in load produce, so we "
+                    "are reporting it as a baseline rather than as a problem. If "
+                    "you contact us again, these are the numbers a later recording "
+                    "would be compared against."),
+                "safety": False,
+            }
+        entry["measured"] = (
+            vocab["neutral_measured"] + " " + _neutral_indicator_sentence(nh)).strip()
+        entry["symptom"] = (
+            vocab["neutral_symptom"] if severity in ("warning", "critical") else
+            "Nothing in particular. This is a check we run on every recording "
+            "rather than something you would have seen.")
+        # Promote above the other findings only when it warrants leading.
+        if severity in ("warning", "critical"):
+            out.insert(0, entry)
+        else:
+            out.append(entry)
 
     # ── Short dips and surges ─────────────────────────────────────────────
     n_sag = counts.get("voltage_sag", 0)
