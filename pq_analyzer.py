@@ -66,6 +66,7 @@ from pq_report import (
     generate_word_report,
 )
 from pq_plots import (
+    plot_overview,
     plot_voltage,
     plot_thd,
     plot_summary,
@@ -350,6 +351,7 @@ def main():
     # ── Plots ─────────────────────────────────────────────────────────────────
     if not args.no_plots:
         log.info("Generating plots …")
+        plot_overview(ds, thresh, outdir=outdir, stem=stem)
         plot_voltage(df, volt_result, thresh, outdir=outdir, stem=stem)
         plot_thd(df, thd_result, thresh, outdir=outdir, stem=stem)
         plot_summary(df, imb_result, outdir=outdir, stem=stem)

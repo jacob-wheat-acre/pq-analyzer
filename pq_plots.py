@@ -84,6 +84,134 @@ def _shade_violations(ax, violation_ts: pd.DatetimeIndex, df_index: pd.DatetimeI
         ax.axvspan(v_start, df_index[-1], color="red", alpha=0.15, linewidth=0)
 
 
+def _gap_spans(index: pd.DatetimeIndex) -> list:
+    """Spans where the meter recorded nothing, as (start, end) pairs.
+
+    A line drawn straight across a gap reads as data that was never measured,
+    which is the opposite of what an overview chart is for.
+    """
+    if len(index) < 3:
+        return []
+    step = pd.Series(index).diff().median()
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        return []
+    limit = step * 2.5
+    gaps = []
+    for prev, nxt in zip(index[:-1], index[1:]):
+        if (nxt - prev) > limit:
+            gaps.append((prev, nxt))
+    return gaps
+
+
+def _break_at_gaps(s: pd.Series, gaps: list) -> pd.Series:
+    """Insert a NaN inside each gap so the line breaks instead of spanning it."""
+    if not gaps:
+        return s
+    breaks = pd.Series(
+        np.nan,
+        index=pd.DatetimeIndex([start + (end - start) / 2 for start, end in gaps],
+                               tz=s.index.tz),
+    )
+    return pd.concat([s, breaks]).sort_index()
+
+
+def plot_overview(
+    ds,
+    thresh: Thresholds,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Voltage and current over the whole recording, as one sanity check.
+
+    This is the chart that answers "did the tool read the file correctly?"
+    before any compliance question is asked: the full period, every phase, the
+    raw measured series with nothing filtered or scaled. Voltage and current are
+    on separate stacked panels sharing one time axis rather than on twin y-axes,
+    because two scales on one frame make the crossings and relative heights an
+    artifact of the scaling choice.
+    """
+    df = ds.df
+    v_cols = [c for c in ["voltage_a", "voltage_b", "voltage_c"] if c in df.columns]
+    i_cols = [c for c in ["current_a", "current_b", "current_c"] if c in df.columns]
+    has_neutral = "current_neutral" in df.columns
+    if not v_cols and not i_cols:
+        log.warning("Overview plot needs voltage or current channels — skipping.")
+        return
+
+    is_split = "voltage_c" not in df.columns and "current_c" not in df.columns
+    if is_split:
+        labels = {"a": "L1", "b": "L2"}
+    else:
+        labels = {"a": "Phase A", "b": "Phase B", "c": "Phase C"}
+
+    panels = [p for p in (("v", v_cols), ("i", i_cols)) if p[1]]
+    gaps = _gap_spans(df.index)
+
+    fig, axes = plt.subplots(
+        len(panels), 1, figsize=(14, 3.2 * len(panels) + 1.0),
+        sharex=True, squeeze=False,
+    )
+    axes = [a[0] for a in axes]
+
+    for ax, (kind, cols) in zip(axes, panels):
+        for col in cols:
+            ph = col[-1]
+            series = _break_at_gaps(df[col].dropna(), gaps)
+            ax.plot(series.index, series.values, color=_PHASE_CLR.get(ph, "gray"),
+                    lw=0.9, label=labels.get(ph, col))
+        if kind == "i" and has_neutral:
+            # Dashed as well as gray: the neutral has to stay identifiable
+            # where the phase hues are the only other cue.
+            series = _break_at_gaps(df["current_neutral"].dropna(), gaps)
+            ax.plot(series.index, series.values, color=_NEUTRAL_CLR, lw=0.9,
+                    ls="--", label="Neutral")
+        if kind == "v":
+            # The allowed band, in gray rather than a status hue: on this chart
+            # the colors carry phase identity, and a red limit line beside an
+            # orange phase trace would read as one more series.
+            vmin = thresh.nominal_voltage * (1 - thresh.volt_tolerance)
+            vmax = thresh.nominal_voltage * (1 + thresh.volt_tolerance)
+            ax.axhspan(vmin, vmax, color="#333333", alpha=0.06, linewidth=0,
+                       zorder=0, label=f"Allowed range ({vmin:.0f}–{vmax:.0f} V)")
+            ax.axhline(thresh.nominal_voltage, color="gray", ls=":", lw=0.8, alpha=0.6)
+            # Keep the band in frame so a flat trace is read against the margin
+            # it has, not against an axis zoomed to its own noise.
+            lo = min([df[c].min() for c in cols] + [vmin])
+            hi = max([df[c].max() for c in cols] + [vmax])
+            pad = max((hi - lo) * 0.05, 1.0)
+            ax.set_ylim(lo - pad, hi + pad)
+            ax.set_ylabel("RMS Voltage (V)")
+            ax.set_title("Recording Overview — measured voltage and current, "
+                         "full period", fontsize=12)
+        else:
+            ax.set_ylabel("RMS Current (A)")
+            ax.set_ylim(bottom=0)
+
+        for start, end in gaps:
+            ax.axvspan(start, end, color=_NEUTRAL_CLR, alpha=0.12, linewidth=0)
+        ax.grid(True, alpha=0.3)
+        if len(ax.get_legend_handles_labels()[0]) > 1:
+            ax.legend(fontsize=8, loc="upper right", ncol=4)
+
+    axes[-1].set_xlabel("Time")
+    _fmt_time_axis(axes[-1], df.index)
+    fig.autofmt_xdate()
+
+    # The caption under the panels is the sanity check itself: what the tool
+    # believes it read, in the same frame as the data it drew.
+    interval = ds.meta.get("interval_minutes", 5)
+    span = f"{df.index[0]:%Y-%m-%d %H:%M} → {df.index[-1]:%Y-%m-%d %H:%M}"
+    subtitle = (f"{span}   ·   {ds.duration_hours:.1f} h "
+                f"({ds.duration_hours / 24:.1f} days)   ·   "
+                f"{len(df):,} intervals of {interval:g} min")
+    if gaps:
+        subtitle += f"   ·   {len(gaps)} recording gap(s), shaded"
+    fig.text(0.5, 0.005, subtitle, ha="center", fontsize=8, color="#444444")
+
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    _save(fig, outdir, stem, "overview.png")
+
+
 def plot_voltage(
     df: pd.DataFrame,
     volt_result: dict,

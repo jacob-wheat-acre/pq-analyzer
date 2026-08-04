@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -135,6 +136,8 @@ def generate_report(
             "interval_minutes": ds.meta.get("interval_minutes", 5),
             "topology":         ds.meta.get("topology", "unknown"),
             "data_quality":     ds.meta.get("data_quality", {}),
+            "channel_map":      ds.meta.get("channel_map", {}),
+            "device_channels":  ds.meta.get("device_channels", 0),
             "has_maxmin":       ds.has_maxmin,
             "has_adaptive":     ds.has_adaptive,
             "catalog":          ds.catalog(),
@@ -1287,6 +1290,36 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
     return bullets[:5]
 
 
+def _word_recording_overview(doc, report, outdir=None, stem="") -> None:
+    """The measured series, whole and unprocessed, before any assessment.
+
+    Everything further down is derived — filtered, averaged, compared against a
+    limit. This section is the raw record those derivations came from, so a
+    reader can confirm the file was read correctly before weighing any
+    conclusion drawn from it.
+    """
+    p = _plot_path(outdir, stem, "overview.png")
+    if p is None or not p.exists():
+        return
+    fs = report["file_summary"]
+    dq = fs.get("data_quality") or {}
+    _section_heading(doc, "Recording Overview", level=1)
+    _body(doc,
+        f"Measured RMS voltage and current over the full recording period, "
+        f"{fs['start_time']} to {fs['end_time']} "
+        f"({fs['duration_hours']:.1f} hours, {fs['sample_count']:,} intervals of "
+        f"{fs.get('interval_minutes', 5):g} minutes). These are the recorded "
+        "series as read from the meter file, with no filtering or scaling "
+        "applied; every finding in this report derives from them. Any span the "
+        "meter did not record is shaded and the trace is broken across it, so a "
+        "gap cannot be mistaken for a flat reading."
+        + ("  This file was incomplete when read — see the data quality note in "
+           "the Appendix." if dq else ""))
+    _embed_plot(doc, outdir, stem, "overview.png",
+                caption="Measured voltage and current over the recording period.")
+    doc.add_paragraph()
+
+
 def _word_exec_summary(doc, report, thresh, df,
                        key_findings: List[str], actions: List[dict]) -> None:
     _section_heading(doc, "Executive Summary and Compliance Status", level=1)
@@ -2405,11 +2438,187 @@ def _word_recommended_actions(doc, actions: List[dict]) -> None:
         doc.add_paragraph()
 
 
+#: Grouping order for the channel appendix: the measured quantities first, then
+#: what is derived from them, so a reader checking the basics is not reading past
+#: forty harmonic orders to find the voltage.
+_CHANNEL_ORDER: Dict[str, int] = {
+    "voltage": 0, "current": 1, "power": 2, "frequency": 3,
+    "thd": 4, "hrms": 5, "flicker": 7, "kfactor": 8,
+}
+
+
+def _channel_sort_key(name: str) -> tuple:
+    """Group, then harmonic order numerically — h11 after h3, not before it."""
+    head = name.split("_")[0]
+    m = re.fullmatch(r"h(\d+)", head)
+    if m:
+        return (6, int(m.group(1)), name)
+    return (_CHANNEL_ORDER.get(head, 99), 0, name)
+
+
+#: Canonical channel name → what it is, for names that carry no phase suffix.
+_CHANNEL_PLAIN: Dict[str, str] = {
+    "frequency":       "System frequency",
+    "power_real":      "Real power, total",
+    "power_reactive":  "Reactive power, total",
+    "power_apparent":  "Apparent power, total",
+    "power_factor":    "Power factor, as reported by the meter",
+    "kfactor_meter":   "Transformer K-factor, as reported by the meter",
+    "voltage_neutral": "RMS voltage, neutral to earth",
+    "current_neutral": "RMS current in the neutral conductor",
+}
+
+#: Ordinal words for harmonic orders, so "3rd" reads as an order and not a count.
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def _phase_word(suffix: str, is_split: bool) -> str:
+    """Name a phase the way the rest of the report names it for this service."""
+    if suffix == "neutral":
+        return "neutral"
+    if is_split:
+        return {"a": "L1", "b": "L2"}.get(suffix, suffix.upper())
+    return f"phase {suffix.upper()}"
+
+
+def _channel_description(name: str, is_split: bool) -> str:
+    """Plain description of one canonical channel.
+
+    Derived from the name rather than tabulated, because the harmonic channels
+    alone run to several dozen and a hand-written table would fall out of date
+    the first time a meter reports an order nobody listed.
+    """
+    base, _, stat = name.rpartition("_")
+    if stat in ("peak", "min") and base:
+        inner = _channel_description(base, is_split)
+        return (f"{inner} — highest value within each interval" if stat == "peak"
+                else f"{inner} — lowest value within each interval")
+
+    if name in _CHANNEL_PLAIN:
+        return _CHANNEL_PLAIN[name]
+
+    m = re.fullmatch(r"h(\d+)_(voltage|current)_(a|b|c|neutral)", name)
+    if m:
+        order, kind, ph = int(m.group(1)), m.group(2), m.group(3)
+        return (f"{_ordinal(order)}-order harmonic {kind}, "
+                f"{_phase_word(ph, is_split)}")
+
+    m = re.fullmatch(r"hrms_(voltage|current)_(a|b|c|neutral)", name)
+    if m:
+        kind, ph = m.group(1), m.group(2)
+        return (f"Total harmonic {kind} (RMS of all orders combined), "
+                f"{_phase_word(ph, is_split)}, as reported by the meter")
+
+    m = re.fullmatch(r"thd_(voltage|current)_(a|b|c|neutral)", name)
+    if m:
+        kind, ph = m.group(1), m.group(2)
+        return (f"Total harmonic distortion of the {kind}, "
+                f"{_phase_word(ph, is_split)}")
+
+    m = re.fullmatch(r"kfactor_current_(a|b|c|neutral)", name)
+    if m:
+        return f"Transformer K-factor from the {_phase_word(m.group(1), is_split)} current"
+
+    m = re.fullmatch(r"flicker_(pst|plt)(?:_(a|b|c))?", name)
+    if m:
+        kind = ("Short-term flicker severity (Pst, 10-minute)" if m.group(1) == "pst"
+                else "Long-term flicker severity (Plt, 2-hour)")
+        return f"{kind}, {_phase_word(m.group(2) or 'a', is_split)}"
+
+    m = re.fullmatch(r"voltage_(ab|bc|ca)", name)
+    if m:
+        p, q = m.group(1)[0], m.group(1)[1]
+        return (f"RMS voltage, line to line "
+                f"({_phase_word(p, is_split)} to {_phase_word(q, is_split)})")
+
+    m = re.fullmatch(r"(voltage|current)_(a|b|c)", name)
+    if m:
+        kind, ph = m.group(1), m.group(2)
+        what = ("RMS voltage, line to neutral" if kind == "voltage" else "RMS current")
+        return f"{what}, {_phase_word(ph, is_split)}"
+
+    return name.replace("_", " ").capitalize()
+
+
+def _word_channel_appendix(doc, report, df) -> None:
+    """Appendix B: every channel read out of the file, and what it holds.
+
+    The channel-to-quantity match is the one step that fails silently: a label
+    matched to the wrong quantity produces a full report of confident numbers
+    about the wrong thing. Listing the match next to the device's own label is
+    what makes that checkable.
+    """
+    fs  = report["file_summary"]
+    cmap = fs.get("channel_map") or {}
+    if not cmap:
+        return
+
+    doc.add_page_break()
+    _section_heading(doc, "Appendix B: Channels Read From the Meter File", level=1)
+
+    is_split  = "voltage_c" not in fs.get("channels", [])
+    intervals = fs.get("sample_count", len(df))
+    unmatched = max((fs.get("device_channels") or 0) - len(cmap), 0)
+    _body(doc,
+        f"{len(cmap):,} channels were read from the meter file and matched to the "
+        "quantities below; every number in this report derives from these and "
+        "nothing else."
+        + (f" A further {unmatched:,} channel(s) found in the file were not "
+           "matched to a quantity and were not read."
+           if unmatched else
+           " Every channel found in the file was matched, so none was dropped.")
+        + " The device name is the label the meter itself gave the channel, so "
+          "each row can be checked against the meter's own channel list. "
+          "\"Intervals with data\" is how many of the "
+          f"{intervals:,} recording intervals carried a value — a channel that "
+          "matched but arrived empty shows here as 0.")
+
+    # Within-interval max/min ride with the channel they qualify, so the table
+    # stays one row per measured quantity rather than three.
+    extras: Dict[str, List[str]] = {}
+    for col in df.columns:
+        base, _, stat = col.rpartition("_")
+        if stat in ("peak", "min") and base in cmap:
+            extras.setdefault(base, []).append("max" if stat == "peak" else "min")
+
+    rows = sorted(cmap.items(), key=lambda kv: _channel_sort_key(kv[0]))
+
+    table = doc.add_table(rows=1, cols=5)
+    table.style = "Table Grid"
+    _set_col_widths(table, [3.6, 6.2, 1.4, 3.2, 2.2])
+    for i, head in enumerate(("Channel", "What it is", "Unit",
+                              "Device name in file", "Intervals with data")):
+        cell = table.rows[0].cells[i]
+        _cell_shade(cell, "E8F1FA")
+        r = cell.paragraphs[0].add_run(head)
+        r.bold = True
+        r.font.size = Pt(9)
+
+    for name, info in rows:
+        cells = table.add_row().cells
+        extra = extras.get(name)
+        label = f"{name}  (+ {', '.join(sorted(extra))})" if extra else name
+        n_valid = int(df[name].notna().sum()) if name in df.columns else 0
+        for cell, text in zip(cells, (
+            label,
+            _channel_description(name, is_split),
+            info.get("unit") or "—",
+            info.get("device") or "—",
+            f"{n_valid:,}",
+        )):
+            r = cell.paragraphs[0].add_run(text)
+            r.font.size = Pt(8)
+    doc.add_paragraph()
+
+
 def _word_appendix(doc, report, thresh, df) -> None:
-    """Appendix: Standards, Methods, and Limitations — methodology disclosures
+    """Appendix A: Standards, Methods, and Limitations — methodology disclosures
     moved out of the main body."""
     doc.add_page_break()
-    _section_heading(doc, "Appendix: Standards, Methods, and Limitations", level=1)
+    _section_heading(doc, "Appendix A: Standards, Methods, and Limitations", level=1)
     _body(doc,
         "The notes below describe the measurement basis, statistical methods, and "
         "known limitations behind the findings in this report.")
@@ -2614,6 +2823,8 @@ def generate_word_report(
     )
     doc.add_paragraph()
 
+    _word_recording_overview(doc, report, outdir, stem)
+
     _add_toc(doc)
 
     key_findings = _collect_key_findings(report, thresh, df)
@@ -2632,6 +2843,7 @@ def generate_word_report(
     _word_signoff(doc, engineer_name, engineer_title, engineer_phone, engineer_email,
                   engineer_contact)
     _word_appendix(doc, report, thresh, df)
+    _word_channel_appendix(doc, report, df)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     outdir.mkdir(parents=True, exist_ok=True)
@@ -2718,6 +2930,30 @@ def _event_counts(event_result: dict) -> Dict[str, int]:
 #: reader can act on distortion and transformer loading and writing down to them
 #: costs credibility.
 _LETTER_CLASSES = {"r": "your home", "c": "your business"}
+
+
+def _discard_stale_letter(path: Path, reason: str) -> None:
+    """Delete a letter left behind by an earlier run of the same file.
+
+    Nothing on the letter itself says which run produced it, so one that
+    survives a run that could not rewrite it sits in the output folder beside a
+    fresh report and fresh plots, describing a different recording — a letter
+    stating a two-hour recording next to a plot spanning a week. Removing it is
+    the only way the folder can be trusted, so failing to remove it has to stop
+    the run rather than pass quietly.
+    """
+    if not path.exists():
+        return
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise PermissionError(
+            f"Could not replace {path.name} -- it's likely still open in Word or "
+            "another program. Close that document and run the analysis again. "
+            "Until then the letter in the output folder is from an earlier run "
+            "and does not describe this recording."
+        ) from exc
+    log.info("Removed the previous customer letter at %s (%s).", path, reason)
 
 
 def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
@@ -3092,15 +3328,24 @@ def generate_customer_letter(
     a small business is billed for power factor and can usually trace waveform
     distortion to specific equipment, where a homeowner can do neither.
     """
+    path = Path(outdir) / f"{stem}_customer_letter.docx"
     if not _DOCX_AVAILABLE:
         log.warning("python-docx not installed — skipping customer letter.")
+        _discard_stale_letter(path, "python-docx is not installed")
         return None
     if thresh.customer_class not in _LETTER_CLASSES:
         log.info(
             "No plain-language letter for service class %r: at that scale the "
             "engineering report is the customer document, with its terms defined "
             "in place.", thresh.customer_class)
+        _discard_stale_letter(path, f"service class {thresh.customer_class!r} "
+                                    "gets the engineering report instead")
         return None
+
+    # Clear the previous letter before doing the work, not after: if this run
+    # cannot write one, the folder must not still hold a letter describing a
+    # different recording. Failing here also fails before the expensive part.
+    _discard_stale_letter(path, "it is being replaced by this run")
 
     import datetime
     fs = report["file_summary"]
@@ -3147,6 +3392,24 @@ def generate_customer_letter(
         "the voltage and current many times a second and stored a summary every "
         "few minutes. This letter explains what those measurements show, in plain "
         "terms.")
+
+    # ── What we recorded ──────────────────────────────────────────────────
+    # The whole recording on one page, before any finding is described. A
+    # customer who has been told their supply was measured for a week should be
+    # able to see that week.
+    overview_img = _plot_path(outdir, stem, "overview.png")
+    if overview_img is not None and overview_img.exists():
+        _section_heading(doc, "What we recorded", level=1)
+        _body(doc,
+            "The chart below is everything the meter recorded, from the first "
+            "reading to the last. The upper half is the voltage supplied to "
+            f"{vocab['site']}; the lower half is the current, which is how much "
+            "electricity was being used at the time. You do not need to read "
+            "anything into the detail — it is here so you can see the whole "
+            "period the findings below are drawn from.")
+        _embed_plot(doc, outdir, stem, "overview.png",
+                    caption="Voltage and current recorded at your service.")
+        doc.add_paragraph()
 
     # ── What we found ─────────────────────────────────────────────────────
     _section_heading(doc, "What we found", level=1)
@@ -3258,12 +3521,14 @@ def generate_customer_letter(
     d = doc.add_paragraph()
     _normal(d, str(datetime.date.today()), size_pt=10)
 
-    path = Path(outdir) / f"{stem}_customer_letter.docx"
+    Path(outdir).mkdir(parents=True, exist_ok=True)
     try:
         doc.save(str(path))
-    except PermissionError:
-        log.error("Cannot write %s — it is open in Word. Close it and re-run.", path)
-        return None
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Could not write {path.name} -- it's likely still open in Word or "
+            "another program. Close that document and run the analysis again."
+        ) from exc
     log.info("Customer letter saved → %s  (%d condition(s) reported)",
              path, len(conditions))
     return path

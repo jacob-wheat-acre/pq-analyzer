@@ -78,6 +78,7 @@ try:
         generate_report,
         export_results,
         generate_word_report,
+        plot_overview,
         plot_voltage,
         plot_thd,
         plot_summary,
@@ -97,6 +98,7 @@ try:
         kfactor_by_phase,
         generate_customer_letter,
     )
+    from pq_report import _LETTER_CLASSES
     _BOOK_AVAILABLE = True
 except Exception as _import_exc:
     import traceback
@@ -104,6 +106,7 @@ except Exception as _import_exc:
     _log_path.write_text(traceback.format_exc())
     _BLUE_BOOK_ISC = {}
     _SERVICE_TYPE_LABEL = {}
+    _LETTER_CLASSES = {}
     _BOOK_AVAILABLE = False
 
 # Display labels for the type picker (ordered for the dropdown)
@@ -124,17 +127,13 @@ _PRIMARY_LABEL  = "Primary metered"
 def _resolve_secondary_v(svc_type: str, nominal_v: float) -> int:
     """Convert nominal L-N voltage to the secondary (L-L) voltage used as a Blue Book key.
 
-    Single-phase services with 120 V L-N use 240 V L-L as their secondary voltage
-    (120/240 V split-phase).  If the Blue Book has no 120 V entries for the given
-    service type, fall back to 240 V automatically.
+    Thin wrapper over the shared resolver so the label and the analysis run read
+    the same Blue Book row.
     """
     try:
-        sv = _infer_secondary_v(svc_type, nominal_v)
+        return _infer_secondary_v(svc_type, nominal_v)
     except Exception:
         return 240
-    if sv == 120 and not any(k[0] == svc_type and k[2] == 120 for k in _BLUE_BOOK_ISC):
-        return 240
-    return sv
 
 
 def _kva_options(svc_type: str, nominal_v: float) -> list:
@@ -590,7 +589,8 @@ class PQApp(tk.Tk):
         if not sizes:
             self._kva_combo.config(state="disabled", values=[])
             self._kva_var.set("")
-            self._isc_auto_var.set("No Blue Book entries for this type/voltage combination")
+            self._isc_auto_var.set("No Blue Book entries for this type/voltage "
+                                   "combination — use Override below")
             self._isc_auto_lbl.config(fg=_ISC_NONE)
             return
 
@@ -815,6 +815,7 @@ class PQApp(tk.Tk):
         export_results(ds, report, outdir, stem=stem)
 
         # ── Plots ─────────────────────────────────────────────────────────────
+        plot_overview(ds, thresh, outdir=outdir, stem=stem)
         plot_voltage(df, volt_result, thresh, outdir=outdir, stem=stem)
         plot_thd(df, thd_result, thresh, outdir=outdir, stem=stem)
         plot_summary(df, imb_result, outdir=outdir, stem=stem)
@@ -861,10 +862,18 @@ class PQApp(tk.Tk):
         if letter:
             self._log_write(
                 "\nCustomer letter written alongside the engineering report.\n")
-        else:
+        elif params["cclass_key"] not in _LETTER_CLASSES:
             self._log_write(
-                "\nNo customer letter: the plain-language version is residential-only "
-                "so far.\n")
+                "\nNo customer letter: the plain-language version is residential "
+                "and small commercial only. This class gets the engineering "
+                "report.\n")
+        else:
+            # Anything else means the letter could not be produced. Saying
+            # "residential-only" here would send the reader to whatever letter
+            # is in the folder, which is then from an earlier run.
+            self._log_write(
+                "\nCustomer letter was NOT written — see the error above.\n",
+                tag="error")
 
         self._log_write("\nDone.  Word report and plots saved to pq_output/\n", tag="done")
         self._open_report(stem)

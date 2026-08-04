@@ -2759,6 +2759,8 @@ def extract_dataset(
         "data_quality":     getattr(adapter, "data_quality", {}) or {},
         "start_time":       df.index[0].isoformat() if len(df) else None,
         "end_time":         df.index[-1].isoformat() if len(df) else None,
+        "channel_map":      df.attrs.get("channel_map", {}),
+        "device_channels":  df.attrs.get("device_channel_count", 0),
     }
 
     ds = PQDataset(df=df, adaptive_df=adaptive_df, meta=meta,
@@ -2833,6 +2835,15 @@ def extract_dataframe(
     df = pd.DataFrame(columns, index=pd.DatetimeIndex(ts_concat, tz="UTC"))
     df.sort_index(inplace=True)
     df = df[~df.index.duplicated(keep="first")]
+
+    # Keep what each column was called in the file. Without it a reader has no
+    # way to check the tool matched the right device channel to the right
+    # engineering quantity -- the one mapping that, if wrong, is wrong silently.
+    df.attrs["channel_map"] = {
+        name: {"device": info.label, "unit": info.unit, "index": info.index}
+        for name, info in resolved.items() if name in df.columns
+    }
+    df.attrs["device_channel_count"] = len(raw_channels)
 
     if resample:
         log.info("Resampling to %s …", resample)

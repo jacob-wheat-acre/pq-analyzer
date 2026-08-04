@@ -1266,6 +1266,86 @@ class TestFundamentalCurrent:
         assert (out == 0.0).all() and out.notna().all()
 
 
+class TestBlueBookISCLookup:
+    """Every ISC the GUI offers must also resolve when the analysis runs."""
+
+    # The nominal voltages the GUI offers.
+    NOMINALS = (120.0, 208.0, 240.0, 277.0, 480.0)
+
+    def test_single_phase_padmount_at_120_v_resolves(self):
+        # 120 V L-N is one leg of a 120/240 V split-phase secondary, and the
+        # pad-mount tables are keyed at 240 V only. The GUI showed 29,600 A while
+        # the run resolved nothing, so the report said ISC was never provided.
+        from pq_constants import _lookup_isc
+        result = _lookup_isc("1ph-padmount", 100, 120.0)
+        assert result is not None
+        isc, note = result
+        assert isc == 29_600
+        assert "240V secondary" in note
+
+    def test_every_size_the_gui_lists_resolves(self):
+        from pq_constants import _BLUE_BOOK_ISC, _lookup_isc, _infer_secondary_v
+        for svc_type in {k[0] for k in _BLUE_BOOK_ISC}:
+            for nominal in self.NOMINALS:
+                sec_v = _infer_secondary_v(svc_type, nominal)
+                offered = [k[1] for k in _BLUE_BOOK_ISC
+                           if k[0] == svc_type and k[2] == sec_v]
+                for kva in offered:
+                    result = _lookup_isc(svc_type, kva, nominal)
+                    assert result is not None, (svc_type, kva, nominal)
+                    assert result[0] == _BLUE_BOOK_ISC[(svc_type, kva, sec_v)]
+
+    def test_the_secondary_is_never_a_voltage_the_table_lacks(self):
+        # Resolving to a voltage with no rows is what made the lookup fail: the
+        # exact key misses and the nearest-kVA fallback is filtered to the same
+        # empty set, so the whole lookup returns None.
+        from pq_constants import _BLUE_BOOK_ISC, _infer_secondary_v
+        for svc_type in {k[0] for k in _BLUE_BOOK_ISC}:
+            available = {k[2] for k in _BLUE_BOOK_ISC if k[0] == svc_type}
+            for nominal in self.NOMINALS:
+                sec_v = _infer_secondary_v(svc_type, nominal)
+                if svc_type == "3ph-overhead-wye" and nominal == 240.0:
+                    # A 240 V wye bank is not a configuration PSCo builds; the
+                    # GUI says so and falls back to the manual ISC override.
+                    continue
+                assert sec_v in available, (svc_type, nominal, sec_v)
+
+    @pytest.mark.parametrize("svc_type,nominal,expected", [
+        # A 240 V pick is already the secondary line voltage — reading it as a
+        # line-to-neutral value and scaling by √3 landed on the 480 V rows and
+        # halved the ISC.
+        ("3ph-open-delta",   240.0, 240),
+        ("3ph-closed-delta", 240.0, 240),
+        ("3ph-padmount",     240.0, 240),
+        ("3ph-padmount",     208.0, 208),
+        ("3ph-overhead-wye", 208.0, 208),
+        # 120 V and 277 V are the line-to-neutral readings of a wye secondary.
+        ("3ph-padmount",     120.0, 208),
+        ("3ph-overhead-wye", 120.0, 208),
+        ("3ph-overhead-wye", 277.0, 480),
+        ("3ph-padmount",     480.0, 480),
+        # A delta bank has no neutral: a 120 V pick is the center-tapped leg of
+        # a 120/240 V secondary.
+        ("3ph-open-delta",   120.0, 240),
+        ("3ph-closed-delta", 120.0, 240),
+        # Single-phase: 120 V rows where the table has them, 240 V otherwise.
+        ("1ph-overhead",     120.0, 120),
+        ("1ph-overhead",     240.0, 240),
+        ("1ph-padmount",     120.0, 240),
+        ("1ph-padmount",     240.0, 240),
+    ])
+    def test_secondary_voltage_for_each_service(self, svc_type, nominal, expected):
+        from pq_constants import _infer_secondary_v
+        assert _infer_secondary_v(svc_type, nominal) == expected
+
+    def test_a_240_v_delta_reads_the_240_v_rows(self):
+        from pq_constants import _lookup_isc
+        isc_240, note = _lookup_isc("3ph-closed-delta", 150, 240.0)
+        isc_480, _    = _lookup_isc("3ph-closed-delta", 150, 480.0)
+        assert "240V secondary" in note
+        assert isc_240 == pytest.approx(2 * isc_480, rel=0.01)
+
+
 class TestTDDDefinition:
     def _thresh(self):
         return Thresholds(nominal_voltage=120.0, isc_amps=10000.0)
@@ -1472,6 +1552,231 @@ class TestHarmonicSignificanceGate:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
+class TestChannelAppendix:
+    """Appendix B: what was read out of the file, and what each channel holds."""
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def doc(tmp_path_factory):
+        import docx
+        import pq_analysis as An
+        from pq_report import generate_report, generate_word_report
+        out = tmp_path_factory.mktemp("chan")
+        ds = extract_dataset(
+            ProntoAdapter(Path("test_data/test_residential.pqd")), ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        path = generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", engineer_contact="", outdir=out, stem="ch")
+        return docx.Document(str(path))
+
+    @staticmethod
+    def _table(doc):
+        return next(t for t in doc.tables if t.rows[0].cells[0].text == "Channel")
+
+    def test_both_appendices_are_lettered_and_ordered(self, doc):
+        heads = [p.text for p in doc.paragraphs if p.text.startswith("Appendix")]
+        assert heads == ["Appendix A: Standards, Methods, and Limitations",
+                         "Appendix B: Channels Read From the Meter File"]
+
+    def test_every_channel_read_is_listed(self, doc):
+        ds = extract_dataset(
+            ProntoAdapter(Path("test_data/test_residential.pqd")), ChannelMapper())
+        listed = {r.cells[0].text.split()[0] for r in list(self._table(doc).rows)[1:]}
+        assert listed == set(ds.meta["channel_map"])
+
+    def test_each_row_names_the_device_channel_it_came_from(self, doc):
+        # The match from device label to engineering quantity is the step that
+        # fails silently, so the label has to be on the page to check it.
+        rows = {r.cells[0].text.split()[0]: [c.text for c in r.cells]
+                for r in list(self._table(doc).rows)[1:]}
+        assert rows["voltage_a"][1].startswith("RMS voltage, line to neutral")
+        assert rows["voltage_a"][2] == "V"
+        assert rows["voltage_a"][3] == "Van RMS"
+        assert rows["current_neutral"][3] == "In RMS"
+
+    def test_within_interval_extremes_ride_with_their_channel(self, doc):
+        labels = [r.cells[0].text for r in list(self._table(doc).rows)[1:]]
+        assert any(l.startswith("voltage_a  (+ ") and "max" in l and "min" in l
+                   for l in labels)
+        assert not any(l.startswith("voltage_a_peak") for l in labels)
+
+    def test_coverage_counts_are_reported(self, doc):
+        rows = {r.cells[0].text.split()[0]: [c.text for c in r.cells]
+                for r in list(self._table(doc).rows)[1:]}
+        assert rows["voltage_a"][4] == "288"
+
+    def test_split_phase_uses_the_service_own_phase_names(self, doc):
+        text = " ".join(c.text for r in self._table(doc).rows for c in r.cells)
+        assert "L1" in text and "L2" in text
+        assert "phase A" not in text
+
+    @pytest.mark.parametrize("name,expected", [
+        ("h3_current_a",       "3rd-order harmonic current, phase A"),
+        ("h11_voltage_b",      "11th-order harmonic voltage, phase B"),
+        ("h21_current_c",      "21st-order harmonic current, phase C"),
+        ("h13_current_neutral", "13th-order harmonic current, neutral"),
+        ("thd_voltage_a",      "Total harmonic distortion of the voltage, phase A"),
+        ("flicker_plt",        "Long-term flicker severity (Plt, 2-hour), phase A"),
+        ("voltage_ab",         "RMS voltage, line to line (phase A to phase B)"),
+        ("current_neutral",    "RMS current in the neutral conductor"),
+        ("frequency",          "System frequency"),
+    ])
+    def test_descriptions_are_derived_from_the_name(self, name, expected):
+        from pq_report import _channel_description
+        assert _channel_description(name, is_split=False) == expected
+
+    def test_within_interval_extremes_describe_their_base_channel(self):
+        from pq_report import _channel_description
+        assert _channel_description("voltage_a_peak", is_split=True) == (
+            "RMS voltage, line to neutral, L1 — highest value within each interval")
+        assert _channel_description("current_b_min", is_split=True) == (
+            "RMS current, L2 — lowest value within each interval")
+
+    def test_an_order_nobody_tabulated_still_gets_a_description(self):
+        # Meters report orders well past the ones the limits cover; a hand-kept
+        # table would leave those rows blank.
+        from pq_report import _channel_description
+        assert _channel_description("h49_current_a", is_split=False) == (
+            "49th-order harmonic current, phase A")
+
+
+class TestRecordingOverview:
+    """The sanity-check chart: the whole recording, before any assessment."""
+
+    def _frame(self, n=576, gap_at=None, cols=("voltage_a", "voltage_b",
+                                               "current_a", "current_b",
+                                               "current_neutral")):
+        import pandas as pd
+        rng = np.random.default_rng(5)
+        idx = pd.date_range("2026-05-02", periods=n, freq="5min", tz="UTC")
+        if gap_at is not None:
+            idx = idx.delete(range(gap_at, gap_at + 60))
+        base = {"voltage_a": 121.0, "voltage_b": 120.0, "voltage_c": 120.5,
+                "current_a": 12.0, "current_b": 9.0, "current_c": 10.0,
+                "current_neutral": 3.0}
+        return pd.DataFrame(
+            {c: np.abs(base[c] + rng.normal(0, 0.5, len(idx))) for c in cols},
+            index=idx)
+
+    def _ds(self, df):
+        from pq_adapter import PQDataset
+        return PQDataset(df=df, adaptive_df=None,
+                         meta={"interval_minutes": 5, "topology": "split-phase"})
+
+    def test_chart_is_written(self, tmp_path):
+        from pq_plots import plot_overview
+        plot_overview(self._ds(self._frame()), Thresholds(nominal_voltage=120.0),
+                      outdir=tmp_path, stem="s")
+        assert (tmp_path / "s_overview.png").exists()
+
+    def test_a_recording_gap_breaks_the_trace(self):
+        # A line drawn straight across five hours the meter never recorded is
+        # indistinguishable from five hours of steady service.
+        from pq_plots import _gap_spans, _break_at_gaps
+        df = self._frame(gap_at=200)
+        gaps = _gap_spans(df.index)
+        assert len(gaps) == 1
+        start, end = gaps[0]
+        assert (end - start).total_seconds() / 3600 == pytest.approx(5.08, abs=0.1)
+        broken = _break_at_gaps(df["voltage_a"], gaps)
+        assert broken.isna().sum() == 1
+        assert start < broken[broken.isna()].index[0] < end
+
+    def test_an_unbroken_recording_has_no_gaps(self):
+        from pq_plots import _gap_spans
+        assert _gap_spans(self._frame().index) == []
+
+    def test_voltage_only_file_still_charts(self, tmp_path):
+        from pq_plots import plot_overview
+        plot_overview(self._ds(self._frame(cols=("voltage_a", "voltage_b"))),
+                      Thresholds(nominal_voltage=120.0), outdir=tmp_path, stem="v")
+        assert (tmp_path / "v_overview.png").exists()
+
+    def test_nothing_to_chart_writes_nothing(self, tmp_path):
+        import pandas as pd
+        from pq_plots import plot_overview
+        df = self._frame()[[]].assign(frequency=60.0)
+        plot_overview(self._ds(df), Thresholds(nominal_voltage=120.0),
+                      outdir=tmp_path, stem="n")
+        assert not (tmp_path / "n_overview.png").exists()
+
+    def test_both_documents_open_with_the_chart(self, tmp_path):
+        # It is the first thing in the report and it is in the letter, so a
+        # reader of either can check the period before reading a conclusion.
+        import docx
+        import pq_analysis as An
+        from pq_plots import plot_overview
+        from pq_report import (generate_report, generate_word_report,
+                               generate_customer_letter)
+        ds = extract_dataset(ProntoAdapter(Path("test_data/test_residential.pqd")),
+                             ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        plot_overview(ds, th, outdir=tmp_path, stem="ov")
+
+        rpt = docx.Document(str(generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", engineer_contact="", outdir=tmp_path, stem="ov")))
+        heads = [p.text for p in rpt.paragraphs if p.text.strip()]
+        assert "Recording Overview" in heads
+        assert heads.index("Recording Overview") < heads.index(
+            "Executive Summary and Compliance Status")
+
+        letter = docx.Document(str(generate_customer_letter(
+            rep, th, "1 Test St", "Eng", tmp_path, "ov")))
+        assert "What we recorded" in [p.text for p in letter.paragraphs]
+        assert len(letter.inline_shapes) == 1
+
+    def test_the_chart_states_the_period_it_drew(self, tmp_path):
+        # The chart and the "Length of recording" line in the letter come from
+        # the same index; the caption is what makes a mismatch visible.
+        from pq_plots import plot_overview
+        import matplotlib.pyplot as plt
+        df = self._frame()
+        captured = {}
+        orig = plt.Figure.text
+
+        def _capture(self, x, y, s, *a, **k):
+            captured.setdefault("sub", s)
+            return orig(self, x, y, s, *a, **k)
+        plt.Figure.text = _capture
+        try:
+            plot_overview(self._ds(df), Thresholds(nominal_voltage=120.0),
+                          outdir=tmp_path, stem="c")
+        finally:
+            plt.Figure.text = orig
+        assert "2026-05-02 00:00" in captured["sub"]
+        assert f"{len(df):,} intervals of 5 min" in captured["sub"]
+
+
 class TestCustomerLetter:
     """The second, customer-facing document.
 
@@ -1508,6 +1813,42 @@ class TestCustomerLetter:
         out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
         assert out is not None and out.exists()
         assert out.name.endswith("_customer_letter.docx")
+
+    def test_a_letter_from_an_earlier_run_never_survives(self, tmp_path):
+        # A letter that outlives the run that wrote it sits beside a fresh
+        # report describing a different recording, and says nothing about which
+        # run produced it.
+        from pq_report import generate_customer_letter
+        stale = tmp_path / "t_customer_letter.docx"
+        stale.write_bytes(b"letter from a two-hour download")
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        assert out == stale and stale.read_bytes() != b"letter from a two-hour download"
+
+    def test_a_class_that_gets_no_letter_clears_the_previous_one(self, tmp_path):
+        from pq_report import generate_customer_letter
+        stale = tmp_path / "t_customer_letter.docx"
+        stale.write_bytes(b"letter from when this was billed residential")
+        rep, th = self._report(Path("test_data/test_residential.pqd"),
+                               customer_class="sg")
+        assert generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t") is None
+        assert not stale.exists()
+
+    def test_a_letter_that_cannot_be_replaced_stops_the_run(self, tmp_path, monkeypatch):
+        # Word holds the file open on Windows, so the unlink is what fails. The
+        # run has to stop there rather than leave the old letter in place.
+        from pathlib import Path as _P
+        import pq_report
+        stale = tmp_path / "t_customer_letter.docx"
+        stale.write_bytes(b"open in Word")
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+
+        def _locked(self):
+            raise PermissionError(32, "The process cannot access the file")
+        monkeypatch.setattr(_P, "unlink", _locked)
+        with pytest.raises(PermissionError, match="open in Word"):
+            pq_report.generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        assert stale.read_bytes() == b"open in Word"
 
     def test_written_for_small_commercial(self, tmp_path):
         from pq_report import generate_customer_letter

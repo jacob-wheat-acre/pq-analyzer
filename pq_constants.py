@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 
 @dataclass
@@ -491,20 +491,41 @@ _SERVICE_TYPE_LABEL: Dict[str, str] = {
 }
 
 
-def _infer_secondary_v(service_type: str, nominal_v: float) -> int:
-    """Convert L-N nominal voltage to the line-to-line secondary voltage used as table key."""
+# Nominal voltage as entered → the secondary line voltages that could key it,
+# best first. Only 120 and 277 are line-to-neutral readings of a wye secondary
+# (208Y/120, 480Y/277); 208, 240 and 480 are already the secondary line voltage,
+# since no PSCo distribution secondary is √3 above them. A 120 V pick on a delta
+# bank is the center-tapped leg of a 120/240 V secondary, hence the 240 fallback.
+_THREE_PHASE_SECONDARY: Dict[int, Tuple[int, ...]] = {
+    120: (208, 240),
+    208: (208, 240),
+    240: (240,),
+    277: (480,),
+    480: (480,),
+}
+
+
+def _secondary_candidates(service_type: str, nominal_v: float) -> Tuple[int, ...]:
+    """Secondary line voltages that could key this service, best match first."""
     if service_type.startswith("1ph"):
-        # Single-phase: nominal is L-N or full service voltage
-        return 120 if nominal_v <= 120 else 240
-    else:
-        # Three-phase: nominal is L-N; derive L-L and snap to standard
-        ll = nominal_v * 3 ** 0.5
-        if ll < 220:
-            return 208
-        elif ll < 400:
-            return 240
-        else:
-            return 480
+        # A 120 V L-N service is one leg of a 120/240 V split-phase secondary.
+        return (120, 240) if nominal_v <= 150 else (240,)
+    nearest = min(_THREE_PHASE_SECONDARY, key=lambda v: abs(v - nominal_v))
+    return _THREE_PHASE_SECONDARY[nearest]
+
+
+def _infer_secondary_v(service_type: str, nominal_v: float) -> int:
+    """Convert the entered nominal voltage to the secondary voltage used as table key.
+
+    Returns the first candidate the Blue Book actually carries rows for, so the
+    kVA list, the ISC label and the analysis run all read the same table entry.
+    """
+    available = {k[2] for k in _BLUE_BOOK_ISC if k[0] == service_type}
+    candidates = _secondary_candidates(service_type, nominal_v)
+    for cand in candidates:
+        if cand in available:
+            return cand
+    return candidates[0]
 
 
 def _lookup_isc(service_type: str, kva: float, nominal_v: float) -> Optional[Tuple[int, str]]:
