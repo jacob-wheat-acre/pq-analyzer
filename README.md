@@ -9,159 +9,77 @@ findings, harmonic diagnostics, and root cause analysis.
 ## Requirements
 
 - Python 3.9 or later
+- Git
 - Dependencies listed in `pq_analyzer_requirements.txt`
 
 ---
 
-## Windows — First-Time Setup
+## First-Time Setup
 
-### 1. Install Python
+**New to this, or setting up a new PC? Follow
+[GIT_GUIDE.md](GIT_GUIDE.md).**  It's the full walkthrough — requesting
+Python through Xcel's software request system, installing Git, getting the
+code, and keeping it updated — written for people who have never used the
+command line.
 
-Download from [python.org](https://www.python.org/downloads/windows/) and run
-the installer.  On the first screen, check **"Add Python to PATH"** before
-clicking Install Now.
+The short version, once Python and Git are installed:
 
-Verify in a Command Prompt:
-
-```
-python --version
-```
-
-### 2. Copy the pq-analyzer folder to the PC
-
-Copy the entire `pq-analyzer` folder to a location you can find, such as your
-Documents folder or the Desktop.
-
-### 3. Install dependencies
-
-Open a Command Prompt **in the pq-analyzer folder** (Shift+right-click the
-folder → "Open PowerShell window here", or use `cd` to navigate), then run:
+### Windows
 
 ```
+cd %USERPROFILE%\Documents
+git clone https://github.com/jacob-wheat-acre/pq-analyzer.git
+cd pq-analyzer
 pip install -r pq_analyzer_requirements.txt
 ```
 
-This installs pandas, numpy, matplotlib, python-docx, and Pillow.  You only
-need to do this once.
+Then double-click `install_shortcut.bat` once to get a **PQ Analyzer**
+Desktop shortcut.  Launch from that shortcut, or from `PQ Analyzer.bat` in
+the folder.  The GUI opens with no console window.
 
-### 4. Create a Desktop shortcut (optional)
+> Don't have Python? On an Xcel-managed PC it must be requested through
+> **Xcel Software Center** (link on the intranet homepage) — the python.org
+> installer is blocked.  See
+> [GIT_GUIDE.md § 1](GIT_GUIDE.md#1-install-python).
 
-Double-click `install_shortcut.bat` inside the pq-analyzer folder.  This
-creates a **PQ Analyzer** shortcut on your Desktop.
+> Already have a copy of the folder that didn't come from `git clone`?
+> Convert it once — see [GIT_GUIDE.md
+> § 4](GIT_GUIDE.md#4-get-the-code-git-clone).
 
-### 5. Launch the tool
-
-Double-click **PQ Analyzer** on the Desktop, or double-click `PQ Analyzer.bat`
-inside the folder.
-
-The GUI opens with no console window.  If Python is not found, a message
-appears in the Command Prompt window pointing you back to step 1.
-
----
-
-## Mac — First-Time Setup
-
-### 1. Install Python
-
-Download from [python.org](https://www.python.org/downloads/mac-osx/) or
-install via Homebrew:
+### Mac
 
 ```
-brew install python
-```
-
-Verify in Terminal:
-
-```
-python3 --version
-```
-
-### 2. Install dependencies
-
-Open Terminal, navigate to the pq-analyzer folder, and run:
-
-```
+cd ~/Documents
+git clone https://github.com/jacob-wheat-acre/pq-analyzer.git
+cd pq-analyzer
 pip3 install -r pq_analyzer_requirements.txt
-```
-
-### 3. Launch the tool
-
-Double-click `run.py`, or from Terminal:
-
-```
 python3 run.py
 ```
 
 To find the file path to a `.pqd` file: drag the file from Finder into the
-Terminal window — the full path appears.  Alternatively, use Option+right-click
-on the file in Finder and choose **Copy as Pathname**.
+Terminal window — the full path appears.  Alternatively, Option+right-click
+the file in Finder and choose **Copy as Pathname**.
 
 ---
 
 ## Keeping the Tool Updated
 
-Fixes ship regularly, especially for new meter file variants. Update your
-copy periodically — and any time you're asked to retry after reporting an
-error. The easiest way is `git pull`, which only downloads what changed
-instead of a fresh copy of everything.
+Fixes ship regularly, especially for new meter file variants.  Update
+periodically — and any time you're asked to retry after reporting an error.
 
-### Windows
+From inside the `pq-analyzer` folder:
 
-**One-time: install Git.**
-Download and install [Git for Windows](https://git-scm.com/download/win)
-(the default options are fine).
-
-**One-time: switch your existing folder to git.**
-If your `pq-analyzer` folder came from a ZIP download (not `git clone`),
-convert it once so future updates are a single command:
-1. Rename or delete your current `pq-analyzer` folder.
-2. Open Command Prompt, `cd` to where you want the folder (e.g. `cd
-   Documents`), then run:
-   ```
-   git clone https://github.com/jacob-wheat-acre/pq-analyzer.git
-   ```
-3. Re-run `install_shortcut.bat` if you use the Desktop shortcut, so it
-   points at the new folder.
-
-**From then on, to update:**
-Shift+right-click inside the `pq-analyzer` folder → "Open PowerShell window
-here" (or `cd` there in Command Prompt), then run:
 ```
 git pull
+pip install -r pq_analyzer_requirements.txt      # pip3 on Mac
 ```
 
-### Mac
+`git pull` downloads only what changed.  Your generated reports are safe:
+everything in `pq_output/` is excluded from git and is never touched by an
+update.
 
-**One-time: install Git.**
-Git ships with the Xcode Command Line Tools. If `git` isn't already
-installed, Terminal will prompt you to install it the first time you run a
-git command, or you can trigger it directly:
-```
-xcode-select --install
-```
-
-**One-time: switch your existing folder to git.**
-If your `pq-analyzer` folder came from a ZIP download (not `git clone`),
-convert it once so future updates are a single command:
-1. Rename or delete your current `pq-analyzer` folder.
-2. In Terminal, navigate to where you want the folder, then run:
-   ```
-   git clone https://github.com/jacob-wheat-acre/pq-analyzer.git
-   ```
-
-**From then on, to update:**
-Open Terminal in the `pq-analyzer` folder and run:
-```
-git pull
-```
-
-### After any update
-
-Dependencies occasionally change. After pulling, re-run:
-```
-pip install -r pq_analyzer_requirements.txt      # Windows
-pip3 install -r pq_analyzer_requirements.txt     # Mac
-```
+If `git pull` reports an error, see [GIT_GUIDE.md
+§ 7](GIT_GUIDE.md#7-when-git-pull-complains).
 
 ---
 
@@ -205,8 +123,19 @@ pq-analyzer directory.
 ## Troubleshooting
 
 **"Python was not found" on Windows**
-Reinstall Python from python.org and make sure "Add to PATH" is checked.
-Then close and reopen any Command Prompt windows.
+Python is installed but Windows can't find it.  Try `py --version` — the `py`
+launcher usually works when `python` doesn't.  If that works, you're fine.  If
+neither does, ask IT to add Python to the system PATH.  Close and reopen any
+Command Prompt windows afterward.
+
+**"fatal: not a git repository" when running `git pull`**
+Either you're not in the `pq-analyzer` folder, or your copy didn't come from
+`git clone`.  See [GIT_GUIDE.md § 4](GIT_GUIDE.md#4-get-the-code-git-clone).
+
+**`pip install` fails with an SSL, certificate, or proxy error**
+Xcel's network is intercepting the connection to the package server.  Don't
+apply workarounds that disable certificate checking — open a ticket asking for
+access to pypi.org and files.pythonhosted.org.
 
 **"Module not found" error when launching**
 Run `pip install -r pq_analyzer_requirements.txt` again from inside the
@@ -225,3 +154,15 @@ with `--verbose` to see the observation records the file actually contains.
 Per-order harmonic channels (h3_current_a, h5_current_a, etc.) are not present
 in the meter export.  Only thd_current_* is available, which is insufficient
 for signature matching.
+
+---
+
+## Reporting Problems and Suggesting Changes
+
+Found a bad number, a file that won't load, or a section that reads wrong?
+Send it to the maintainer with the `.pqd` file and what you expected — that's
+the fastest path to a fix, and fixes reach everyone through `git pull`.
+
+Changes are published by the maintainer only.  The commit and push workflow
+is documented in [GIT_GUIDE.md
+§ 8](GIT_GUIDE.md#8-for-the-maintainer-pushing-changes).
