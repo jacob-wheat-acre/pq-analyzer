@@ -686,9 +686,21 @@ class ProntoAdapter:
 
         if self._spec is not None:
             self._load_spec()
+            # Carry the denominator and the parser's reasons, not just a count:
+            # "1 of 2" and "1 of 300" are very different findings, and the error
+            # text distinguishes a truncated transfer from a corrupt export.
             self.data_quality = {
                 "missing_bytes": self._spec.missing_bytes,
                 "unreadable_observations": len(self._spec.unreadable_observations),
+                "total_observations": self._spec.observation_count,
+                "unreadable_detail": [
+                    {"offset": pos, "reason": err, "name": name}
+                    for (pos, err), name in zip(
+                        self._spec.unreadable_observations,
+                        getattr(self._spec, "unreadable_observation_names", [])
+                        or [""] * len(self._spec.unreadable_observations),
+                    )
+                ],
             }
             return
         self._load_legacy()
@@ -2477,9 +2489,15 @@ class MockAdapter:
         ib = 51.0 + 5 * np.sin(2 * np.pi * np.arange(n) / 900 + 0.1) + rng.normal(0, 0.5, n)
         ic = 49.5 + 5 * np.sin(2 * np.pi * np.arange(n) / 900 - 0.1) + rng.normal(0, 0.5, n)
 
+        # power_real / power_reactive are watts and VAR everywhere else, so the
+        # demo has to generate them in watts too -- an 18 kW demo service that
+        # stored 18 into a watt channel read as 0.018 kW once the plots started
+        # converting correctly.
         kw   = 18.0 + 2 * np.sin(2 * np.pi * np.arange(n) / 3600) + rng.normal(0, 0.2, n)
         kvar = 6.0  + 0.5 * np.sin(2 * np.pi * np.arange(n) / 3600) + rng.normal(0, 0.1, n)
         pf   = np.clip(kw / np.sqrt(kw**2 + kvar**2) + rng.normal(0, 0.005, n), 0.5, 1.0)
+        kw   = kw * 1000.0      # W
+        kvar = kvar * 1000.0    # VAR
 
         # THD with a few exceedance periods
         thd_v = np.clip(3.0 + rng.normal(0, 0.8, n), 0.5, 20)

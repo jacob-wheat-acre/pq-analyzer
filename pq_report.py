@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 
 from pq_constants import (
+    SEVERITY_LABEL,
+    is_single_phase_208,
+    ll_factor,
     __version__,
     Thresholds,
     _H519_ORDERS,
@@ -18,7 +21,7 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
-from pq_analysis import standard_k_rating
+from pq_analysis import grade_finding, standard_k_rating
 
 log = logging.getLogger(__name__)
 
@@ -81,8 +84,10 @@ def _normal(para, text: str, color=None, size_pt: int = 11):
 
 
 def _pf_sym(passes) -> str:
-    if passes is True:  return "PASS"
-    if passes is False: return "FAIL"
+    # "Within" / "Exceeded" states the compliance fact without the alarm that
+    # FAIL carries; severity is now a separate column and does the grading.
+    if passes is True:  return "Within"
+    if passes is False: return "Exceeded"
     return "N/A"
 
 
@@ -90,6 +95,27 @@ def _pf_color(passes):
     if passes is True:  return _PASS_CLR
     if passes is False: return _FAIL_CLR
     return None
+
+
+#: Severity band → (text colour, cell shade).  Only "severe" gets alarm red;
+#: "watch" is deliberately a neutral blue-grey because nothing is wrong yet.
+_SEVERITY_STYLE = {
+    "compliant":    ((0x1F, 0x7A, 0x1F), "E8F4E8"),
+    "watch":        ((0x4A, 0x5F, 0x73), "EEF1F4"),
+    "minor":        ((0x8A, 0x6D, 0x00), "FFF8E1"),
+    "significant":  ((0xC0, 0x5A, 0x00), "FFECD9"),
+    "severe":       ((0xCC, 0x00, 0x00), "FFE3E3"),
+    "not_assessed": ((0x77, 0x77, 0x77), "F2F2F2"),
+}
+
+
+def _sev_color(band):
+    rgb, _ = _SEVERITY_STYLE.get(band, _SEVERITY_STYLE["not_assessed"])
+    return RGBColor(*rgb) if _DOCX_AVAILABLE else None
+
+
+def _sev_shade(band) -> str:
+    return _SEVERITY_STYLE.get(band, _SEVERITY_STYLE["not_assessed"])[1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,7 +201,12 @@ def generate_report(
                                       if (frequency_result or {}).get("available") else None,
             "flicker":                (flicker_result or {}).get("overall_pass")
                                       if (flicker_result or {}).get("available") else None,
-            "thd_voltage":            thd_result["voltage"]["pct_exceeding"] == 0
+            # IEEE 519-2022 Clause 5 judges voltage THD on the 95th percentile of
+            # short-time values (and P99 against 1.5x the limit), not on every
+            # sample.  Failing a site on a single artifact interval overstates
+            # what the standard actually requires.
+            "thd_voltage":            (thd_result["voltage"].get("p95_pass", True)
+                                       and thd_result["voltage"].get("p99_pass", True))
                                       if thd_result["voltage"]["available"] else None,
             "thd_current":            thd_result["current"]["pct_exceeding"] == 0
                                       if thd_result["current"]["available"] else None,
@@ -250,15 +281,30 @@ def print_report(report: dict) -> None:
     if dq.get("missing_bytes") or dq.get("unreadable_observations"):
         print(f"\n{sep}")
         print("  ⚠  SOURCE FILE INCOMPLETE")
+        n_bad   = dq.get("unreadable_observations") or 0
+        n_total = dq.get("total_observations") or 0
+        if n_bad:
+            scope = f"{n_bad} of {n_total}" if n_total else str(n_bad)
+            print(f"  {scope} observation records could not be decoded and were "
+                  "skipped.  An observation")
+            print("  record is one block of measurements the meter wrote to the "
+                  "file.")
+            for d in (dq.get("unreadable_detail") or [])[:3]:
+                label = d.get("name") or f"offset {d.get('offset', '?')}"
+                print(f"    - {label}: {d.get('reason', '')}")
         if dq.get("missing_bytes"):
             print(f"  The file is {dq['missing_bytes']:,} bytes shorter than its own "
-                  "record headers declare.")
-        if dq.get("unreadable_observations"):
-            print(f"  {dq['unreadable_observations']} observation record(s) could not "
-                  "be read and were skipped.")
-        print("  Everything below covers only the data that was readable. Re-export "
-              "or re-copy the")
-        print("  file and re-run before relying on these results.")
+                  "record headers")
+            print("  declare, so it was cut short — an export or copy that ended "
+                  "early.")
+        if n_total and n_bad and n_bad < n_total:
+            print(f"  Everything below was computed from the {n_total - n_bad} "
+                  "records that read cleanly.")
+        print("  Measurements in the damaged portion are missing entirely — not "
+              "zero, just absent —")
+        print("  so counts, minimums and maximums may understate what the meter "
+              "saw.  Re-export")
+        print("  the file and re-run before relying on these results.")
 
     # ── Voltage ───────────────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -397,10 +443,10 @@ def print_report(report: dict) -> None:
     ih = report["individual_harmonics"]
     if not ih.get("available"):
         note = ih.get("note", "Pass --isc to enable per-order IEEE 519-2022 check")
-        print(f"  INDIVIDUAL HARMONICS (IEEE 519-2022)  [{note}]")
+        print(f"  INDIVIDUAL CURRENT HARMONICS (IEEE 519-2022 Table 2)  [{note}]")
     else:
         sym = "PASS" if ih["overall_pass"] else "FAIL"
-        print(f"  INDIVIDUAL HARMONICS (IEEE 519-2022)  [{sym}]")
+        print(f"  INDIVIDUAL CURRENT HARMONICS (IEEE 519-2022 Table 2)  [{sym}]")
         print(f"  IL={ih['il_amps']:.0f} A  ISC/IL={ih['isc_il_ratio']:.1f}")
         # Print header + one row per harmonic order showing worst phase
         order_rows = []
@@ -478,7 +524,9 @@ def print_report(report: dict) -> None:
         print(
             f"  Severity: {sev}  |  "
             f"L1+L2 sum={nh['sum_mean_v']:.1f} V (std {nh['sum_std_v']:.2f} V)  |  "
-            f"Leg corr r={nh['leg_correlation']:.3f}  |  "
+            f"Leg corr r=" + (f"{nh['leg_correlation']:.3f}" if
+                                 nh.get("leg_correlation") is not None
+                                 else "n/a") + "  |  "
             f"Asym={nh['asym_mean_v']:.1f} V ({nh['asym_pct']:.1f}%)"
         )
         if nh.get("vne_available"):
@@ -650,6 +698,81 @@ def _add_toc(doc) -> None:
     doc.add_page_break()
 
 
+def _integrity_note(dq: dict, fs: dict) -> str:
+    """Explain a damaged source file to someone who has never heard of PQDIF.
+
+    The reader has to answer three questions before weighing anything else in
+    the report: what was lost, how much of the file that is, and whether the
+    findings can still be relied on.  A bare count of "observation records"
+    answers none of them.
+    """
+    parts = []
+
+    n_bad   = dq.get("unreadable_observations") or 0
+    n_total = dq.get("total_observations") or 0
+    missing = dq.get("missing_bytes") or 0
+
+    if n_bad:
+        # Name the unit before counting it — "observation record" is PQDIF
+        # jargon that means nothing to a field engineer reading the report.
+        scope = f"{n_bad} of {n_total}" if n_total else f"{n_bad}"
+        parts.append(
+            f"{scope} observation records could not be decoded and were skipped. "
+            "An observation record is one block of measurements the meter wrote "
+            "to the file — typically one channel group over one span of time."
+        )
+        detail = dq.get("unreadable_detail") or []
+
+        # Name what was lost.  Which record it was determines which checks are
+        # affected — losing the max/min observation removes the peak/min voltage
+        # check, and no count conveys that.
+        names = [d.get("name", "") for d in detail]
+        names = [n for n in names if n]
+        if names:
+            parts.append("Skipped: " + "; ".join(f"“{n}”" for n in names) + ".")
+
+        reasons = [d.get("reason", "") for d in detail if d.get("reason")]
+        if reasons:
+            # One reason is worth quoting; a list of them is noise in a table.
+            parts.append(f"Reason reported by the reader: {reasons[0]}"
+                         + (f" (and {len(reasons) - 1} more)" if len(reasons) > 1 else "")
+                         + ".")
+
+    if missing:
+        parts.append(
+            f"The file is {'also ' if n_bad else ''}{missing:,} bytes shorter "
+            "than its own record headers declare, which means it was cut short — "
+            "an export or copy that ended early, not a format this reader fails "
+            "to understand."
+        )
+
+    # What it means for the findings, stated plainly.
+    if n_total and n_bad and n_bad < n_total:
+        n_good = n_total - n_bad
+        parts.append(
+            f"Everything in this report was computed from the {n_good} "
+            f"record{'' if n_good == 1 else 's'} that read cleanly, covering the "
+            "recording period shown above. Measurements held only in the "
+            "skipped records are absent "
+            "from every statistic here — they are not counted as zero, but any "
+            "interval or event they contained is simply missing, so counts, "
+            "minimums and maximums may understate what the meter actually saw."
+        )
+    else:
+        parts.append(
+            "Measurements in the damaged portion are absent from every statistic "
+            "in this report — not counted as zero, but missing, so counts, "
+            "minimums and maximums may understate what the meter actually saw."
+        )
+
+    parts.append(
+        "Re-export the file from the meter and re-run before relying on these "
+        "results. If a re-export reads clean, use it instead of this report."
+    )
+
+    return "INCOMPLETE — " + " ".join(parts)
+
+
 def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, substation,
                           fs, nominal_v, nominal_ll) -> None:
     rows_data = [
@@ -678,18 +801,9 @@ def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, 
     # the findings below are drawn from partial data and a reader has to know.
     _dq = fs.get("data_quality") or {}
     if _dq.get("missing_bytes") or _dq.get("unreadable_observations"):
-        _notes = []
-        if _dq.get("missing_bytes"):
-            _notes.append(f"{_dq['missing_bytes']:,} bytes short of the length its "
-                          "own record headers declare")
-        if _dq.get("unreadable_observations"):
-            _notes.append(f"{_dq['unreadable_observations']} observation record(s) "
-                           "unreadable and skipped")
         rows_data.append((
             "Source file integrity",
-            "INCOMPLETE — " + "; ".join(_notes)
-            + ". The findings below cover only the readable data; re-export the "
-              "file and re-run to confirm them.",
+            _integrity_note(_dq, fs),
         ))
     info_tbl = doc.add_table(rows=len(rows_data), cols=2)
     info_tbl.style = 'Table Grid'
@@ -714,16 +828,20 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     ivh  = report.get("individual_voltage_harmonics", {})
     hs   = report.get("harmonic_statistics", {})
     tdd_info = thd.get("tdd_info", {})
+    sev = compute_severities(report, thresh)
 
     _bold(doc.add_paragraph(), "Compliance Status by Standard", size_pt=11)
 
-    tbl = doc.add_table(rows=1, cols=3)
+    tbl = doc.add_table(rows=1, cols=4)
     tbl.style = 'Table Grid'
-    _set_col_widths(tbl, [8.5, 5.5, 2.5])
+    # Measured carries the most text now, so it gets the room; the total stays
+    # inside the 16.5 cm the previous three-column layout used.
+    _set_col_widths(tbl, [5.6, 6.0, 1.9, 3.0])
 
     # Header row
     hdr_cells = tbl.rows[0].cells
-    for cell, text in zip(hdr_cells, ["Standard", "Measured", "Result"]):
+    for cell, text in zip(hdr_cells,
+                          ["Standard", "Measured", "Compliance", "Severity"]):
         _cell_shade(cell, "004B87")
         p = cell.paragraphs[0]
         r = p.add_run(text)
@@ -731,55 +849,130 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         r.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
         r.font.size = Pt(10)
 
-    def add_row(standard, measured, passes):
+    # Rows are buffered rather than written straight out, so they can be emitted
+    # grouped by the quantity being measured.  Interleaving volts, amps, kVA and
+    # hertz made the table read as a list of unrelated tests; grouped, a reader
+    # can take in "the voltage picture" or "the current picture" at once.
+    buffered: List[tuple] = []
+
+    def add_row(standard, measured, passes, severity=None, group="other"):
+        """One finding: the compliance fact, then how much it matters.
+
+        Callers that pass no severity fall back to grading on pass/fail alone,
+        which yields Compliant / Minor / Not assessed — never a red row without
+        a margin to justify it.
+        """
+        buffered.append((group, standard, measured, passes, severity))
+
+    def _emit(standard, measured, passes, severity):
         row   = tbl.add_row()
         cells = row.cells
         cells[0].paragraphs[0].add_run(standard).font.size = Pt(10)
         cells[1].paragraphs[0].add_run(measured).font.size = Pt(10)
-        sym = _pf_sym(passes)
-        clr = _pf_color(passes)
-        _cell_shade(cells[2], "E8F4E8" if passes is True else ("FFE8E8" if passes is False else "F2F2F2"))
-        r = cells[2].paragraphs[0].add_run(sym)
+
+        # Compliance column — the standard's own binary verdict, unshaded so it
+        # reads as a fact rather than an alarm.
+        r = cells[2].paragraphs[0].add_run(_pf_sym(passes))
         r.bold = True
         r.font.size = Pt(10)
+        if passes is False:
+            r.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+        elif passes is True:
+            r.font.color.rgb = _PASS_CLR
+
+        # Severity column — carries the colour, because this is the axis that
+        # actually says whether to worry.
+        s = severity or grade_finding(passes)
+        band = s["band"]
+        _cell_shade(cells[3], _sev_shade(band))
+        p3 = cells[3].paragraphs[0]
+        r3 = p3.add_run(s["label"])
+        r3.bold = True
+        r3.font.size = Pt(10)
+        clr = _sev_color(band)
         if clr:
-            r.font.color.rgb = clr
+            r3.font.color.rgb = clr
+        if s.get("reason"):
+            note = p3.add_run("\n" + s["reason"])
+            note.font.size = Pt(7.5)
+            note.italic = True
+            note.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+
+    def _emit_group_heading(text):
+        row = tbl.add_row()
+        cell = row.cells[0].merge(row.cells[-1])
+        _cell_shade(cell, "DCE6F1")
+        p = cell.paragraphs[0]
+        r = p.add_run(text)
+        r.bold = True
+        r.font.size = Pt(9)
+        r.font.color.rgb = _XE_BLUE
 
     # Demand / transformer loading
     if "transformer" in dem:
         tx   = dem["transformer"]
         meas = f"{tx['peak_8h_kva']:.0f} kVA 8-hr peak  /  {tx['nameplate_kva']:.0f} kVA nameplate  ({tx['pct_nameplate']:.0f}%)"
-        add_row("Steady-state demand ≤ transformer nameplate (8-hr peak)", meas, not tx["overloaded"])
+        add_row("Steady-state demand ≤ transformer nameplate (8-hr peak)", meas,
+                not tx["overloaded"], sev.get("demand"), group="power")
     else:
-        add_row("Steady-state demand ≤ transformer nameplate (8-hr peak)", "No nameplate provided", None)
+        add_row("Steady-state demand ≤ transformer nameplate (8-hr peak)", "No nameplate provided", None, group="power")
 
     # Power factor
     if pfr["available"]:
         if thresh.customer_class == "r":
             meas = (f"Min {pfr['min_pf']:.3f}  /  Mean {pfr['mean_pf']:.3f}  "
                     f"(residential — tariff PF clause not applicable)")
-            add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas, None)
+            add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas, None, group="power")
         else:
             meas = f"Min {pfr['min_pf']:.3f}  /  Mean {pfr['mean_pf']:.3f}  (limit ≥ {pfr['limit']:.2f})"
-            add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas, pf["power_factor"])
+            # Graded on the mean, not the minimum: the tariff clause is about
+            # sustained operation, and a single low interval is not a billing
+            # condition.  The minimum still shows in the Measured column.
+            add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas,
+                    pf["power_factor"], sev.get("power_factor"), group="power")
     else:
-        add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", "No data", None)
+        add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", "No data", None, group="power")
 
     # Voltage compliance
     if volt["available"]:
         phases = volt["phases"]
-        worst_oob = max(v["pct_out_of_bounds"] for v in phases.values())
         rng = volt["range_v"]
         missing = volt.get("phases_missing_data") or []
         missing_note = (
             f"  |  No usable data: {', '.join(_phase_label(m) for m in missing)}"
             if missing else ""
         )
-        meas = (f"Range {rng[0]:.1f}–{rng[1]:.1f} V  |  "
-                f"Worst phase: {worst_oob:.2f}% intervals out of band{missing_note}")
-        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", meas, pf["voltage"])
+        # Name the worst phase and quote what it actually measured.  The old row
+        # printed range_v -- the *allowed* band -- under the bare label "Range",
+        # so the only voltage in the cell was the limit dressed as a measurement,
+        # and "worst phase" was never followed by which phase or what it read.
+        worst_col, worst_st = max(phases.items(),
+                                  key=lambda kv: kv[1]["pct_out_of_bounds"])
+        worst_oob = worst_st["pct_out_of_bounds"]
+        # Say which direction it went, since low and high voltage have opposite
+        # causes and opposite fixes.
+        if worst_oob == 0:
+            band_note = "All intervals in band"
+        else:
+            if worst_st["pct_under"] and worst_st["pct_over"]:
+                excursion = (f"{worst_st['pct_under']:.1f}% under / "
+                             f"{worst_st['pct_over']:.1f}% over")
+            elif worst_st["pct_under"]:
+                excursion = f"all below {rng[0]:.1f} V"
+            else:
+                excursion = f"all above {rng[1]:.1f} V"
+            band_note = f"{worst_oob:.1f}% of intervals out of band, {excursion}"
+
+        meas = (f"Worst phase {_phase_label(worst_col)}: "
+                f"{worst_st['min_v']:.1f}–{worst_st['max_v']:.1f} V "
+                f"(mean {worst_st['mean_v']:.1f})  |  {band_note}  |  "
+                f"Allowed {rng[0]:.1f}–{rng[1]:.1f} V{missing_note}")
+        # Voltage severity is driven by how much of the recording sat out of
+        # band; the excursion depth now shows in the Measured column.
+        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", meas,
+                pf["voltage"], sev.get("voltage"), group="voltage")
     else:
-        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", volt.get("error", "No data"), None)
+        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", volt.get("error", "No data"), None, group="voltage")
 
     # Voltage transients / ITIC
     itic = report.get("itic", {})
@@ -789,19 +982,37 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         else:
             it_meas = (f"{itic['n_events']} sag/swell event(s) evaluated; "
                        f"{itic['n_violations']} outside the ITIC envelope")
+            # A count of events says nothing about whether equipment would have
+            # ridden them through.  Depth and duration are what the ITIC curve
+            # is actually plotted against.
+            w = itic.get("worst")
+            if w:
+                it_meas += (f"  |  Worst: {w['value_v']:.1f} V "
+                            f"({w['pct_nominal']:.0f}% of nominal) for "
+                            f"{w['duration_ms']:.0f} ms")
+                if w.get("phase"):
+                    it_meas += f" on {_phase_label(w['phase'])}"
         add_row("Voltage sags/swells within ITIC voltage tolerance curve",
-                it_meas, pf.get("itic_transients"))
+                it_meas, pf.get("itic_transients"), group="voltage")
     else:
         add_row("Voltage sags/swells within ITIC voltage tolerance curve",
-                itic.get("note", "Event duration data not available"), None)
+                itic.get("note", "Event duration data not available"), None, group="voltage")
 
     # Voltage THD
     v_thd = thd["voltage"]
     if v_thd["available"]:
-        meas = f"Max {v_thd['max_thd_pct']:.2f}%  /  Mean {v_thd['mean_thd_pct']:.2f}%  (limit {v_thd['limit_pct']:.1f}%)"
-        add_row("Voltage THD < 8.0% (IEEE 519-2022, secondary)", meas, pf["thd_voltage"])
+        # Lead with the percentile the standard actually judges on; the maximum
+        # follows as context, flagged when it is a spike rather than a level.
+        meas = (f"P95 {v_thd.get('p95_thd_pct', v_thd['max_thd_pct']):.2f}%  "
+                f"(limit {v_thd['limit_pct']:.1f}%)  /  "
+                f"Mean {v_thd['mean_thd_pct']:.2f}%  /  "
+                f"Max {v_thd['max_thd_pct']:.2f}%")
+        if v_thd.get("max_is_outlier"):
+            meas += " (isolated spike)"
+        add_row("Voltage THD < 8.0% (IEEE 519-2022 P95, secondary)", meas,
+                pf["thd_voltage"], sev.get("thd_voltage"), group="voltage")
     else:
-        add_row("Voltage THD < 8.0% (IEEE 519-2022, secondary)", "No voltage THD channel", None)
+        add_row("Voltage THD < 8.0% (IEEE 519-2022, secondary)", "No voltage THD channel", None, group="voltage")
 
     # Current TDD / THD
     c_thd = thd["current"]
@@ -815,38 +1026,58 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         else:
             cls = ""
         meas   = f"Max {c_thd['max_thd_pct']:.2f}%  /  Mean {c_thd['mean_thd_pct']:.2f}%  (limit {lim:.1f}%{cls})"
-        add_row(f"Current {metric} within IEEE 519-2022 Table 2", meas, pf["thd_current"])
+        add_row(f"Current {metric} within IEEE 519-2022 Table 2", meas,
+                pf["thd_current"], sev.get("thd_current"), group="current")
     else:
-        add_row("Current TDD within IEEE 519-2022 Table 2", "No current THD channel", None)
+        add_row("Current TDD within IEEE 519-2022 Table 2", "No current THD channel", None, group="current")
 
     # Individual current harmonics
     if ih.get("available"):
-        wo = ih.get("worst_order")
-        if ih["overall_pass"]:
-            meas = (f"All orders within limits  (worst: H{wo[0]} at {ih['worst_pct_of_il']:.2f}% of IL)"
-                    if wo else "All orders within limits")
+        # Report the order with the tightest margin, not the largest current.
+        # The Table 2 limits fall steeply with h, so the biggest harmonic is
+        # often comfortably legal while a small high order is the binding one.
+        mo   = ih.get("worst_margin_order")
+        mpct = ih.get("worst_margin_pct_of_il")
+        mlim = ih.get("worst_limit_pct")
+        # Spell out IL the first time it appears -- "% of IL" is IEEE shorthand
+        # for percent of maximum demand load current and is not self-evident to
+        # everyone the report goes to.
+        il_note = (f", IL = {ih['il_amps']:.0f} A max demand current"
+                   if ih.get("il_amps") else " (IL = max demand current)")
+        if mo and mpct is not None and mlim:
+            tight = (f"tightest: H{mo[0]} phase {mo[1].upper()} at {mpct:.2f}% of IL "
+                     f"vs {mlim:.1f}% limit ({mpct / mlim * 100:.0f}% of it)")
         else:
-            meas = (f"One or more orders exceed limit  (worst: H{wo[0]} at {ih['worst_pct_of_il']:.2f}% of IL)"
-                    if wo else "One or more orders exceed limit")
-        add_row("Individual harmonic orders within IEEE 519-2022 Table 2", meas, pf["individual_harmonics"])
+            wo = ih.get("worst_order")
+            tight = (f"worst: H{wo[0]} at {ih['worst_pct_of_il']:.2f}% of IL"
+                     if wo else "")
+        head = ("All current harmonic orders within limits" if ih["overall_pass"]
+                else "One or more current harmonic orders exceed limit")
+        meas = (f"{head}  ({tight}{il_note})" if tight
+                else f"{head}{il_note}")
+        add_row("Individual current harmonics within IEEE 519-2022 Table 2", meas,
+                pf["individual_harmonics"], sev.get("individual_harmonics"), group="current")
     else:
         note = ih.get("note", "Pass --isc to enable per-order check")
-        add_row("Individual harmonic orders within IEEE 519-2022 Table 2", note, None)
+        add_row("Individual current harmonics within IEEE 519-2022 Table 2", note, None, group="current")
 
     # Individual voltage harmonics
     if ivh.get("available"):
         vwo = ivh.get("worst_order")
-        if ivh["overall_pass"]:
-            meas = (f"All orders within 5% limit  (worst: H{vwo[0]} at {ivh['worst_pct_nom']:.2f}% of nominal)"
-                    if vwo else "All orders within 5% limit")
-        else:
-            meas = (f"One or more orders exceed 5% limit  (worst: H{vwo[0]} at {ivh['worst_pct_nom']:.2f}% of nominal)"
-                    if vwo else "One or more orders exceed limit")
+        # Mirror the current row's wording so the two are impossible to confuse
+        # at a glance: name the quantity, then what the percentage is of.
+        vhead = ("All voltage harmonic orders within 5% limit"
+                 if ivh["overall_pass"]
+                 else "One or more voltage harmonic orders exceed 5% limit")
+        meas = (f"{vhead}  (worst: H{vwo[0]} phase {vwo[1].upper()} at "
+                f"{ivh['worst_pct_nom']:.2f}% of nominal voltage)"
+                if vwo else vhead)
         add_row("Individual voltage harmonics within IEEE 519-2022 Table 1 (5% of nominal)", meas,
-                pf.get("individual_voltage_harmonics"))
+                pf.get("individual_voltage_harmonics"),
+                sev.get("individual_voltage_harmonics"), group="voltage")
     else:
         add_row("Individual voltage harmonics within IEEE 519-2022 Table 1 (5% of nominal)",
-                ivh.get("note", "Per-order voltage harmonics not available in this meter format"), None)
+                ivh.get("note", "Per-order voltage harmonics not available in this meter format"), None, group="voltage")
 
     # Statistical compliance (IEEE 519-2022 Clause 5)
     if hs.get("available"):
@@ -855,22 +1086,46 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             hs_meas = f"P95 ≤ 1.0× and P99 ≤ 1.5× limits for all orders ({period_note})"
         else:
             hs_meas = f"One or more orders exceed P95 or P99 statistical limits ({period_note})"
+        # Name the order that binds and quote it.  "Within limits for all orders"
+        # gives no sense of how close the service came, and the tightest margin
+        # is what a follow-up recording should be aimed at.
+        b = hs.get("binding")
+        if b:
+            label = "TDD" if b["order"] == "thd" else f"H{b['order']}"
+            hs_meas += (f"  |  Tightest: {label} phase {b['phase'].upper()} "
+                        f"P95 {b['p95']:.2f}% vs {b['limit']:.2f}% limit "
+                        f"({b['ratio'] * 100:.0f}% of it)")
+        # Already a percentile test, so persistence is baked in; grade on the
+        # verdict and note when the recording was too short to be a true week.
         add_row(
-            "Harmonic P95 / P99 within IEEE 519-2022 Clause 5 statistical limits",
+            "Current harmonic P95 / P99 within IEEE 519-2022 Clause 5 statistical limits",
             hs_meas, pf.get("harmonic_statistics"),
+            sev.get("harmonic_statistics"), group="current",
         )
     else:
         add_row(
-            "Harmonic P95 / P99 within IEEE 519-2022 Clause 5 statistical limits",
+            "Current harmonic P95 / P99 within IEEE 519-2022 Clause 5 statistical limits",
             hs.get("note", "Pass --isc to enable statistical check"), None,
+            group="current",
         )
 
-    # Voltage imbalance
+    # Voltage imbalance — the metric itself differs by service configuration,
+    # so the row must not claim NEMA MG1 on a single-phase service where that
+    # definition does not apply.
     if imb["available"]:
         meas = f"Max {imb['max_imbalance_pct']:.2f}%  /  Mean {imb['mean_imbalance_pct']:.2f}%  (limit {imb['limit_pct']:.1f}%)"
-        add_row("Voltage imbalance < 3% (ANSI C84.1 / NEMA MG1)", meas, pf["voltage_imbalance"])
+        if imb.get("metric") == "nema_mg1":
+            imb_label = "Voltage imbalance < 3% (ANSI C84.1 / NEMA MG1)"
+        else:
+            imb_label = (f"Leg-to-leg voltage difference < "
+                         f"{imb['limit_pct']:.0f}% of nominal (single-phase service)")
+            meas += "  |  NEMA MG1 unbalance is a three-phase definition"
+            if imb.get("note"):
+                meas += "; only two of three phases measured"
+        add_row(imb_label, meas,
+                pf["voltage_imbalance"], sev.get("voltage_imbalance"), group="voltage")
     else:
-        add_row("Voltage imbalance < 3% (ANSI C84.1 / NEMA MG1)", "No data", None)
+        add_row("Voltage imbalance < 3% (ANSI C84.1 / NEMA MG1)", "No data", None, group="voltage")
 
     # Current imbalance
     if thresh.customer_class in ("sg", "pg"):
@@ -879,9 +1134,10 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         ci_label = "Current imbalance < 10% (NEMA MG1)"
     if ci["available"]:
         meas = f"Max {ci['max_imbalance_pct']:.2f}%  /  Mean {ci['mean_imbalance_pct']:.2f}%  (limit {ci['limit_pct']:.1f}%)"
-        add_row(ci_label, meas, pf["current_imbalance"])
+        add_row(ci_label, meas, pf["current_imbalance"],
+                sev.get("current_imbalance"), group="current")
     else:
-        add_row(ci_label, "No data", None)
+        add_row(ci_label, "No data", None, group="current")
 
     # Flicker — every phase the meter recorded, not just phase A. The row makes
     # an unqualified statement about the service, so it has to be based on the
@@ -904,9 +1160,11 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             f"(Pst ≤ {fl['pst_limit']:.1f}, Plt ≤ {fl['plt_limit']:.2f})",
             measured,
             fl.get("overall_pass"),
+            sev.get("flicker"), group="voltage",
         )
     else:
-        add_row("Flicker within IEC 61000-3-3 limits (Pst ≤ 1.0, Plt ≤ 0.65)", "Not measured in this recording", None)
+        add_row("Flicker within IEC 61000-3-3 limits (Pst ≤ 1.0, Plt ≤ 0.65)",
+                "Not measured in this recording", None, group="voltage")
 
     # Line-to-line voltage and frequency were being counted in the standards
     # tally without appearing here, so the summary claimed more standards than
@@ -920,19 +1178,59 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         if worst["pct_out_of_bounds"] > 0:
             meas += f"  |  worst pair {worst['pct_out_of_bounds']:.2f}% out of range"
         add_row(f"Line-to-line voltage within ANSI C84.1 Range A "
-                f"({llv['nominal_v']:.0f} V nominal)", meas, llv.get("overall_pass"))
+                f"({llv['nominal_v']:.0f} V nominal)", meas, llv.get("overall_pass"),
+                sev.get("voltage_line_to_line"), group="voltage")
     else:
         add_row("Line-to-line voltage within ANSI C84.1 Range A",
-                llv.get("error", "Not evaluated"), None)
+                llv.get("error", "Not evaluated"), None, group="voltage")
 
     frq = report.get("frequency") or {}
     if frq.get("available"):
         meas = (f"{frq['min_hz']:.3f}–{frq['max_hz']:.3f} Hz  "
                 f"(allowed {frq['range_hz'][0]:.2f}–{frq['range_hz'][1]:.2f} Hz)")
         add_row(f"System frequency within ±{(frq['range_hz'][1] - frq['nominal_hz']):.1f} Hz "
-                f"of {frq['nominal_hz']:.0f} Hz", meas, frq.get("overall_pass"))
+                f"of {frq['nominal_hz']:.0f} Hz", meas, frq.get("overall_pass"),
+                sev.get("frequency"), group="frequency")
     else:
-        add_row("System frequency within tolerance", "No frequency channel", None)
+        add_row("System frequency within tolerance", "No frequency channel", None, group="frequency")
+
+    # ── Emit, grouped by the quantity measured ────────────────────────────────
+    # Voltage first: it is what the customer experiences and what most calls are
+    # about.  Current second, since distortion and imbalance there are usually
+    # the cause of what the voltage rows show.  Power and frequency last.
+    # Within a group, magnitude checks come before distortion checks: a reader
+    # wants "is the voltage right" answered before "is its shape right".  Code
+    # order does not give that, so rank explicitly on a distinctive fragment of
+    # each label.  Anything unmatched keeps insertion order, after the ranked.
+    order_within = {
+        "voltage": ["Steady-state voltage", "Line-to-line voltage",
+                    "Voltage imbalance", "Voltage sags/swells", "Voltage THD",
+                    "Individual voltage harmonics", "Flicker"],
+        "current": ["Current imbalance", "Current TDD", "Current THD",
+                    "Individual current harmonics", "Current harmonic P95"],
+        "power":   ["Steady-state demand", "Power factor"],
+    }
+
+    def _rank(group_key, standard):
+        for i, frag in enumerate(order_within.get(group_key, [])):
+            if standard.startswith(frag):
+                return i
+        return len(order_within.get(group_key, []))
+
+    for key, heading in (
+        ("voltage",   "VOLTAGE  —  volts, and quantities derived from voltage"),
+        ("current",   "CURRENT  —  amps, and quantities derived from current"),
+        ("power",     "DEMAND AND POWER FACTOR  —  kVA, power factor"),
+        ("frequency", "FREQUENCY  —  hertz"),
+        ("other",     "OTHER"),
+    ):
+        rows = [r for r in buffered if r[0] == key]
+        if not rows:
+            continue
+        rows.sort(key=lambda r: _rank(key, r[1]))
+        _emit_group_heading(heading)
+        for _, standard, measured, passes, severity in rows:
+            _emit(standard, measured, passes, severity)
 
     doc.add_paragraph()
 
@@ -951,7 +1249,7 @@ _PF_FRIENDLY = {
     "power_factor":                 "power factor (PSCo tariff)",
     "voltage_imbalance":            "voltage imbalance",
     "current_imbalance":            "current imbalance",
-    "harmonic_statistics":          "harmonic statistical limits (IEEE 519 Clause 5)",
+    "harmonic_statistics":          "current harmonic statistical limits (IEEE 519 Clause 5)",
     "neutral_health":               "neutral integrity",
     "itic_transients":              "voltage sags/swells (ITIC curve)",
     "voltage_line_to_line":         "line-to-line voltage (ANSI C84.1)",
@@ -1000,8 +1298,20 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
 
     v_thd = thd["voltage"]
     if pf.get("thd_voltage") is False and v_thd.get("available"):
+        # State the percentile that failed, since that is the criterion, and say
+        # how much of the recording was actually above the limit.
+        if not v_thd.get("p95_pass", True):
+            basis = (f"the 95th-percentile voltage THD was "
+                     f"{v_thd.get('p95_thd_pct', 0):.2f}%, above the "
+                     f"{v_thd['limit_pct']:.1f}% IEEE 519-2022 limit")
+        else:
+            basis = (f"the 99th-percentile voltage THD was "
+                     f"{v_thd.get('p99_thd_pct', 0):.2f}%, above the "
+                     f"{v_thd.get('p99_limit_pct', 0):.1f}% short-time limit "
+                     f"(1.5 x the {v_thd['limit_pct']:.1f}% limit)")
         items.append((0,
-            f"Voltage THD exceeded the {v_thd['limit_pct']:.1f}% IEEE 519-2022 limit "
+            f"Voltage distortion exceeded IEEE 519-2022: {basis}, sustained "
+            f"across {v_thd['pct_exceeding']:.1f}% of the recording "
             f"(maximum {v_thd['max_thd_pct']:.2f}%)."))
 
     ih = report["individual_harmonics"]
@@ -1021,8 +1331,8 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
 
     if pf.get("harmonic_statistics") is False:
         items.append((0,
-            "One or more harmonic orders exceeded the IEEE 519-2022 statistical "
-            "(95th/99th percentile) limits over the recording period."))
+            "One or more current harmonic orders exceeded the IEEE 519-2022 "
+            "statistical (95th/99th percentile) limits over the recording period."))
 
     volt = report["voltage_compliance"]
     if pf.get("voltage") is False and volt.get("available"):
@@ -1129,6 +1439,65 @@ def _purpose_from_title(title: str) -> str:
     return f"Address {title}."
 
 
+#: Most actions any one report should carry.  Past this the section stops being
+#: a plan and becomes bulk the reader skims, which is worse than a short list
+#: that names the few things actually worth doing.
+_MAX_ACTIONS = 6
+
+#: Distinct things an action can ask for.  Two recommendations that both amount
+#: to "re-measure with the customer's load disconnected" are one action, however
+#: differently they are worded.
+_ACTION_INTENTS = (
+    ("remeasure_isolated", ("loads disconnected", "with all customer loads")),
+    ("neutral_inspect",    ("neutral connection", "tighten all neutral")),
+    ("neutral_sizing",     ("neutral conductor sizing",)),
+    ("pf_correction",      ("power factor correction",)),
+    ("transformer_upgrade", ("upgrade of the overloaded", "transformer upgrade")),
+    ("voltage_review",     ("ansi c84.1 range a",)),
+    ("harmonic_study",     ("harmonic impedance frequency sweep", "detailed harmonic study")),
+    ("harmonic_source",    ("identify the source", "inventory the nonlinear",
+                            "mitigate harmonic current sources", "document existing harmonic")),
+    ("load_balance",       ("redistribute single-phase", "balanced between the two")),
+    ("capacitor_review",   ("feeder capacitor", "capacitor banks")),
+)
+
+_PRIORITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
+
+
+def _action_intent(recommendation: str) -> Optional[str]:
+    """Classify what an action is actually asking for, for de-duplication."""
+    low = recommendation.lower()
+    for intent, needles in _ACTION_INTENTS:
+        if any(n in low for n in needles):
+            return intent
+    return None
+
+
+def _prune_actions(actions: List[dict]) -> List[dict]:
+    """Collapse duplicates and cap the list.
+
+    Findings arrive from several independent checks, and more than one can
+    conclude the same next step -- two separate findings both ended with
+    "measure again with all customer loads disconnected", which reached the
+    report as two actions. Keeping the higher-priority wording of each distinct
+    intent removes the repetition without losing anything.
+    """
+    actions.sort(key=lambda a: _PRIORITY_ORDER.get(a.get("priority"), 3))
+
+    kept: List[dict] = []
+    seen_intents: set = set()
+    for a in actions:
+        intent = _action_intent(a["recommendation"])
+        if intent is not None:
+            if intent in seen_intents:
+                continue
+            seen_intents.add(intent)
+        kept.append(a)
+        if len(kept) >= _MAX_ACTIONS:
+            break
+    return kept
+
+
 def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
     """Assemble recommended actions as dicts with recommendation, purpose and
     priority (High/Medium/Low).
@@ -1143,8 +1512,24 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
     sev_rank = {"critical": 0, "warning": 1, "info": 2}
     actions: List[dict] = []
 
+    cls = thresh.customer_class
+    residential = cls == "r"
+    small = cls in ("r", "c")
+
     for f in sorted(rca, key=lambda f: sev_rank.get(f["severity"], 9)):
         if not f.get("recommendation"):
+            continue
+        # A finding that reports the absence of a result is not something to
+        # act on. Without this the actions list carried entries like
+        # "Address no recognised load signature."
+        if f.get("no_action"):
+            continue
+        # Informational findings are hypotheses, not conclusions. The load
+        # signature match is the main one: promoting its recommendation to a
+        # Recommended Action told a homeowner to fit input reactors to VFDs
+        # they do not own, on the strength of a shape match. Its advice stays
+        # attached to the finding in the Engineering Assessment instead.
+        if f.get("severity") == "info":
             continue
         actions.append({
             "recommendation": f["recommendation"],
@@ -1156,13 +1541,13 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
     covered = " ".join(a["recommendation"].lower() for a in actions)
 
     # Compliance-driven actions not already covered by assessment findings
-    if (thresh.customer_class != "r" and pf["power_factor"] is False
+    if (not residential and pf["power_factor"] is False
             and "power factor" not in covered):
-        if thresh.customer_class == "pg":
+        if cls == "pg":
             rec = ("Install power factor correction to maintain near unity power factor "
                    "per PSCo Electric Tariff Sheet R121 (Schedule PG — C&I Primary service).")
         else:
-            sched = "SG" if thresh.customer_class == "sg" else "C"
+            sched = "SG" if cls == "sg" else "C"
             rec = (f"Install power factor correction capacitors to bring power factor "
                    f"above 0.90 lagging per PSCo Electric Tariff Sheet R73 (Schedule {sched}).")
         actions.append({"recommendation": rec,
@@ -1172,13 +1557,37 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
 
     if not any(k in covered for k in ("harmonic", "vfd", "rectifier")):
         if pf.get("thd_current") is False:
-            actions.append({
-                "recommendation": "Investigate and mitigate harmonic current sources "
-                                  "(VFDs, rectifiers, UPS). Consider passive or active "
-                                  "harmonic filters, or 12-pulse drive topologies.",
-                "purpose":  "Bring current distortion within IEEE 519-2022 limits.",
-                "priority": "High"})
-        if pf.get("individual_harmonics") is False:
+            # Filters and 12-pulse topologies are industrial remedies. At a
+            # house the useful step is finding which appliance is responsible.
+            if residential:
+                rec = ("Identify the source by switching major nonlinear loads "
+                       "individually — EV charger, air conditioning or heat pump, "
+                       "and any solar inverter — and noting which one changes the "
+                       "distortion. Report the result to your Xcel Energy contact; "
+                       "harmonic filters are not an appropriate remedy at a "
+                       "residential service.")
+                purpose = ("Locate the responsible equipment before considering any "
+                           "corrective work.")
+            elif cls == "c":
+                rec = ("Inventory the nonlinear equipment on site (electronic "
+                       "lighting drivers, small drives, EV charging, office "
+                       "equipment) and identify the dominant contributor before "
+                       "considering mitigation. At this service size, replacing or "
+                       "relocating a single offending load is usually cheaper and "
+                       "more effective than a filter.")
+                purpose = ("Bring current distortion within IEEE 519-2022 limits "
+                           "proportionately to the size of the service.")
+            else:
+                rec = ("Investigate and mitigate harmonic current sources "
+                       "(VFDs, rectifiers, UPS). Consider passive or active "
+                       "harmonic filters, or 12-pulse drive topologies.")
+                purpose = "Bring current distortion within IEEE 519-2022 limits."
+            actions.append({"recommendation": rec, "purpose": purpose,
+                            "priority": "High"})
+
+        if pf.get("individual_harmonics") is False and not small:
+            # A commissioned harmonic study is not a proportionate ask of a
+            # house or a corner store.
             actions.append({
                 "recommendation": "Perform a detailed harmonic study with individual "
                                   "source identification for the harmonic orders "
@@ -1189,12 +1598,18 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
 
     if (pf["current_imbalance"] is False
             and not any(k in covered for k in ("imbalance", "balance"))):
-        actions.append({
-            "recommendation": "Redistribute single-phase loads across phases. Investigate "
-                              "whether triplen harmonics are contributing to elevated "
-                              "neutral current.",
-            "purpose":  "Reduce current imbalance and neutral current.",
-            "priority": "High"})
+        if residential:
+            rec = ("Have the split-phase load balanced between the two 120 V legs "
+                   "at the panel. Large single-phase additions — EV charging, "
+                   "a heat pump, a workshop circuit — are the usual cause of a "
+                   "service drifting out of balance.")
+        else:
+            rec = ("Redistribute single-phase loads across phases. Investigate "
+                   "whether triplen harmonics are contributing to elevated "
+                   "neutral current.")
+        actions.append({"recommendation": rec,
+                        "purpose":  "Reduce current imbalance and neutral current.",
+                        "priority": "High"})
 
     if pf.get("transformer_loading") is False and "transformer upgrade" not in covered:
         actions.append({
@@ -1211,7 +1626,141 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
             "purpose":  "Return service voltage to within ANSI C84.1 Range A.",
             "priority": "High"})
 
-    return actions
+    return _prune_actions(actions)
+
+
+def compute_severities(report: dict, thresh: Thresholds) -> dict:
+    """Grade every finding once, keyed the same way as ``pass_fail``.
+
+    The executive summary is written before the compliance table is drawn, and
+    both quote severity.  Computing it in one place is what keeps the summary's
+    "1 significant, 2 minor" from disagreeing with the rows underneath it.
+    """
+    pf   = report["pass_fail"]
+    thd  = report["thd_compliance"]
+    volt = report["voltage_compliance"]
+    pfr  = report["power_factor"]
+    imb  = report["voltage_imbalance"]
+    ci   = report["current_imbalance"]
+    dem  = report["demand"]
+    ih   = report["individual_harmonics"]
+    ivh  = report.get("individual_voltage_harmonics", {})
+    hs   = report.get("harmonic_statistics", {})
+    llv  = report.get("voltage_ll_compliance") or {}
+    frq  = report.get("frequency") or {}
+    fl   = report.get("flicker") or {}
+    tdd_info = thd.get("tdd_info", {})
+
+    sev: dict = {}
+
+    # Voltage THD — artifact gating is a confidence signal, not a silent edit.
+    v_thd = thd["voltage"]
+    if v_thd.get("available"):
+        notes = []
+        if v_thd.get("artifact_samples"):
+            notes.append(f"{v_thd['artifact_samples']} interval(s) dropped as "
+                         f"artifacts below {v_thd.get('artifact_floor_v', 0):.0f} V")
+        sev["thd_voltage"] = grade_finding(
+            pf.get("thd_voltage"), measured=v_thd.get("p95_thd_pct"),
+            limit=v_thd.get("limit_pct"),
+            persistence_pct=v_thd.get("pct_exceeding"), confidence_notes=notes)
+
+    # Current TDD — an assumed ISC class is exactly the kind of soft input that
+    # should hold a finding back from the top band.
+    c_thd = thd["current"]
+    if c_thd.get("available"):
+        notes = []
+        if tdd_info and not tdd_info.get("isc_provided"):
+            notes.append("ISC not supplied — most restrictive class assumed")
+        if c_thd.get("light_load_filtered"):
+            notes.append("light-load intervals excluded")
+        sev["thd_current"] = grade_finding(
+            pf.get("thd_current"), measured=c_thd.get("mean_thd_pct"),
+            limit=c_thd.get("limit_pct"),
+            persistence_pct=c_thd.get("pct_exceeding"), confidence_notes=notes)
+
+    if volt.get("available"):
+        missing = volt.get("phases_missing_data") or []
+        worst_oob = max(v["pct_out_of_bounds"] for v in volt["phases"].values())
+        sev["voltage"] = grade_finding(
+            pf.get("voltage"), persistence_pct=worst_oob,
+            confidence_notes=([f"no usable data on "
+                               f"{', '.join(_phase_label(m) for m in missing)}"]
+                              if missing else None))
+
+    if pfr.get("available") and thresh.customer_class != "r":
+        sev["power_factor"] = grade_finding(
+            pf.get("power_factor"), measured=pfr.get("mean_pf"),
+            limit=pfr.get("limit"), persistence_pct=pfr.get("pct_below_limit"),
+            lower_is_worse=True)
+
+    if imb.get("available"):
+        sev["voltage_imbalance"] = grade_finding(
+            pf.get("voltage_imbalance"), measured=imb.get("mean_imbalance_pct"),
+            limit=imb.get("limit_pct"), persistence_pct=imb.get("pct_exceeding"))
+
+    if ci.get("available"):
+        sev["current_imbalance"] = grade_finding(
+            pf.get("current_imbalance"), measured=ci.get("mean_imbalance_pct"),
+            limit=ci.get("limit_pct"), persistence_pct=ci.get("pct_exceeding"))
+
+    if "transformer" in dem:
+        tx = dem["transformer"]
+        sev["demand"] = grade_finding(
+            not tx["overloaded"], measured=tx["peak_8h_kva"],
+            limit=tx["nameplate_kva"])
+
+    if ih.get("available"):
+        sev["individual_harmonics"] = grade_finding(
+            pf.get("individual_harmonics"),
+            measured=ih.get("worst_margin_pct_of_il"),
+            limit=ih.get("worst_limit_pct"))
+
+    if ivh.get("available"):
+        sev["individual_voltage_harmonics"] = grade_finding(
+            pf.get("individual_voltage_harmonics"),
+            measured=ivh.get("worst_pct_nom"), limit=ivh.get("limit_pct"))
+
+    if hs.get("available"):
+        # Grade on the order that binds, so a P95 sitting at 91% of its limit
+        # reads as Watch here rather than as a bare Compliant.
+        b = hs.get("binding") or {}
+        sev["harmonic_statistics"] = grade_finding(
+            pf.get("harmonic_statistics"),
+            measured=b.get("p95"), limit=b.get("limit"),
+            confidence_notes=([f"{hs['period_days']:.1f}-day recording, short of "
+                               "the 7 days Clause 5 assumes"]
+                              if hs.get("period_days", 7) < 7 else None))
+
+    if fl.get("available"):
+        sev["flicker"] = grade_finding(
+            fl.get("overall_pass"), measured=fl.get("pst_max"),
+            limit=fl.get("pst_limit"))
+
+    if llv.get("available"):
+        worst = max(llv["pairs"].values(), key=lambda p: p["pct_out_of_bounds"])
+        sev["voltage_line_to_line"] = grade_finding(
+            llv.get("overall_pass"), persistence_pct=worst["pct_out_of_bounds"])
+
+    if frq.get("available"):
+        sev["frequency"] = grade_finding(
+            frq.get("overall_pass"), persistence_pct=frq.get("pct_out_of_bounds"))
+
+    if report.get("itic", {}).get("available"):
+        sev["itic_transients"] = grade_finding(pf.get("itic_transients"))
+
+    return sev
+
+
+def _severity_rollup(sev: dict) -> str:
+    """"1 significant, 2 minor" — the proportion a bare fail count hides."""
+    counts: dict = {}
+    for s in sev.values():
+        if s["band"] in ("severe", "significant", "minor"):
+            counts[s["band"]] = counts.get(s["band"], 0) + 1
+    order = ["severe", "significant", "minor"]
+    return ", ".join(f"{counts[b]} {SEVERITY_LABEL[b].lower()}"
+                     for b in order if b in counts)
 
 
 def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
@@ -1232,14 +1781,25 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
     if fl and fl["passes"] is False:
         fails.append("voltage flicker (IEC 61000-3-3)")
 
+    sev = compute_severities(report, thresh)
+
     bullets: List[str] = []
     if fails:
+        # A bare count of failed standards reads the same whether every one is a
+        # marginal excursion or a sustained overload.  Leading with the severity
+        # mix gives the reader proportion before they reach the table.
+        rollup = _severity_rollup(sev)
+        mix = f" ({rollup} by severity)" if rollup else ""
         bullets.append(
             f"{len(fails)} of the {n_eval} power quality standards evaluated were "
-            f"not met: {', '.join(fails)}.")
+            f"not met{mix}: {', '.join(fails)}.")
     else:
+        watch = sum(1 for s in sev.values() if s["band"] == "watch")
+        watch_txt = (f" {watch} measurement(s) sit within the limit but close "
+                     "enough to it to be worth tracking." if watch else "")
         bullets.append(
-            f"All {n_eval} power quality standards evaluated for this service were met.")
+            f"All {n_eval} power quality standards evaluated for this service "
+            f"were met.{watch_txt}")
 
     if key_findings and (fails or len(key_findings) > 0):
         bullets.append(key_findings[0])
@@ -1267,9 +1827,14 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
     else:
         bullets.append("No corrective actions are required at this time.")
 
+    # Three marginal exceedances are not "significant deficiencies".  Escalate on
+    # how bad the findings are, not on how many rows are red.
+    n_serious = sum(1 for s in sev.values()
+                    if s["band"] in ("severe", "significant"))
     has_critical = (any(f.get("severity") == "critical" for f in rca)
                     or report.get("neutral_health", {}).get("severity") == "critical"
-                    or len(fails) >= 3)
+                    or any(s["band"] == "severe" for s in sev.values())
+                    or n_serious >= 3)
     has_warning  = any(f.get("severity") == "warning" for f in rca)
     if fails and has_critical:
         overall = ("Overall assessment: significant power quality deficiencies exist at "
@@ -1313,8 +1878,10 @@ def _word_recording_overview(doc, report, outdir=None, stem="") -> None:
         "applied; every finding in this report derives from them. Any span the "
         "meter did not record is shaded and the trace is broken across it, so a "
         "gap cannot be mistaken for a flat reading."
-        + ("  This file was incomplete when read — see the data quality note in "
-           "the Appendix." if dq else ""))
+        + ("  This file was incomplete when read — see Source file integrity in "
+           "the header table above."
+           if (dq.get("missing_bytes") or dq.get("unreadable_observations"))
+           else ""))
     _embed_plot(doc, outdir, stem, "overview.png",
                 caption="Measured voltage and current over the recording period.")
     doc.add_paragraph()
@@ -1565,7 +2132,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         else:
             ll_note = (
                 " Light-load intervals are excluded from this evaluation "
-                "(see the Appendix for the method)."
+                "(see Appendix B for the method)."
                 if c_thd.get("light_load_filtered") else ""
             )
             _body(doc,
@@ -1594,7 +2161,8 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             if not r["pass"]
         ]
         _body(doc,
-            f"The following individual harmonic orders exceeded their IEEE 519-2022 per-order limits: "
+            f"The following individual current harmonic orders exceeded their IEEE 519-2022 "
+            f"Table 2 per-order limits: "
             + ", ".join(fail_orders) + ". "
             "Individual harmonic limits are more restrictive than TDD for higher-order harmonics. "
             "Per-order magnitudes for every phase are tabulated below."
@@ -1604,7 +2172,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         if h_ord:
             worst_r = ih["phases"].get(h_ord[1], {}).get(h_ord[0], {})
             _body(doc,
-                f"All individual harmonic orders are within IEEE 519-2022 limits. "
+                f"All individual current harmonic orders are within IEEE 519-2022 Table 2 limits. "
                 f"The most constraining harmonic is H{h_ord[0]} (phase {h_ord[1].upper()}) "
                 f"at {ih['worst_pct_of_il']:.2f}% of IL "
                 f"against a limit of {worst_r.get('limit_pct_il', '—')}%."
@@ -1773,7 +2341,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         doc.add_paragraph(
             f"Overall indication: {overall_labels.get(overall, overall)}. "
             f"Resonance suspects: {res_str}. "
-            "This is an indication only; see the Appendix for the method and its limitations. It concerns the direction distortion appears to come from, not responsibility for it."
+            "This is an indication only; see Appendix B for the method and its limitations. It concerns the direction distortion appears to come from, not responsibility for it."
         )
 
         sh_tbl = doc.add_table(rows=1, cols=5)
@@ -1833,7 +2401,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         doc.add_paragraph(
             f"Percentiles computed over the {hs['period_days']:.1f}-day recording period "
             f"(ISC/IL = {hs['isc_il_ratio']:.0f}, class {hs['isc_class']}). "
-            "See the Appendix for the statistical method and its limitations."
+            "See Appendix B for the statistical method and its limitations."
         )
         # The bracketed figure is headroom against the limit, so a negative
         # value marks an exceedance. Without saying so, the convention
@@ -2109,9 +2677,13 @@ def _word_neutral_health(doc, report, thresh, outdir=None, stem="") -> Optional[
     indicators = [
         ("L1 + L2 Sum (mean / std)",
          f"{nh['sum_mean_v']:.1f} V / {nh['sum_std_v']:.2f} V",
-         "Healthy: ~240 V, std < 1 V"),
+         (f"Healthy: ~{nh.get('healthy_sum_v', 240):.0f} V, std < 1 V"
+          + (f"; open neutral → ~{nh.get('open_neutral_sum_v', 0):.0f} V"
+             if nh.get("sum_is_diagnostic") else
+             "; same either way on this service"))),
         ("L1–L2 Correlation (Pearson r)",
-         f"{nh['leg_correlation']:.3f}",
+         (f"{nh['leg_correlation']:.3f}"
+          if nh.get("leg_correlation") is not None else "not computable"),
          "Healthy: r > 0.80; open neutral → r ≈ −1"),
         ("Voltage Asymmetry |L1 − L2|",
          f"{nh['asym_mean_v']:.1f} V mean, {nh['asym_max_v']:.1f} V max ({nh['asym_pct']:.1f}%)",
@@ -2207,7 +2779,26 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
                 f"({nc['mean_pct_of_phase']:.1f}% of phase average) with a peak of "
                 f"{nc['max_amps']:.1f} A ({nc['max_pct_of_phase']:.1f}%)."
             )
-            if nc["mean_pct_of_phase"] > 15:
+            if is_single_phase_208(thresh.service_type):
+                # The two legs of a 120/208 service are 120 degrees apart, so
+                # their currents do not subtract in the neutral the way the two
+                # legs of a 120/240 service do. With balanced load the neutral
+                # carries essentially full leg current, and calling that
+                # "elevated" would send an engineer looking for a fault that
+                # is not there.
+                nc_text += (
+                    " This is a single-phase 120/208 service — two legs of a "
+                    "three-phase transformer — so the legs are 120° apart "
+                    "rather than the 180° of a 120/240 service. Their currents "
+                    "add vectorially instead of subtracting, and with balanced "
+                    "load the neutral carries roughly the same current as each "
+                    "leg. A neutral near 100% of leg current is therefore "
+                    "normal here and is not evidence of imbalance. Triplen "
+                    "harmonics (3rd, 9th, 15th) also add in phase on this "
+                    "configuration, so neutral current above leg current points "
+                    "to harmonics rather than to a wiring fault."
+                )
+            elif nc["mean_pct_of_phase"] > 15:
                 nc_text += (
                     " Elevated neutral current is consistent with load imbalance and/or significant "
                     "triplen harmonic currents (3rd, 9th, 15th) from nonlinear single-phase loads "
@@ -2544,7 +3135,7 @@ def _channel_description(name: str, is_split: bool) -> str:
 
 
 def _word_channel_appendix(doc, report, df) -> None:
-    """Appendix B: every channel read out of the file, and what it holds.
+    """Appendix C: every channel read out of the file, and what it holds.
 
     The channel-to-quantity match is the one step that fails silently: a label
     matched to the wrong quantity produces a full report of confident numbers
@@ -2557,7 +3148,7 @@ def _word_channel_appendix(doc, report, df) -> None:
         return
 
     doc.add_page_break()
-    _section_heading(doc, "Appendix B: Channels Read From the Meter File", level=1)
+    _section_heading(doc, "Appendix C: Channels Read From the Meter File", level=1)
 
     is_split  = "voltage_c" not in fs.get("channels", [])
     intervals = fs.get("sample_count", len(df))
@@ -2615,10 +3206,10 @@ def _word_channel_appendix(doc, report, df) -> None:
 
 
 def _word_appendix(doc, report, thresh, df) -> None:
-    """Appendix A: Standards, Methods, and Limitations — methodology disclosures
+    """Appendix B: Standards, Methods, and Limitations — methodology disclosures
     moved out of the main body."""
     doc.add_page_break()
-    _section_heading(doc, "Appendix A: Standards, Methods, and Limitations", level=1)
+    _section_heading(doc, "Appendix B: Standards, Methods, and Limitations", level=1)
     _body(doc,
         "The notes below describe the measurement basis, statistical methods, and "
         "known limitations behind the findings in this report.")
@@ -2803,8 +3394,10 @@ def generate_word_report(
 
     fs         = report["file_summary"]
     nominal_v  = thresh.nominal_voltage
-    is_split   = "voltage_c" not in fs.get("channels", [])
-    nominal_ll = round(nominal_v * 2) if is_split else round(nominal_v * 3**0.5)
+    # A single-phase 120/208 service also lacks a C channel, so channel
+    # presence alone reported it as 120/240 -- a 13% error that reads as a
+    # severe undervoltage. The service-type picker settles it.
+    nominal_ll = round(nominal_v * ll_factor(thresh.service_type, thresh.topology))
 
     hdr = doc.add_paragraph()
     hdr.alignment = WD_ALIGN_PARAGRAPH.LEFT
@@ -2817,9 +3410,10 @@ def generate_word_report(
     opening = doc.add_paragraph()
     opening.add_run(
         "This report summarizes power quality measurements at the service listed above "
-        "and evaluates them against the applicable standards. Conclusions, key findings, "
-        "and recommended actions are presented first; detailed measurements and harmonic "
-        "diagnostics follow as supporting evidence."
+        "and evaluates them against the applicable standards. The executive summary and "
+        "compliance status come first, followed by the detailed measurements and harmonic "
+        "diagnostics they rest on; key findings, the engineering assessment and "
+        "recommended actions are drawn from those measurements and appear after them."
     )
     doc.add_paragraph()
 
@@ -2830,18 +3424,24 @@ def generate_word_report(
     key_findings = _collect_key_findings(report, thresh, df)
     actions      = _build_structured_actions(report, thresh)
 
+    # Order: summary, then the measurements, then what is concluded from them.
+    # This is the internal engineering document, and its reader wants the data
+    # before the narrative -- they are checking the numbers, not being persuaded
+    # by them. Key Findings, the assessment and the actions all cite the
+    # measurement sections, so those sections now precede rather than follow
+    # what refers to them.
     _word_exec_summary(doc, report, thresh, df, key_findings, actions)
-    _word_key_findings(doc, key_findings)
-    # Definitions go after the findings but before the detailed sections: a
-    # reader who bounces off "total demand distortion" in Key Findings meets the
-    # definition immediately, without a glossary at the back nobody reaches.
-    _word_terms_panel(doc, report)
-    _word_engineering_assessment(doc, report)
-    _word_recommended_actions(doc, actions)
+    # Definitions live in Appendix A; the pointer sits ahead of the measurement
+    # sections, which is where the terminology first appears.
+    _word_terms_pointer(doc, report)
     _word_measurement_review(doc, report, thresh, df, outdir, stem)
     _word_harmonics(doc, report, thresh, df, outdir, stem)
+    _word_key_findings(doc, key_findings)
+    _word_engineering_assessment(doc, report)
+    _word_recommended_actions(doc, actions)
     _word_signoff(doc, engineer_name, engineer_title, engineer_phone, engineer_email,
                   engineer_contact)
+    _word_terms_panel(doc, report)
     _word_appendix(doc, report, thresh, df)
     _word_channel_appendix(doc, report, df)
 
@@ -3633,16 +4233,35 @@ def _applicable_terms(report: dict) -> List[Tuple[str, str]]:
     return [(t, d) for t, d, key in _TERM_DEFINITIONS if present(key)]
 
 
+def _word_terms_pointer(doc, report: dict) -> None:
+    """One line telling the reader where the definitions live.
+
+    The glossary sits in Appendix A rather than inline, so a reader who meets an
+    unfamiliar term in Key Findings needs somewhere to be sent; without this the
+    definitions are only found by whoever happens to page to the back.
+    """
+    if not _applicable_terms(report):
+        return
+    p = doc.add_paragraph()
+    r = p.add_run(
+        "Terms used in this report — total demand distortion, percentiles, "
+        "and the rest — are defined in Appendix A.")
+    r.italic = True
+    r.font.size = Pt(9)
+    r.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+    doc.add_paragraph()
+
+
 def _word_terms_panel(doc, report: dict) -> None:
-    """Define the report's recurring terms once, before they are first used."""
+    """Define the report's recurring terms, in Appendix A."""
     terms = _applicable_terms(report)
     if not terms:
         return
-    _section_heading(doc, "Terms used in this report", level=1)
+    _section_heading(doc, "Appendix A: Terms Used in This Report", level=1)
     _body(doc,
         "This report is written for an engineering reader but is also shared with "
-        "customers. The terms below are the ones it relies on; the measurements "
-        "that follow assume them rather than re-explaining them.")
+        "customers. The terms below are the ones it relies on; the measurement "
+        "sections assume them rather than re-explaining them.")
     tbl = doc.add_table(rows=len(terms), cols=2)
     tbl.style = "Table Grid"
     _set_col_widths(tbl, [4.8, 11.7])

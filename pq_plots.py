@@ -43,6 +43,54 @@ _PHASE_CLR  = {"a": _PH_A, "b": _PH_B, "c": _PH_C,
 _NEUTRAL_CLR = "#666666"
 
 
+#: Power channels are carried in watts and VAR throughout (see PQDataset in
+#: pq_adapter), while every label and every reported figure is in kW and kVAR.
+#: The analysis code divides by 1000 at each use; the plots did not, so a 3.2 kW
+#: house was drawn as 3,200 on an axis labelled kW.
+_W_PER_KW = 1000.0
+
+
+def _to_kilo(series: pd.Series) -> pd.Series:
+    """Convert a watt/VAR channel to kW/kVAR for display."""
+    return series / _W_PER_KW
+
+
+def service_phases(df: pd.DataFrame, thresh: Optional[Thresholds] = None) -> list:
+    """The phases this service actually has, as (key, label, colour).
+
+    A 120/240 V split-phase service has two legs, not three, and labelling them
+    "Phase A/B/C" invents a conductor that does not exist -- the harmonic
+    spectrum chart was drawing an empty "Phase C" series and legend entry for
+    every house.
+
+    Resolution order puts the engineer's own picker first, because channel
+    presence alone cannot tell a genuinely single-phase service from a
+    three-phase one whose C phase is missing from the export:
+
+      1. ``service_type`` from the transformer picker ("1ph-..." is split-phase)
+      2. ``topology`` if explicitly set to something other than "auto"
+      3. otherwise, whether a C-phase channel was read at all
+    """
+    split = None
+    if thresh is not None:
+        svc = (thresh.service_type or "")
+        if svc.startswith("1ph"):
+            split = True
+        elif svc.startswith("3ph"):
+            split = False
+        elif thresh.topology == "split-phase":
+            split = True
+        elif thresh.topology == "3ph-wye":
+            split = False
+    if split is None:
+        split = "current_c" not in df.columns and "voltage_c" not in df.columns
+
+    if split:
+        # L1/L2 is what the legs are called on a split-phase service.
+        return [("a", "L1", _PH_A), ("b", "L2", _PH_B)]
+    return [("a", "Phase A", _PH_A), ("b", "Phase B", _PH_B), ("c", "Phase C", _PH_C)]
+
+
 def _plot_name(stem: str, name: str) -> str:
     """Stem-prefixed plot filename so multi-site output dirs never collide."""
     return f"{stem}_{name}" if stem else name
@@ -138,11 +186,9 @@ def plot_overview(
         log.warning("Overview plot needs voltage or current channels — skipping.")
         return
 
-    is_split = "voltage_c" not in df.columns and "current_c" not in df.columns
-    if is_split:
-        labels = {"a": "L1", "b": "L2"}
-    else:
-        labels = {"a": "Phase A", "b": "Phase B", "c": "Phase C"}
+    phases   = service_phases(df, thresh)
+    labels   = {ph: label for ph, label, _ in phases}
+    is_split = len(phases) == 2
 
     panels = [p for p in (("v", v_cols), ("i", i_cols)) if p[1]]
     gaps = _gap_spans(df.index)
@@ -226,12 +272,13 @@ def plot_voltage(
 
     fig, ax = plt.subplots(figsize=(14, 5))
     colors = {"voltage_a": _PH_A, "voltage_b": _PH_B, "voltage_c": _PH_C}
-    is_split = "voltage_c" not in df.columns
+    phases   = service_phases(df, thresh)
+    is_split = len(phases) == 2
     if is_split:
         labels = {"voltage_a": "L1-N", "voltage_b": "L2-N"}
         topo_title = "Split-Phase Voltage (L-N)"
     else:
-        labels = {"voltage_a": "Phase A", "voltage_b": "Phase B", "voltage_c": "Phase C"}
+        labels = {f"voltage_{ph}": label for ph, label, _ in phases}
         topo_title = "Three-Phase Voltage"
 
     for col in v_cols:
@@ -363,9 +410,9 @@ def plot_summary(
     if "power_factor" in df.columns:
         panels.append(("Power Factor", df["power_factor"], None, "#009688"))
     if "power_real" in df.columns:
-        panels.append(("Real Power (kW)", df["power_real"], None, "#F44336"))
+        panels.append(("Real Power (kW)", _to_kilo(df["power_real"]), None, "#F44336"))
     if "power_reactive" in df.columns:
-        panels.append(("Reactive Power (kVAR)", df["power_reactive"], None, "#FF5722"))
+        panels.append(("Reactive Power (kVAR)", _to_kilo(df["power_reactive"]), None, "#FF5722"))
 
     if not panels:
         return
@@ -404,7 +451,7 @@ def plot_harmonic_spectrum(
     display as % of IL for direct comparison against limits.
     """
     orders = [3, 5, 7, 9, 11, 13]
-    phases = [("a", "Phase A", _PH_A), ("b", "Phase B", _PH_B), ("c", "Phase C", _PH_C)]
+    phases = service_phases(df, thresh)
 
     # Build per-phase median harmonic % of IL
     il_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
@@ -430,11 +477,14 @@ def plot_harmonic_spectrum(
         return
 
     x = np.arange(len(orders))
-    width = 0.22
+    # Width and offset both follow the phase count so a two-leg service gets a
+    # centred pair rather than three slots with one left empty.
+    n_ph  = len(phases)
+    width = 0.66 / n_ph
     fig, ax = plt.subplots(figsize=(11, 5))
 
     for i, (ph, label, color) in enumerate(phases):
-        offset = (i - 1) * width
+        offset = (i - (n_ph - 1) / 2) * width
         ax.bar(x + offset, data[ph], width, label=label, color=color, alpha=0.85)
 
     # IEEE 519-2022 limits — horizontal segment spanning only the orders each limit covers
@@ -692,7 +742,7 @@ def plot_demand_profile(
     """
     i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
     if "power_real" in df.columns and df["power_real"].notna().any():
-        demand = df["power_real"].dropna()
+        demand = _to_kilo(df["power_real"].dropna())
         d_label = "Real power (kW)"
     elif i_cols:
         demand = df[i_cols].max(axis=1).dropna()
@@ -886,7 +936,7 @@ def plot_pf_load(
     if "power_factor" not in df.columns:
         return
     if "power_real" in df.columns and df["power_real"].notna().any():
-        load, x_label = df["power_real"], "Real power (kW)"
+        load, x_label = _to_kilo(df["power_real"]), "Real power (kW)"
     else:
         i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
         if not i_cols:

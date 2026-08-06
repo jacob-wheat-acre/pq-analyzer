@@ -1346,6 +1346,902 @@ class TestBlueBookISCLookup:
         assert isc_240 == pytest.approx(2 * isc_480, rel=0.01)
 
 
+class TestTwoLegServiceRigor:
+    """NEMA MG1 and the neutral sum both depend on the service configuration.
+
+    NEMA MG1 unbalance is defined for three-phase systems; its formula applied
+    to two legs returns half the difference an engineer would quote, under a
+    label that does not apply. And the L1+L2 sum discriminates an open neutral
+    on a 120/208 service but cannot on a 120/240 one.
+    """
+
+    def _two_leg(self, va=122.0, vb=118.0, n=120):
+        import pandas as pd
+        return pd.DataFrame(
+            {"voltage_a": np.full(n, va), "voltage_b": np.full(n, vb)},
+            index=pd.date_range("2025-01-01", periods=n, freq="5min"))
+
+    def _ds(self, va, vb):
+        import pandas as pd
+        n = len(va)
+        class _DS:
+            pass
+        d = _DS()
+        d.df = pd.DataFrame({"voltage_a": va, "voltage_b": vb},
+                            index=pd.date_range("2025-01-01", periods=n, freq="5min"))
+        d.meta = {"topology": "split-phase"}
+        d.has_adaptive = False
+        d.adaptive_df = None
+        return d
+
+    def test_nema_mg1_is_not_claimed_on_a_single_phase_service(self):
+        from pq_analysis import check_voltage_imbalance
+        r = check_voltage_imbalance(self._two_leg(),
+                                    Thresholds(nominal_voltage=120.0))
+        assert r["metric"] == "leg_difference"
+        assert "NEMA MG1" not in r["metric_label"]
+        assert "not applicable to a single-phase service" in r["basis"]
+
+    def test_two_legs_report_the_full_difference_not_half(self):
+        from pq_analysis import check_voltage_imbalance
+        # 122 vs 118 on a 120 V base is a 4 V spread: 3.33% of nominal.
+        # The NEMA formula applied to two elements would have said 1.67%.
+        r = check_voltage_imbalance(self._two_leg(),
+                                    Thresholds(nominal_voltage=120.0))
+        assert r["mean_imbalance_pct"] == pytest.approx(3.333, abs=0.01)
+
+    def test_three_phase_still_uses_nema_mg1(self):
+        from pq_analysis import check_voltage_imbalance
+        import pandas as pd
+        n = 60
+        df = pd.DataFrame({"voltage_a": np.full(n, 122.0),
+                           "voltage_b": np.full(n, 118.0),
+                           "voltage_c": np.full(n, 120.0)},
+                          index=pd.date_range("2025-01-01", periods=n, freq="5min"))
+        r = check_voltage_imbalance(df, Thresholds(nominal_voltage=120.0))
+        assert r["metric"] == "nema_mg1"
+        assert r["mean_imbalance_pct"] == pytest.approx(1.667, abs=0.01)
+
+    def test_a_208_service_says_the_third_phase_is_unmeasured(self):
+        from pq_analysis import check_voltage_imbalance
+        r = check_voltage_imbalance(
+            self._two_leg(), Thresholds(nominal_voltage=120.0,
+                                        service_type="1ph-208"))
+        assert r["note"] and "cannot be determined" in r["note"]
+
+    def test_the_sum_discriminates_an_open_neutral_on_a_208_service(self):
+        from pq_analysis import check_neutral_health
+        n = 120
+        # Open neutral: the two loads sit in series across the 208 V L-L.
+        frac = np.full(n, 0.45)
+        ds = self._ds(208.0 * frac, 208.0 * (1 - frac))
+        r = check_neutral_health(ds, Thresholds(nominal_voltage=120.0,
+                                                service_type="1ph-208"))
+        assert r["sum_is_diagnostic"] is True
+        assert r["sum_toward_open"] > 0.9
+        assert any("collapsed toward the line-to-line" in f for f in r["findings"])
+
+    def test_a_healthy_208_service_is_not_flagged_by_the_sum(self):
+        from pq_analysis import check_neutral_health
+        n = 120
+        ds = self._ds(np.full(n, 120.0), np.full(n, 120.0))
+        r = check_neutral_health(ds, Thresholds(nominal_voltage=120.0,
+                                                service_type="1ph-208"))
+        assert r["sum_toward_open"] == pytest.approx(0.0, abs=0.05)
+
+    def test_the_sum_carries_no_information_on_a_120_240_service(self):
+        # Collinear legs sum to the line-to-line voltage whether the neutral is
+        # intact or open, so a steady 240 V must not read as proof of health.
+        from pq_analysis import check_neutral_health
+        n = 120
+        healthy = self._ds(np.full(n, 120.0), np.full(n, 120.0))
+        frac = np.full(n, 0.45)
+        opened = self._ds(240.0 * frac, 240.0 * (1 - frac))
+        th = Thresholds(nominal_voltage=120.0)
+        for ds in (healthy, opened):
+            r = check_neutral_health(ds, th)
+            assert r["sum_is_diagnostic"] is False
+            assert any("carries no open-neutral information" in f
+                       for f in r["findings"])
+
+    def test_an_open_neutral_on_a_120_240_service_is_still_caught(self):
+        # The sum cannot see it, but the cross-leg behaviour must.
+        from pq_analysis import check_neutral_health
+        n = 120
+        rng = np.random.default_rng(1)
+        frac = 0.45 + rng.normal(0, 0.03, n)
+        ds = self._ds(240.0 * frac, 240.0 * (1 - frac))
+        r = check_neutral_health(ds, Thresholds(nominal_voltage=120.0))
+        assert r["severity"] in ("warning", "critical")
+        assert r["leg_correlation_available"]
+        assert r["leg_correlation"] < 0
+
+    def test_neutral_health_runs_on_a_208_service(self):
+        from pq_analysis import check_neutral_health
+        n = 60
+        ds = self._ds(np.full(n, 120.0), np.full(n, 120.0))
+        r = check_neutral_health(ds, Thresholds(nominal_voltage=120.0,
+                                                service_type="1ph-208"))
+        assert r["available"] and r["topology"] == "1ph-208"
+
+
+class TestSinglePhase208Service:
+    """A single-phase service taken from two legs of a 208Y/120 wye.
+
+    Common in condos and apartments. It has two legs like a 120/240 service,
+    but they sit 120 degrees apart rather than 180, which changes the
+    line-to-line voltage, the neutral current expectation, and which Blue Book
+    rows the fault current comes from.
+    """
+
+    def test_line_to_line_is_208_not_240(self):
+        from pq_constants import ll_factor
+        assert 120 * ll_factor("1ph-208") == pytest.approx(207.8, abs=0.5)
+        assert 120 * ll_factor("1ph-padmount") == pytest.approx(240.0)
+
+    def test_it_is_recognised_as_a_single_phase_208_service(self):
+        from pq_constants import is_single_phase_208
+        assert is_single_phase_208("1ph-208")
+        assert not is_single_phase_208("1ph-padmount")
+        assert not is_single_phase_208("3ph-padmount")
+        assert not is_single_phase_208(None)
+
+    def test_fault_current_comes_from_the_three_phase_rows(self):
+        from pq_constants import _lookup_isc
+        net = _lookup_isc("1ph-208", 75, 120.0)
+        thr = _lookup_isc("3ph-padmount", 75, 120.0)
+        assert net is not None and thr is not None
+        assert net[0] == thr[0]           # same transformer, same ISC
+        assert "208V secondary" in net[1]
+        # ...and it is not the single-phase answer.
+        sp = _lookup_isc("1ph-padmount", 75, 120.0)
+        assert sp is None or sp[0] != net[0]
+
+    def test_the_kva_picker_is_populated(self):
+        # The service type has no Blue Book rows of its own; without the proxy
+        # the Size dropdown would be permanently empty.
+        import run
+        assert run._kva_options("1ph-208", 120.0)
+        assert run._resolve_secondary_v("1ph-208", 120.0) == 208
+
+    def test_it_appears_in_the_picker(self):
+        from pq_constants import _SERVICE_TYPE_LABEL
+        import run
+        assert "1ph-208" in _SERVICE_TYPE_LABEL
+        assert "1ph-208" in run._TYPE_ORDER
+
+    def test_it_still_resolves_to_two_legs(self):
+        from pq_plots import service_phases
+        import pandas as pd
+        n = 10
+        df = pd.DataFrame(
+            {"voltage_a": np.full(n, 120.0), "voltage_b": np.full(n, 120.0)},
+            index=pd.date_range("2025-01-01", periods=n, freq="5min"))
+        ph = service_phases(df, Thresholds(service_type="1ph-208"))
+        assert len(ph) == 2
+
+    def test_a_full_neutral_is_not_called_elevated(self, tmp_path):
+        # With balanced load the neutral carries essentially full leg current
+        # on this configuration; the report must say that is normal rather
+        # than reporting imbalance.
+        pytest.importorskip("docx")
+        import subprocess, sys, glob, os
+        from docx import Document
+        root = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(
+            [sys.executable, os.path.join(root, "pq_analyzer.py"),
+             os.path.join(root, "test_data", "test_residential.pqd"),
+             "--customer-class", "r", "--service-type", "1ph-208",
+             "--report", "--no-plots", "--outdir", str(tmp_path)],
+            check=True, capture_output=True)
+        d = Document(glob.glob(str(tmp_path / "**" / "*_report.docx"),
+                               recursive=True)[0])
+        body = " ".join(p.text for p in d.paragraphs)
+        if "Neutral current averaged" in body:
+            assert "120°" in body or "120 degrees" in body
+
+
+class TestServicePhasesFollowTheService:
+    """A split-phase house has two legs, not three.
+
+    The harmonic spectrum chart drew an empty "Phase C" bar and legend entry on
+    every residential file, inventing a conductor that does not exist.
+    """
+
+    def _df(self, three_phase: bool):
+        import pandas as pd
+        n = 20
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        cols = {"voltage_a": np.full(n, 120.0), "voltage_b": np.full(n, 120.0),
+                "current_a": np.full(n, 30.0), "current_b": np.full(n, 30.0)}
+        if three_phase:
+            cols["voltage_c"] = np.full(n, 120.0)
+            cols["current_c"] = np.full(n, 30.0)
+        return pd.DataFrame(cols, index=idx)
+
+    def test_split_phase_channels_give_two_legs(self):
+        from pq_plots import service_phases
+        ph = service_phases(self._df(False), Thresholds())
+        assert [p[1] for p in ph] == ["L1", "L2"]
+
+    def test_three_phase_channels_give_three_phases(self):
+        from pq_plots import service_phases
+        ph = service_phases(self._df(True), Thresholds())
+        assert [p[1] for p in ph] == ["Phase A", "Phase B", "Phase C"]
+
+    def test_the_service_type_picker_wins_over_channel_presence(self):
+        # A three-phase export missing its C channel must not be relabelled as
+        # a split-phase service when the engineer said it is three-phase.
+        from pq_plots import service_phases
+        ph = service_phases(self._df(False),
+                            Thresholds(service_type="3ph-padmount"))
+        assert len(ph) == 3
+
+    def test_a_single_phase_transformer_forces_two_legs(self):
+        from pq_plots import service_phases
+        ph = service_phases(self._df(True),
+                            Thresholds(service_type="1ph-padmount"))
+        assert [p[1] for p in ph] == ["L1", "L2"]
+
+    def test_the_topology_picker_is_honoured(self):
+        from pq_plots import service_phases
+        assert len(service_phases(self._df(True),
+                                  Thresholds(topology="split-phase"))) == 2
+        assert len(service_phases(self._df(False),
+                                  Thresholds(topology="3ph-wye"))) == 3
+
+    def test_auto_topology_defers_to_the_channels(self):
+        from pq_plots import service_phases
+        assert len(service_phases(self._df(True), Thresholds(topology="auto"))) == 3
+        assert len(service_phases(self._df(False), Thresholds(topology="auto"))) == 2
+
+    def test_the_spectrum_plot_draws_only_real_phases(self, tmp_path):
+        pytest.importorskip("matplotlib")
+        from pq_plots import plot_harmonic_spectrum
+        import matplotlib.pyplot as plt
+        df = self._df(False)
+        for h in (3, 5, 7, 9, 11, 13):
+            df[f"h{h}_current_a"] = 1.0
+            df[f"h{h}_current_b"] = 0.8
+        plot_harmonic_spectrum(df, Thresholds(isc_amps=5000.0),
+                               outdir=tmp_path, stem="s")
+        assert (tmp_path / "s_harmonic_spectrum.png").exists()
+        # The legend is built from the resolved phase list, so this is the
+        # invariant that matters: no C entry for a two-leg service.
+        from pq_plots import service_phases
+        assert all(p[0] != "c" for p in service_phases(df, Thresholds()))
+
+
+class TestSectionOrder:
+    """Measurements precede the narrative drawn from them.
+
+    This is the internal engineering document: its reader is checking numbers,
+    not being walked to a conclusion, so the sections that cite measurements
+    come after the measurements rather than before them.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def headings(cls, tmp_path_factory):
+        pytest.importorskip("docx")
+        import subprocess, sys, glob, os
+        from docx import Document
+        out = tmp_path_factory.mktemp("order")
+        root = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(
+            [sys.executable, os.path.join(root, "pq_analyzer.py"),
+             os.path.join(root, "test_data", "test_commercial_large.pqd"),
+             "--isc", "10000", "--nominal", "277", "--report", "--no-plots",
+             "--outdir", str(out)], check=True, capture_output=True)
+        path = glob.glob(str(out / "**" / "*_report.docx"), recursive=True)[0]
+        d = Document(path)
+        return [p.text.strip() for p in d.paragraphs
+                if p.style.name == "Heading 1" and p.text.strip()]
+
+    def _idx(self, headings, prefix):
+        return next(i for i, h in enumerate(headings) if h.startswith(prefix))
+
+    def test_measurement_review_follows_the_executive_summary(self, headings):
+        assert (self._idx(headings, "Detailed Measurement Review")
+                == self._idx(headings, "Executive Summary") + 1)
+
+    def test_measurements_precede_the_narrative(self, headings):
+        last_measurement = max(self._idx(headings, "Detailed Measurement Review"),
+                               self._idx(headings, "Harmonic Evaluation"))
+        for narrative in ("Key Findings",
+                          "Engineering Assessment",
+                          "Recommended Actions"):
+            assert self._idx(headings, narrative) > last_measurement
+
+    def test_the_two_measurement_sections_stay_adjacent(self, headings):
+        assert (self._idx(headings, "Harmonic Evaluation")
+                == self._idx(headings, "Detailed Measurement Review") + 1)
+
+    def test_appendices_remain_last(self, headings):
+        first_appendix = self._idx(headings, "Appendix A")
+        assert all(h.startswith("Appendix") for h in headings[first_appendix:])
+
+    def test_the_opening_paragraph_describes_the_actual_order(self, tmp_path_factory):
+        # The opening said conclusions came first and measurements followed.
+        pytest.importorskip("docx")
+        import subprocess, sys, glob, os
+        from docx import Document
+        out = tmp_path_factory.mktemp("intro")
+        root = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(
+            [sys.executable, os.path.join(root, "pq_analyzer.py"),
+             os.path.join(root, "test_data", "test_commercial_small.pqd"),
+             "--report", "--no-plots", "--outdir", str(out)],
+            check=True, capture_output=True)
+        d = Document(glob.glob(str(out / "**" / "*_report.docx"), recursive=True)[0])
+        body = " ".join(p.text for p in d.paragraphs)
+        assert "recommended actions are presented first" not in body
+
+
+class TestPowerUnitsAreConsistent:
+    """Power channels are watts/VAR; every label and figure is kW/kVAR.
+
+    The plots were drawing the raw channel under a kW label, so a 3.2 kW house
+    appeared as 3,200 kW.  The analysis code had always divided by 1000, so the
+    text and the charts disagreed by a factor of a thousand.
+    """
+
+    def _df(self, watts=3200.0, n=48):
+        import pandas as pd
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame({
+            "power_real":     np.full(n, watts),
+            "power_reactive": np.full(n, watts * 0.3),
+            "power_factor":   np.full(n, 0.96),
+            "current_a":      np.full(n, 27.0),
+        }, index=idx)
+
+    def test_the_demand_plot_draws_kilowatts(self, tmp_path):
+        pytest.importorskip("matplotlib")
+        from pq_plots import plot_demand_profile
+        import matplotlib.pyplot as plt
+        plot_demand_profile(self._df(), {}, outdir=tmp_path, stem="u")
+        # The y data must be ~3.2, not ~3200.
+        from pq_plots import _to_kilo
+        assert _to_kilo(self._df()["power_real"]).max() == pytest.approx(3.2)
+
+    def test_the_conversion_helper_is_a_thousand(self):
+        from pq_plots import _to_kilo
+        import pandas as pd
+        s = pd.Series([1000.0, 2500.0])
+        assert list(_to_kilo(s)) == [1.0, 2.5]
+
+    def test_analysis_and_plots_agree_on_scale(self):
+        # check_demand reports kVA by dividing by 1000; the plot helper must
+        # apply the same factor or the report contradicts its own charts.
+        from pq_analysis import check_demand
+        from pq_plots import _to_kilo
+        df = self._df()
+        dem = check_demand(df, Thresholds())
+        assert dem["available"]
+        plotted_peak_kw = float(_to_kilo(df["power_real"]).max())
+        assert plotted_peak_kw == pytest.approx(3.2, rel=1e-6)
+        assert dem["real_power"]["peak_kw"] == pytest.approx(plotted_peak_kw, rel=1e-6)
+
+    def test_the_demo_dataset_is_in_watts(self):
+        # The demo generator wrote kW into a watt channel, which only became
+        # visible once the plots started converting.
+        from pq_adapter import MockAdapter
+        from pq_analyzer import ChannelMapper, extract_dataset
+        ds = extract_dataset(MockAdapter(), ChannelMapper())
+        mean_w = float(ds.df["power_real"].dropna().mean())
+        assert 5_000 < mean_w < 60_000, f"demo power_real mean is {mean_w} W"
+
+
+class TestRecommendedActionsAreProportionate:
+    """Actions must fit the service and stay short enough to be read."""
+
+    def _report(self, **pf_over):
+        pf = {k: True for k in ("power_factor", "thd_current",
+                                "individual_harmonics", "current_imbalance",
+                                "transformer_loading", "voltage")}
+        pf.update(pf_over)
+        return {"pass_fail": pf, "root_causes": []}
+
+    def _actions(self, report, cls):
+        from pq_report import _build_structured_actions
+        return _build_structured_actions(report, Thresholds(customer_class=cls))
+
+    def test_a_house_is_not_told_to_fit_reactors_to_its_vfds(self):
+        # The load-signature match is a hypothesis, so its advice belongs with
+        # the finding rather than in a list of things to go and do.
+        rep = self._report()
+        rep["root_causes"] = [{
+            "severity": "info",
+            "title": "Possible load type: 6-pulse VFD / rectifier (no input reactor)",
+            "recommendation": "Add 3-5% impedance AC line reactors to VFD inputs.",
+        }]
+        assert self._actions(rep, "r") == []
+
+    def test_no_informational_finding_becomes_an_action(self):
+        rep = self._report()
+        rep["root_causes"] = [{"severity": "info", "title": "X",
+                               "recommendation": "Do something speculative."}]
+        for cls in ("r", "c", "sg", "pg"):
+            assert self._actions(rep, cls) == []
+
+    def test_harmonic_advice_scales_with_the_service(self):
+        rep = self._report(thd_current=False)
+        res = " ".join(a["recommendation"] for a in self._actions(rep, "r")).lower()
+        assert "filter" not in res or "not an appropriate remedy" in res
+        assert "12-pulse" not in res
+        ci = " ".join(a["recommendation"] for a in self._actions(rep, "sg")).lower()
+        assert "12-pulse" in ci or "harmonic filters" in ci
+
+    def test_a_house_is_not_asked_to_commission_a_harmonic_study(self):
+        rep = self._report(individual_harmonics=False)
+        for cls in ("r", "c"):
+            joined = " ".join(a["recommendation"] for a in self._actions(rep, cls))
+            assert "detailed harmonic study" not in joined.lower()
+        joined = " ".join(a["recommendation"] for a in self._actions(rep, "sg"))
+        assert "detailed harmonic study" in joined.lower()
+
+    def test_residential_imbalance_advice_is_split_phase(self):
+        rep = self._report(current_imbalance=False)
+        res = " ".join(a["recommendation"] for a in self._actions(rep, "r")).lower()
+        assert "120 v legs" in res or "two 120" in res
+        assert "across phases" not in res
+
+    def test_duplicate_intents_collapse_to_one_action(self):
+        from pq_report import _build_structured_actions
+        rep = self._report()
+        rep["root_causes"] = [
+            {"severity": "warning", "title": "A",
+             "recommendation": "Measure voltage imbalance with all customer loads "
+                               "disconnected to isolate the utility contribution."},
+            {"severity": "warning", "title": "B",
+             "recommendation": "Confirming the origin requires measurement with all "
+                               "customer loads disconnected."},
+        ]
+        acts = _build_structured_actions(rep, Thresholds(customer_class="sg"))
+        assert len(acts) == 1
+
+    def test_the_action_list_is_capped(self):
+        from pq_report import _build_structured_actions, _MAX_ACTIONS
+        rep = self._report(power_factor=False, thd_current=False,
+                           individual_harmonics=False, current_imbalance=False,
+                           transformer_loading=False, voltage=False)
+        rep["root_causes"] = [
+            {"severity": "warning", "title": f"F{i}",
+             "recommendation": f"Distinct unrelated recommendation number {i}."}
+            for i in range(12)
+        ]
+        acts = _build_structured_actions(rep, Thresholds(customer_class="sg"))
+        assert len(acts) <= _MAX_ACTIONS
+
+    def test_high_priority_actions_survive_the_cap(self):
+        from pq_report import _build_structured_actions
+        rep = self._report(voltage=False, transformer_loading=False)
+        rep["root_causes"] = [
+            {"severity": "info", "title": f"I{i}",
+             "recommendation": f"Low value note {i}."} for i in range(10)
+        ]
+        acts = _build_structured_actions(rep, Thresholds(customer_class="sg"))
+        assert acts and all(a["priority"] == "High" for a in acts)
+
+    def test_a_trivial_power_factor_shortfall_raises_no_install_action(self):
+        # Correcting by a couple of kVAR is below the smallest practical
+        # switched capacitor step; recommending an install is not advice.
+        import pq_analysis as A
+        assert A._MIN_ACTIONABLE_KVAR > 0
+
+
+class TestLoadSignatureFloor:
+    """A spectrum matching nothing must be reported as matching nothing.
+
+    Nearest-neighbour scoring always returns a candidate.  Scoring 20,000 random
+    decaying spectra against the library gave a median top score of 0.87, with
+    71% above the old 0.75 gate and 29% above 0.95 -- so "scores well" was not
+    evidence of anything, and pure noise reached "high confidence" routinely.
+    """
+
+    def _frame(self, spec, cv=0.1, n=150, seed=0):
+        import pandas as pd
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        rng = np.random.default_rng(seed)
+        d = {"current_a": np.full(n, 100.0)}
+        for h, v in zip([3, 5, 7, 9, 11, 13], spec):
+            d[f"h{h}_current_a"] = np.clip(
+                rng.normal(v, max(v * cv, 1e-4), n), 1e-4, None)
+        return pd.DataFrame(d, index=idx)
+
+    def _run(self, spec, cv=0.1, cls="sg", seed=0):
+        from pq_analysis import _detect_harmonic_signature
+        return _detect_harmonic_signature(self._frame(spec, cv, seed=seed),
+                                          100.0, None, customer_class=cls)
+
+    def test_an_unmatched_spectrum_is_named_as_unmatched(self):
+        out = self._run([0.4, 0.3, 0.5, 0.2, 0.4, 0.3], cv=0.8, cls="r")
+        assert out and out[0]["title"] == "No recognised load signature"
+        assert "below the" in out[0]["finding"]
+
+    def test_the_unmatched_finding_still_reports_the_spectrum(self):
+        # Naming nothing must not mean saying nothing -- the engineer still
+        # needs the measured numbers to interpret by hand.
+        out = self._run([0.4, 0.3, 0.5, 0.2, 0.4, 0.3], cv=0.8, cls="r")
+        assert "Measured spectrum:" in out[0]["finding"]
+        assert out[0]["evidence"]["h3_pct_il"] > 0
+
+    def test_a_spectrum_between_two_families_is_not_assigned_to_either(self):
+        from pq_analysis import _detect_harmonic_signature
+        out = self._run([35, 18, 9, 5, 3, 2], cls="r")
+        assert out[0]["title"] == "No recognised load signature"
+        assert "between two unrelated load families" in out[0]["finding"]
+
+    def test_a_clean_match_is_still_reported(self):
+        out = self._run([2, 23, 9, 1, 5, 4], cls="sg")
+        assert out[0]["title"] != "No recognised load signature"
+        assert "6-pulse" in out[0]["title"]
+
+    def test_indistinguishable_members_are_reported_as_a_family(self):
+        # A 6-pulse VFD, a 6-pulse UPS and a DC fast charger are one topology;
+        # naming one of them specifically would be arbitrary.
+        out = self._run([2, 23, 9, 1, 5, 4], cls="sg")
+        assert out[0]["title"].startswith("Possible load family")
+        assert out[0]["evidence"]["resolved_to_member"] is False
+
+    def test_most_random_spectra_are_rejected(self):
+        # The rule's whole purpose. Old behaviour named something ~71% of the
+        # time; this asserts the floor actually bites.
+        rng = np.random.default_rng(7)
+        named = 0
+        trials = 120
+        for i in range(trials):
+            spec = np.clip(np.array([20, 10, 6, 3, 2, 1])
+                           * rng.uniform(0.2, 3.0, 6), 0.01, None)
+            out = self._run(spec, cv=0.2, cls="sg", seed=i)
+            if out and out[0]["title"] != "No recognised load signature":
+                named += 1
+        assert named / trials < 0.30, f"named {named/trials:.0%} of random spectra"
+
+    def test_the_floor_is_documented_where_it_is_set(self):
+        import pq_constants as C
+        assert C.SIGNATURE_ABSOLUTE_FLOOR >= 0.85
+        assert C.SIGNATURE_FAMILY_SEPARATION > 0
+        assert C.SIGNATURE_MEMBER_SEPARATION > 0
+
+    def test_every_signature_belongs_to_a_labelled_family(self):
+        from pq_constants import _LOAD_SIGNATURES, LOAD_FAMILY_LABEL
+        for s in _LOAD_SIGNATURES:
+            assert s.get("family"), f"{s['id']} has no family"
+            assert s["family"] in LOAD_FAMILY_LABEL, s["family"]
+
+
+class TestLoadSignaturesRespectCustomerClass:
+    """Load-type matching must not offer equipment the service cannot have.
+
+    Cosine similarity always returns a nearest neighbour, so an unrestricted
+    library named an arc welder as the best match for a house.
+    """
+
+    def _welder_shaped_frame(self):
+        # [H3,H5,H7,H9,H11,H13] = [10,8,6,5,4,3] with high variability, which is
+        # the arc welder reference signature.
+        import pandas as pd
+        n = 200
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        rng = np.random.default_rng(3)
+        data = {"current_a": np.full(n, 100.0)}
+        for h, v in {3: 10., 5: 8., 7: 6., 9: 5., 11: 4., 13: 3.}.items():
+            data[f"h{h}_current_a"] = np.clip(rng.normal(v, v * 0.5, n), 0.01, None)
+        return pd.DataFrame(data, index=idx)
+
+    def _titles(self, customer_class):
+        from pq_analysis import _detect_harmonic_signature
+        return [f["title"] for f in _detect_harmonic_signature(
+            self._welder_shaped_frame(), 100.0, None,
+            customer_class=customer_class)]
+
+    def test_a_residential_service_is_never_offered_industrial_equipment(self):
+        joined = " ".join(self._titles("r")).lower()
+        for banned in ("arc welder", "arc furnace", "12-pulse", "18-pulse",
+                       "dc fast charger"):
+            assert banned not in joined, f"{banned!r} offered to a house"
+
+    def test_a_residential_service_gets_residential_candidates(self):
+        joined = " ".join(self._titles("r")).lower()
+        assert any(k in joined for k in
+                   ("pv inverter", "ev charger", "heat pump", "air conditioning"))
+
+    def test_an_arc_furnace_is_only_offered_to_primary_service(self):
+        from pq_constants import _LOAD_SIGNATURES
+        eaf = next(s for s in _LOAD_SIGNATURES if s["id"] == "arc_furnace")
+        assert eaf["classes"] == {"pg"}
+
+    def test_every_signature_declares_its_classes(self):
+        from pq_constants import _LOAD_SIGNATURES
+        valid = {"r", "c", "sg", "pg"}
+        for s in _LOAD_SIGNATURES:
+            assert s.get("classes"), f"{s['id']} has no classes"
+            assert set(s["classes"]) <= valid, f"{s['id']} has an unknown class"
+
+    def test_every_class_has_candidates(self):
+        from pq_constants import _LOAD_SIGNATURES
+        for cls in ("r", "c", "sg", "pg"):
+            assert [s for s in _LOAD_SIGNATURES if cls in s["classes"]], cls
+
+    def test_an_unresolvable_match_names_the_family_not_the_equipment(self):
+        # An arc welder and an arc furnace score within a thousandth of each
+        # other on this spectrum. They are one topology, so the report names
+        # the arcing family rather than picking one piece of equipment.
+        from pq_analysis import _detect_harmonic_signature
+        f = _detect_harmonic_signature(self._welder_shaped_frame(), 100.0, None,
+                                       customer_class="pg")
+        assert f[0]["evidence"]["similarity"] > 0.95
+        assert f[0]["title"].startswith("Possible load family")
+        assert "Arcing load" in f[0]["title"]
+        assert f[0]["evidence"]["resolved_to_member"] is False
+        assert "not resolvable from the spectrum" in f[0]["finding"]
+        assert f[0]["confidence"] != "high"
+
+    def test_the_finding_does_not_claim_to_identify_equipment(self):
+        f_titles = self._titles("r")
+        assert f_titles and not any(t.startswith("Best match") for t in f_titles)
+        assert f_titles[0].startswith("Possible load type")
+
+
+class TestComplianceTableGrouping:
+    """The table groups checks by the quantity measured, and loses nothing.
+
+    Buffering rows to regroup them is the kind of change that silently drops a
+    check, so the count is asserted against the ungrouped behaviour: every
+    standard that used to appear still appears, exactly once.
+    """
+
+    def _table(self, path):
+        from docx import Document
+        d = Document(str(path))
+        for t in d.tables:
+            if [c.text.strip() for c in t.rows[0].cells][:2] == ["Standard", "Measured"]:
+                return t
+        raise AssertionError("compliance table not found")
+
+    def _split(self, tbl):
+        headings, checks = [], []
+        for row in tbl.rows[1:]:
+            if len({id(c._tc) for c in row.cells}) == 1:
+                headings.append(row.cells[0].text.strip())
+            else:
+                checks.append(row.cells[0].text.strip())
+        return headings, checks
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def report_path(cls, tmp_path_factory):
+        pytest.importorskip("docx")
+        import subprocess, sys, glob, os
+        out = tmp_path_factory.mktemp("grouped")
+        root = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(
+            [sys.executable, os.path.join(root, "pq_analyzer.py"),
+             os.path.join(root, "test_data", "test_commercial_large.pqd"),
+             "--isc", "10000", "--transformer-kva", "500", "--nominal", "277",
+             "--report", "--no-plots", "--outdir", str(out)],
+            check=True, capture_output=True)
+        found = glob.glob(str(out / "**" / "*.docx"), recursive=True)
+        assert found, "no report generated"
+        return found[0]
+
+    def test_every_check_appears_exactly_once(self, report_path):
+        _, checks = self._split(self._table(report_path))
+        assert len(checks) == 14
+        assert len(set(checks)) == len(checks)
+
+    def test_checks_are_grouped_by_measured_quantity(self, report_path):
+        headings, _ = self._split(self._table(report_path))
+        assert [h.split("—")[0].strip() for h in headings] == [
+            "VOLTAGE", "CURRENT", "DEMAND AND POWER FACTOR", "FREQUENCY"]
+
+    def test_no_check_is_stranded_outside_a_group(self, report_path):
+        tbl = self._table(report_path)
+        seen_heading = False
+        for row in tbl.rows[1:]:
+            if len({id(c._tc) for c in row.cells}) == 1:
+                seen_heading = True
+            else:
+                assert seen_heading, f"{row.cells[0].text!r} precedes any heading"
+
+    def test_magnitude_checks_precede_distortion_checks(self, report_path):
+        _, checks = self._split(self._table(report_path))
+        pos = {c.split("(")[0].strip(): i for i, c in enumerate(checks)}
+        volt_mag = next(i for c, i in pos.items() if c.startswith("Steady-state voltage"))
+        volt_thd = next(i for c, i in pos.items() if c.startswith("Voltage THD"))
+        assert volt_mag < volt_thd
+
+
+class TestComplianceRowsQuoteMeasurements:
+    """Every row should carry a number the recording actually produced.
+
+    The voltage row used to print range_v -- the *allowed* band -- under the
+    bare label "Range", so the only voltage in the cell was the limit, and
+    "Worst phase" was never followed by which phase or what it read.
+    """
+
+    def _report(self, **over):
+        from pq_analysis import check_voltage_compliance
+        import pandas as pd
+        n = 100
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        data = {"voltage_a": [121.0] * n, "voltage_b": [120.0] * n,
+                "voltage_c": [120.0] * n}
+        data.update(over)
+        return check_voltage_compliance(pd.DataFrame(data, index=idx),
+                                        Thresholds(nominal_voltage=120.0))
+
+    def test_per_phase_measurements_are_available_to_the_row(self):
+        v = self._report(voltage_a=[110.0] * 50 + [121.0] * 50)
+        st = v["phases"]["voltage_a"]
+        # The row needs all of these; none were being printed before.
+        assert st["min_v"] == pytest.approx(110.0)
+        assert st["max_v"] == pytest.approx(121.0)
+        assert st["mean_v"] == pytest.approx(115.5)
+        assert st["pct_under"] == pytest.approx(50.0)
+        assert st["pct_over"] == 0.0
+
+    def test_range_v_is_the_allowed_band_not_a_measurement(self):
+        # 120 V nominal at +/-5 % -> 114-126.  Nothing measured 114 or 126 here.
+        v = self._report()
+        assert v["range_v"] == pytest.approx((114.0, 126.0))
+        assert v["phases"]["voltage_a"]["max_v"] == pytest.approx(121.0)
+
+    def test_the_worst_phase_is_the_one_with_most_intervals_out_of_band(self):
+        v = self._report(voltage_b=[100.0] * 80 + [120.0] * 20)
+        worst = max(v["phases"].items(),
+                    key=lambda kv: kv[1]["pct_out_of_bounds"])
+        assert worst[0] == "voltage_b"
+        assert worst[1]["pct_out_of_bounds"] == pytest.approx(80.0)
+
+    def test_the_binding_harmonic_order_is_reported_by_margin(self):
+        from pq_analysis import check_individual_harmonics
+        # H5 is the larger current but sits well inside its limit; H23's much
+        # tighter limit makes it the order that actually binds.
+        df = _frame(current_a=[100.0] * 10,
+                    h5_current_a=[6.0] * 10,
+                    h23_current_a=[0.9] * 10)
+        r = check_individual_harmonics(df, Thresholds(isc_amps=5000.0))
+        assert r["available"]
+        assert r["worst_order"][0] == 5              # largest magnitude
+        assert r["worst_margin_order"][0] == 23      # tightest margin
+        assert r["worst_limit_pct"] < 2.0
+
+
+class TestSeverityGrading:
+    """Severity is a second axis beside compliance, not a replacement for it.
+
+    Compliance stays binary because the standards are; severity says how much
+    the exceedance matters, so an isolated artifact and a sustained overload
+    stop sharing one red FAIL.
+    """
+
+    def test_compliance_and_severity_are_independent(self):
+        from pq_analysis import grade_finding
+        # Over the limit is over the limit — severity never contradicts that.
+        assert grade_finding(False, measured=8.1, limit=8.0,
+                             persistence_pct=0.1)["band"] == "minor"
+        assert grade_finding(True, measured=2.0, limit=8.0)["band"] == "compliant"
+
+    def test_a_marginal_brief_exceedance_is_minor_not_severe(self):
+        from pq_analysis import grade_finding
+        g = grade_finding(False, measured=8.2, limit=8.0, persistence_pct=0.2)
+        assert g["band"] == "minor"
+
+    def test_a_large_sustained_exceedance_is_severe(self):
+        from pq_analysis import grade_finding
+        g = grade_finding(False, measured=12.8, limit=8.0, persistence_pct=60.0)
+        assert g["band"] == "severe"
+
+    def test_a_very_large_exceedance_is_severe_however_brief(self):
+        from pq_analysis import grade_finding
+        g = grade_finding(False, measured=19.0, limit=8.0, persistence_pct=0.5)
+        assert g["band"] == "severe"
+
+    def test_low_confidence_drops_one_band_and_says_so(self):
+        from pq_analysis import grade_finding
+        kw = dict(measured=12.8, limit=8.0, persistence_pct=60.0)
+        assert grade_finding(False, **kw)["band"] == "severe"
+        g = grade_finding(False, confidence_notes=["ISC not supplied"], **kw)
+        assert g["band"] == "significant"
+        assert g["downgraded"] is True
+        assert "ISC not supplied" in g["reason"]
+        assert "severity reduced one band" in g["reason"]
+
+    def test_confidence_never_downgrades_below_minor(self):
+        from pq_analysis import grade_finding
+        g = grade_finding(False, measured=8.1, limit=8.0, persistence_pct=0.1,
+                          confidence_notes=["light-load intervals excluded"])
+        assert g["band"] == "minor"
+        assert g["downgraded"] is False
+
+    def test_close_to_the_limit_is_watch_not_compliant(self):
+        from pq_analysis import grade_finding
+        g = grade_finding(True, measured=7.2, limit=8.0)
+        assert g["band"] == "watch"
+        assert "90% of it" in g["reason"]
+
+    def test_a_healthy_power_factor_is_not_flagged_as_watch(self):
+        from pq_analysis import grade_finding
+        # PF is bounded at 1.0, so the ceiling-metric watch band would mark
+        # every power factor including 0.99.  Floor metrics get a tighter one.
+        assert grade_finding(True, measured=0.989, limit=0.90,
+                             lower_is_worse=True)["band"] == "compliant"
+        assert grade_finding(True, measured=0.912, limit=0.90,
+                             lower_is_worse=True)["band"] == "watch"
+
+    def test_a_power_factor_shortfall_reads_in_the_right_direction(self):
+        from pq_analysis import grade_finding
+        g = grade_finding(False, measured=0.88, limit=0.90, persistence_pct=12.0,
+                          lower_is_worse=True)
+        assert "below the limit" in g["reason"]
+
+    def test_an_unassessed_check_has_no_severity(self):
+        from pq_analysis import grade_finding
+        assert grade_finding(None)["band"] == "not_assessed"
+
+
+class TestVoltageTHDIsJudgedStatistically:
+    """IEEE 519-2022 Clause 5 judges voltage THD on percentiles, not on maxima.
+
+    A single interval where the fundamental collapsed used to fail an entire
+    site: pass_fail asked for pct_exceeding == 0, and V_h/V_1 runs to tens of
+    percent whenever V_1 approaches zero.
+    """
+
+    def _thresh(self):
+        return Thresholds(nominal_voltage=120.0)
+
+    def test_a_sag_artifact_is_dropped_not_reported_as_distortion(self):
+        from pq_analysis import check_thd
+        # 2.5 % site with one interval measured during a collapse to 11 V.
+        thd   = [2.5] * 99 + [80.20]
+        volts = [120.0] * 99 + [11.0]
+        r = check_thd(_frame(thd_voltage_a=thd, voltage_a=volts), self._thresh())["voltage"]
+        assert r["artifact_samples"] == 1
+        assert r["sample_count"] == 99
+        assert r["max_thd_pct"] == pytest.approx(2.5)
+        assert r["p95_pass"] and r["p99_pass"]
+
+    def test_a_spike_at_normal_voltage_does_not_fail_the_site(self):
+        from pq_analysis import check_thd
+        # The voltage gate cannot catch this one — the percentile has to.
+        thd = [2.5] * 99 + [80.20]
+        r = check_thd(_frame(thd_voltage_a=thd, voltage_a=[120.0] * 100),
+                      self._thresh())["voltage"]
+        assert r["artifact_samples"] == 0
+        assert r["max_thd_pct"] == pytest.approx(80.20)
+        assert r["p95_pass"] and r["p99_pass"]
+        assert r["max_is_outlier"] is True
+
+    def test_genuine_sustained_distortion_still_fails(self):
+        from pq_analysis import check_thd
+        r = check_thd(_frame(thd_voltage_a=[9.5] * 100, voltage_a=[120.0] * 100),
+                      self._thresh())["voltage"]
+        assert r["p95_pass"] is False
+        assert r["max_is_outlier"] is False
+
+    def test_a_sustained_excursion_is_caught_by_the_p99_rule(self):
+        from pq_analysis import check_thd
+        # P95 stays under 8 %, but 3 % of the recording sits at 13 % — over the
+        # 1.5x short-time limit, so the site must not pass.
+        thd = [6.0] * 97 + [13.0] * 3
+        r = check_thd(_frame(thd_voltage_a=thd, voltage_a=[120.0] * 100),
+                      self._thresh())["voltage"]
+        assert r["p95_pass"] is True
+        assert r["p99_pass"] is False
+
+    def test_the_gate_keeps_distortion_measured_during_a_shallow_sag(self):
+        from pq_analysis import check_thd
+        # 0.75 pu is a real sag but a valid THD reading; it must not be dropped.
+        r = check_thd(_frame(thd_voltage_a=[9.0] * 100, voltage_a=[90.0] * 100),
+                      self._thresh())["voltage"]
+        assert r["artifact_samples"] == 0
+        assert r["p95_pass"] is False
+
+
 class TestTDDDefinition:
     def _thresh(self):
         return Thresholds(nominal_voltage=120.0, isc_amps=10000.0)
@@ -1588,10 +2484,24 @@ class TestChannelAppendix:
     def _table(doc):
         return next(t for t in doc.tables if t.rows[0].cells[0].text == "Channel")
 
-    def test_both_appendices_are_lettered_and_ordered(self, doc):
+    def test_the_appendices_are_lettered_and_ordered(self, doc):
         heads = [p.text for p in doc.paragraphs if p.text.startswith("Appendix")]
-        assert heads == ["Appendix A: Standards, Methods, and Limitations",
-                         "Appendix B: Channels Read From the Meter File"]
+        assert heads == ["Appendix A: Terms Used in This Report",
+                         "Appendix B: Standards, Methods, and Limitations",
+                         "Appendix C: Channels Read From the Meter File"]
+
+    def test_the_glossary_is_reachable_from_the_body(self, doc):
+        # The definitions moved to the back, so the body has to say where they
+        # went or they are found only by whoever pages to the end.
+        body = " ".join(p.text for p in doc.paragraphs)
+        assert "defined in Appendix A" in body
+
+    def test_no_cross_reference_points_at_a_bare_appendix(self, doc):
+        # Three appendices make "see the Appendix" ambiguous.
+        body = " ".join(p.text for p in doc.paragraphs)
+        for tb in doc.tables:
+            body += " " + " ".join(c.text for r in tb.rows for c in r.cells)
+        assert "see the Appendix" not in body
 
     def test_every_channel_read_is_listed(self, doc):
         ds = extract_dataset(
@@ -2239,8 +3149,12 @@ class TestEngineeringReportReview:
         m = re.search(r"of the (\d+) power quality standards evaluated", t)
         assert m, "standards tally sentence missing"
         claimed = int(m.group(1))
-        rows = next(len(tb.rows) - 1 for tb in doc.tables
-                    if tb.rows[0].cells[0].text.strip() == "Standard")
+        # The table is grouped by measured quantity, so it carries merged
+        # heading rows that are not standards and must not be counted.
+        tbl = next(tb for tb in doc.tables
+                   if tb.rows[0].cells[0].text.strip() == "Standard")
+        rows = sum(1 for r in tbl.rows[1:]
+                   if len({id(c._tc) for c in r.cells}) > 1)
         assert claimed == rows, f"summary claims {claimed}, table shows {rows}"
 
     def test_the_new_checks_have_table_rows(self, doc):

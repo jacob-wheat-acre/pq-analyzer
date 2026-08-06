@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.14.1"
+__version__ = "0.22.0"
 
 
 @dataclass
@@ -27,10 +27,59 @@ class Thresholds:
     isc_source: Optional[str] = None     # human-readable note on how ISC was determined
     transformer_kva: Optional[float] = None  # service transformer nameplate (kVA)
     customer_class: str = "sg"            # "r" | "c" | "sg" | "pg"  (PSCo tariff schedules)
+    # The engineer picks these at the start; they resolve how many phases the
+    # service actually has, which channel presence alone can get wrong when a
+    # phase is simply missing from the export.
+    service_type: Optional[str] = None    # e.g. "1ph-padmount", "3ph-padmount"
+    topology: str = "auto"                # "auto" | "3ph-wye" | "split-phase"
     # Spectral-shape ("broadband vs. resonance") classifier -- heuristic starting
     # points, not yet empirically validated across many sites. See check_spectral_shape().
     spectral_elevation_ratio: float = 0.4  # mean VTHD / thd_voltage_limit above this = "elevated"
     spectral_flatness_cv: float = 0.6      # per-order spectrum CV below this = "flat" (broadband-like)
+
+
+# ── Finding severity ─────────────────────────────────────────────────────────
+# Compliance is binary because the standards are: a value is inside the limit or
+# it is not, and that determination stays quotable.  Severity is a second,
+# separate axis answering how much the exceedance matters, so that a single
+# artifact interval and a sustained 2x overload stop sharing one red FAIL.
+#
+# These are engineering judgment, not values from any standard.  They are named
+# here rather than buried in the report so they can be tuned against real files.
+
+#: Bands, ordered least to most serious.  "watch" is inside the limit.
+SEVERITY_ORDER = ["compliant", "watch", "minor", "significant", "severe"]
+
+SEVERITY_LABEL = {
+    "compliant":    "Compliant",
+    "watch":        "Watch",
+    "minor":        "Minor",
+    "significant":  "Significant",
+    "severe":       "Severe",
+    "not_assessed": "Not assessed",
+}
+
+#: Inside the limit but this close to it -> "Watch".  Nothing is wrong yet, so
+#: this must not render in a warning colour; it flags drift worth tracking.
+SEVERITY_WATCH_FRACTION = 0.85
+
+#: Tighter band for floor metrics like power factor.  PF is bounded above at
+#: 1.0, so its whole usable range above a 0.90 limit spans about 11% -- a 15%
+#: "close to the limit" rule would mark every power factor, including 0.99, as
+#: Watch.  0.95 flags roughly PF < 0.945 instead.
+SEVERITY_WATCH_FRACTION_FLOOR = 0.95
+
+#: Over the limit by this ratio -> at least "Significant".
+SEVERITY_SIGNIFICANT_MARGIN = 1.20
+#: Over the limit for this share of the recording (%) -> at least "Significant".
+SEVERITY_SIGNIFICANT_PERSISTENCE = 25.0
+
+#: "Severe" needs both a large margin and persistence -- a brief 1.6x excursion
+#: is not the same finding as one that holds for a quarter of the week.
+SEVERITY_SEVERE_MARGIN = 1.50
+SEVERITY_SEVERE_PERSISTENCE = 25.0
+#: ...except that this far over the limit is severe however briefly it happened.
+SEVERITY_SEVERE_MARGIN_ALONE = 2.00
 
 
 # IEEE 519-2022 Table 2: TDD limits indexed by ISC/IL ratio
@@ -49,6 +98,48 @@ _H519_LIMITS: List[Tuple[int, int, List[float]]] = [
 # Odd harmonic orders to check per IEEE 519-2022 (even harmonics limited to 25% of odd limits)
 _H519_ORDERS = [3, 5, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]
 
+# ── Load-signature families and match thresholds ─────────────────────────────
+# Several library entries describe the same electrical topology and therefore
+# have near-identical spectra -- a 6-pulse VFD, a 6-pulse UPS and a DC fast
+# charger all rectify three-phase power the same way.  Nothing in a harmonic
+# spectrum can separate them, so when the top candidates come from one family
+# the family is reported rather than a specific piece of equipment.
+LOAD_FAMILY_LABEL = {
+    "six_pulse":              "Three-phase 6-pulse rectifier load "
+                              "(VFD, UPS, or DC fast charger)",
+    "multipulse":             "Multi-pulse or active-front-end drive "
+                              "(12-pulse, 18-pulse, or AFE)",
+    "single_phase_switchmode": "Single-phase switch-mode or electronic "
+                              "lighting load",
+    "triplen_saturation":     "Transformer saturation",
+    "arcing":                 "Arcing load (welding or arc furnace)",
+    "mixed_three_phase":      "Mixed three-phase: rectifier plus "
+                              "single-phase nonlinear load",
+    "mixed_single_phase":     "Single-phase drive or charger",
+    "near_linear":            "Near-linear or inverter-interfaced load",
+}
+
+# Thresholds below were set from a measured null distribution, not chosen by
+# eye.  Scoring 20,000 randomly generated decaying spectra (the shape real
+# harmonic spectra take) against this library gave a median top score of 0.87,
+# with 71% above 0.75 and 29% above 0.95.  In other words the old 0.75 gate
+# admitted noise most of the time, and pure noise reached "high confidence"
+# roughly a third of the time.  See test_pq.py::TestLoadSignatureFloor.
+
+#: Minimum score before any load type is named at all.  Below this the report
+#: says it does not recognise the spectrum instead of naming a nearest
+#: neighbour.  Engineering judgment informed by the null distribution above.
+SIGNATURE_ABSOLUTE_FLOOR = 0.90
+
+#: Minimum gap to the next *family* before a match is considered resolved.
+#: Within-family gaps are meaningless -- those entries are the same topology.
+SIGNATURE_FAMILY_SEPARATION = 0.05
+
+#: Gap to the next entry inside the winning family, below which the family is
+#: reported instead of the individual load type.
+SIGNATURE_MEMBER_SEPARATION = 0.05
+
+
 # ── Harmonic load-signature reference library ─────────────────────────────────
 # Spectrum vectors are [H3, H5, H7, H9, H11, H13] as typical % of fundamental
 # at rated/normal operating load.  Only the *shape* matters — vectors are
@@ -61,6 +152,8 @@ _H519_ORDERS = [3, 5, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]
 _LOAD_SIGNATURES: List[Dict] = [
     {
         "id": "vfd_6pulse_reactor",
+        "family": "six_pulse",
+        "classes": {"c", "sg", "pg"},
         "title": "6-pulse VFD / rectifier (with input reactor)",
         "spectrum": [2, 23, 9, 1, 5, 4],
         "variability": "low",
@@ -78,6 +171,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "vfd_6pulse_no_reactor",
+        "family": "six_pulse",
+        "classes": {"c", "sg", "pg"},
         "title": "6-pulse VFD / rectifier (no input reactor)",
         "spectrum": [2, 30, 13, 2, 12, 9],
         "variability": "low",
@@ -94,6 +189,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "rectifier_12pulse",
+        "family": "multipulse",
+        "classes": {"sg", "pg"},
         "title": "12-pulse rectifier / drive",
         "spectrum": [1, 3, 2, 1, 14, 11],
         "variability": "low",
@@ -111,6 +208,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "drive_18pulse_afe",
+        "family": "multipulse",
+        "classes": {"sg", "pg"},
         "title": "18-pulse or active front-end (AFE) drive",
         "spectrum": [1, 1, 1, 1, 1, 1],
         "variability": "low",
@@ -127,6 +226,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "smps",
+        "family": "single_phase_switchmode",
+        "classes": {"r", "c", "sg", "pg"},
         "title": "Switched-mode power supplies (computers / servers / office equipment)",
         "spectrum": [35, 18, 9, 5, 3, 2],
         "variability": "low",
@@ -144,6 +245,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "fluorescent_magnetic",
+        "family": "single_phase_switchmode",
+        "classes": {"c", "sg", "pg"},
         "title": "Fluorescent lighting (magnetic ballast)",
         "spectrum": [30, 12, 5, 2, 1, 1],
         "variability": "low",
@@ -160,6 +263,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "led_poor_pf",
+        "family": "single_phase_switchmode",
+        "classes": {"r", "c", "sg", "pg"},
         "title": "LED drivers (poor power factor / no active PFC)",
         "spectrum": [40, 10, 4, 2, 1, 1],
         "variability": "low",
@@ -176,6 +281,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "ev_charger_l2",
+        "family": "mixed_single_phase",
+        "classes": {"r", "c", "sg"},
         "title": "EV charger (Level 2 / AC charging)",
         "spectrum": [20, 15, 8, 4, 3, 2],
         "variability": "medium",
@@ -193,6 +300,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "ups_6pulse",
+        "family": "six_pulse",
+        "classes": {"c", "sg", "pg"},
         "title": "UPS (6-pulse double-conversion)",
         "spectrum": [2, 22, 10, 1, 4, 3],
         "variability": "low",
@@ -210,6 +319,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "welder_arc",
+        "family": "arcing",
+        "classes": {"c", "sg", "pg"},
         "title": "Arc welder / resistance welder",
         "spectrum": [10, 8, 6, 5, 4, 3],
         "variability": "high",
@@ -227,6 +338,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "arc_furnace",
+        "family": "arcing",
+        "classes": {"pg"},
         "title": "Electric arc furnace (EAF) / plasma load",
         "spectrum": [15, 12, 9, 7, 5, 4],
         "variability": "high",
@@ -244,6 +357,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "transformer_saturation",
+        "family": "triplen_saturation",
+        "classes": {"r", "c", "sg", "pg"},
         "title": "Transformer saturation (overvoltage-induced)",
         "spectrum": [35, 8, 3, 1, 1, 1],
         "variability": "low",
@@ -261,6 +376,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "dc_fast_charger",
+        "family": "six_pulse",
+        "classes": {"c", "sg", "pg"},
         "title": "DC fast charger (DCFC / Level 3, 6-pulse front-end)",
         "spectrum": [3, 25, 10, 1, 5, 4],
         "variability": "medium",
@@ -278,6 +395,8 @@ _LOAD_SIGNATURES: List[Dict] = [
     },
     {
         "id": "mixed_vfd_smps",
+        "family": "mixed_three_phase",
+        "classes": {"c", "sg", "pg"},
         "title": "Mixed load: 6-pulse VFDs + single-phase nonlinear loads",
         "spectrum": [15, 20, 8, 2, 4, 3],
         "variability": "low",
@@ -292,6 +411,89 @@ _LOAD_SIGNATURES: List[Dict] = [
             "drives for 3-phase VFD loads, and (2) verify neutral conductor sizing for triplen "
             "harmonic current from single-phase loads (computers, LED lighting). "
             "Consider a K-rated transformer if K-factor exceeds 4."
+        ),
+        "responsibility": "customer",
+    },
+    # ── Residential and small-commercial loads ───────────────────────────────
+    # The library was built around industrial equipment, so a residential
+    # service had nothing plausible to match and was handed the nearest
+    # industrial neighbour.  The three below cover what actually drives
+    # distortion on a house: air conditioning, EV charging (above), and
+    # rooftop PV.
+    #
+    # Their spectra are engineering estimates from the topology of each load,
+    # not measurements from a validated dataset -- the same standing as the
+    # rest of this table.  Treat a match as a hypothesis to check on site.
+    {
+        "id": "pv_inverter",
+        "family": "near_linear",
+        "classes": {"r", "c", "sg"},
+        "title": "Rooftop PV inverter (grid-following DER)",
+        "spectrum": [8, 6, 4, 2, 2, 1],
+        "variability": "high",
+        "cause": (
+            "Low-order odd harmonics with no single dominant order, varying "
+            "strongly through the day, is consistent with a grid-following PV "
+            "inverter. IEEE 1547 holds inverters to under 5% TDD at rated "
+            "output, but the percentage rises at low irradiance because the "
+            "fundamental falls while the harmonic floor does not — so early "
+            "morning and late afternoon read worst. Distortion that tracks "
+            "daylight and disappears overnight points here rather than to a "
+            "load."
+        ),
+        "recommendation": (
+            "Confirm whether DER is interconnected at this service and review "
+            "the inverter's IEEE 1547 test report. Check that measured "
+            "distortion follows the solar day; if it does not, the inverter is "
+            "probably not the source. Verify the inverter firmware is current, "
+            "as harmonic and anti-islanding behaviour are often improved in "
+            "later revisions."
+        ),
+        "responsibility": "customer",
+    },
+    {
+        "id": "ac_compressor_single_phase",
+        "family": "near_linear",
+        "classes": {"r", "c"},
+        "title": "Air conditioning / heat pump (fixed-speed compressor)",
+        "spectrum": [6, 4, 2, 1, 1, 1],
+        "variability": "medium",
+        "cause": (
+            "Low distortion dominated by H3, cycling on and off over tens of "
+            "minutes, is characteristic of a fixed-speed single-phase "
+            "compressor — a largely linear inductive load whose modest "
+            "harmonics come from motor and any transformer saturation. Expect "
+            "the current to step rather than ramp, and a starting inrush that "
+            "can depress voltage briefly at each start."
+        ),
+        "recommendation": (
+            "Normally no harmonic mitigation is warranted; this load type is "
+            "not a significant distortion source. If starting dips are the "
+            "complaint, evaluate service conductor size and transformer "
+            "sizing, or a soft-start on the compressor, rather than filters."
+        ),
+        "responsibility": "customer",
+    },
+    {
+        "id": "heat_pump_inverter",
+        "family": "mixed_single_phase",
+        "classes": {"r", "c"},
+        "title": "Inverter-driven heat pump / mini-split",
+        "spectrum": [12, 14, 6, 2, 3, 2],
+        "variability": "medium",
+        "cause": (
+            "Comparable H3 and H5 with a modest H7 tail is consistent with a "
+            "variable-speed heat pump or ductless mini-split, which is a small "
+            "single-phase drive: a rectifier front end gives it the H5 of a "
+            "VFD, while its single-phase supply keeps H3 present. Unlike a "
+            "fixed-speed compressor it modulates continuously rather than "
+            "cycling."
+        ),
+        "recommendation": (
+            "No mitigation is normally justified at residential scale. Where "
+            "several units share one transformer, check that H3 is not "
+            "accumulating on the neutral, since triplens from single-phase "
+            "loads add rather than cancel."
         ),
         "responsibility": "customer",
     },
@@ -484,6 +686,9 @@ _BLUE_BOOK_IMPEDANCE: Dict[str, List[Tuple[int, int, float, float]]] = {
 _SERVICE_TYPE_LABEL: Dict[str, str] = {
     "1ph-overhead":      "Single-phase overhead",
     "1ph-padmount":      "Single-phase pad-mounted",
+    # Two legs of a 208Y/120 wye, not a center-tapped single-phase transformer.
+    # Common in condos and apartments fed from a three-phase service.
+    "1ph-208":       "Single-phase 120/208 (two legs of a three-phase transformer)",
     "3ph-padmount":      "Three-phase pad-mounted",
     "3ph-overhead-wye":  "Three-phase overhead wye bank",
     "3ph-open-delta":    "Three-phase overhead open delta bank",
@@ -507,11 +712,62 @@ _THREE_PHASE_SECONDARY: Dict[int, Tuple[int, ...]] = {
 
 def _secondary_candidates(service_type: str, nominal_v: float) -> Tuple[int, ...]:
     """Secondary line voltages that could key this service, best match first."""
+    if service_type in SINGLE_PHASE_208_TYPES:
+        # Two legs of a wye: the secondary is the wye's line voltage (208), not
+        # the 240 of a center-tapped single-phase can.
+        nearest = min(_THREE_PHASE_SECONDARY, key=lambda v: abs(v - nominal_v))
+        return _THREE_PHASE_SECONDARY[nearest]
     if service_type.startswith("1ph"):
         # A 120 V L-N service is one leg of a 120/240 V split-phase secondary.
         return (120, 240) if nominal_v <= 150 else (240,)
     nearest = min(_THREE_PHASE_SECONDARY, key=lambda v: abs(v - nominal_v))
     return _THREE_PHASE_SECONDARY[nearest]
+
+
+#: Single-phase services taken from two legs of a three-phase 120/208
+#: transformer, as opposed to a center-tapped 120/240 single-phase one.  The
+#: legs sit 120 degrees apart rather than 180, so line-to-line is sqrt(3) x
+#: line-to-neutral (208 V) instead of 2x (240 V), and the neutral carries the
+#: vector sum of the two legs rather than their difference.
+SINGLE_PHASE_208_TYPES = frozenset({"1ph-208"})
+
+#: A single-phase 120/208 service is fed from the same three-phase transformer
+#: as a full three-phase 120/208 service -- the customer simply pulls fewer
+#: wires -- so its Blue Book fault current comes from the three-phase rows.
+_1PH_208_ISC_PROXY = "3ph-padmount"
+
+
+def is_single_phase_208(service_type: Optional[str]) -> bool:
+    """True for a single-phase service taken from a three-phase wye."""
+    return (service_type or "") in SINGLE_PHASE_208_TYPES
+
+
+def ll_factor(service_type: Optional[str] = None, topology: str = "auto") -> float:
+    """Ratio of line-to-line to line-to-neutral voltage for this service.
+
+    2.0 for a center-tapped single-phase secondary (120/240), sqrt(3) for
+    anything derived from a wye -- including a single-phase service taken from
+    two legs of one (120/208).  Getting this wrong misreports a 208 V service
+    as a 240 V service, a 13% error that reads as a severe undervoltage.
+    """
+    svc = service_type or ""
+    if is_single_phase_208(svc):
+        return 3.0 ** 0.5
+    if svc.startswith("1ph") or topology == "split-phase":
+        return 2.0
+    return 3.0 ** 0.5
+
+
+def isc_lookup_type(service_type: Optional[str]) -> str:
+    """Blue Book row family to read for this service.
+
+    A single-phase 120/208 service has no rows of its own: it is served by the
+    same transformer as a three-phase 120/208 service, so it reads the same
+    rows.  Both the ISC lookup and the GUI's kVA list go through here so they
+    cannot disagree.
+    """
+    svc = service_type or ""
+    return _1PH_208_ISC_PROXY if is_single_phase_208(svc) else svc
 
 
 def _infer_secondary_v(service_type: str, nominal_v: float) -> int:
@@ -534,9 +790,14 @@ def _lookup_isc(service_type: str, kva: float, nominal_v: float) -> Optional[Tup
     Returns (isc_amps, note_string) or None if not found.
     The note identifies which table entry was used.
     """
-    secondary_v = _infer_secondary_v(service_type, nominal_v)
+    # A single-phase 120/208 service shares its transformer with a three-phase
+    # 120/208 service, so its available fault current comes from the three-phase
+    # rows -- reading the single-phase (120/240) rows would give the wrong ISC
+    # and therefore the wrong IEEE 519 Table 2 class.
+    lookup_type = isc_lookup_type(service_type)
+    secondary_v = _infer_secondary_v(lookup_type, nominal_v)
     kva_int = int(round(kva))
-    key = (service_type, kva_int, secondary_v)
+    key = (lookup_type, kva_int, secondary_v)
     isc = _BLUE_BOOK_ISC.get(key)
     if isc is not None:
         label = _SERVICE_TYPE_LABEL.get(service_type, service_type)
@@ -546,7 +807,7 @@ def _lookup_isc(service_type: str, kva: float, nominal_v: float) -> Optional[Tup
 
     # Try finding the nearest kVA in the same service type / voltage
     candidates = {k[1]: v for k, v in _BLUE_BOOK_ISC.items()
-                  if k[0] == service_type and k[2] == secondary_v}
+                  if k[0] == lookup_type and k[2] == secondary_v}
     if candidates:
         nearest_kva = min(candidates, key=lambda k: abs(k - kva_int))
         isc = candidates[nearest_kva]

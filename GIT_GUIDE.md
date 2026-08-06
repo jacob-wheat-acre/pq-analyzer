@@ -206,6 +206,21 @@ pip install -r pq_analyzer_requirements.txt
 One time only — unless an update changes the list, which is why section 6
 tells you to re-run it after pulling.
 
+**Confirm it worked.**  pip can stop partway through — a proxy timeout, a
+dropped connection — and leave you with some libraries installed and others
+missing.  The tool will still open, but the transformer Size picker stays
+greyed out and analysis fails.  Check with:
+
+```
+python check_install.py
+```
+
+It prints which Python it's running, every library and its version, and
+ends with either `RESULT: install looks good.` or the exact command to fix
+what's broken.  Run it any time the tool misbehaves — and paste its output
+when reporting a problem, since it answers most of what the maintainer
+would otherwise have to ask.
+
 > **If pip fails with an SSL, certificate, or proxy error**, that's Xcel's
 > network intercepting the connection to the package server, not a problem
 > with your machine.  Don't paste in workarounds you find online that
@@ -389,6 +404,7 @@ Print this part.  Every command runs from inside the `pq-analyzer` folder.
 git pull                              Get the latest version
 pip install -r pq_analyzer_requirements.txt
                                       Re-install dependencies after a pull
+python check_install.py               Is my install healthy?
 git log --oneline -10                 What changed recently
 git status                            Have I modified anything?
 git checkout -- .                     Throw away my accidental edits

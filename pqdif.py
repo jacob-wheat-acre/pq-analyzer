@@ -929,6 +929,15 @@ class PQDIFFile:
 
     # ── observations ─────────────────────────────────────────────────────
     @property
+    def observation_count(self) -> int:
+        """How many observation records the file declares, readable or not.
+
+        The denominator for ``unreadable_observations``: losing one of two
+        records and one of three hundred are not the same finding.
+        """
+        return len(self._observation_records)
+
+    @property
     def observations(self) -> List[Observation]:
         """Every observation that could be read.
 
@@ -944,16 +953,19 @@ class PQDIFFile:
 
         out: List[Observation] = []
         self.unreadable_observations: List[Tuple[int, str]] = []
+        self.unreadable_observation_names: List[str] = []
         for i, record in enumerate(self._observation_records):
             try:
                 out.append(self._read_observation(i, record))
             except (PQDIFError, zlib.error, struct.error) as exc:
                 self.unreadable_observations.append((record.position, str(exc)))
+                name = self._safe_observation_name(record)
+                self.unreadable_observation_names.append(name)
                 log.warning(
                     "%s: skipping unreadable observation record %d of %d at "
-                    "offset %d — %s",
+                    "offset %d%s — %s",
                     self.path.name, i + 1, len(self._observation_records),
-                    record.position, exc,
+                    record.position, f" ({name})" if name else "", exc,
                 )
 
         if not out and self._observation_records:
@@ -973,6 +985,22 @@ class PQDIFFile:
             )
         self._observations = out
         return self._observations
+
+    def _safe_observation_name(self, record) -> str:
+        """Best-effort name of a record that failed to read.
+
+        Naming what was lost is worth more to a reader than the byte offset --
+        losing the max/min observation removes the peak/min voltage check, and
+        that consequence is invisible from a count.  The name lives near the
+        front of the body, so a partial inflate of a truncated record usually
+        still carries it; when it doesn't, the caller falls back to the offset.
+        """
+        try:
+            body = record.body(self.compressed)
+            element = body.find(TAG_OBSERVATION_NAME)
+            return element.string() if element is not None else ""
+        except Exception:
+            return ""
 
     def observation_names(self) -> List[str]:
         """Observation names without decoding any series values."""

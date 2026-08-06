@@ -26,6 +26,9 @@ from pq_constants import (
     _SERVICE_TYPE_LABEL,
     _infer_secondary_v,
     _lookup_isc,
+    is_single_phase_208,
+    isc_lookup_type,
+    ll_factor,
 )
 from pq_adapter import (
     PQDIFAdapter,
@@ -123,8 +126,17 @@ IEEE 519-2022 TDD  (--isc, --transformer-kva, --service-type)
 
   Provide --isc directly, or auto-look up from the PSCo Blue Book:
     --transformer-kva 500 --service-type 3ph-padmount
-  Service types: 1ph-padmount, 3ph-padmount, 1ph-overhead, 3ph-overhead,
-                 network, spot-network
+  Service types: 1ph-overhead, 1ph-padmount, 1ph-208, 3ph-padmount,
+                 3ph-overhead-wye, 3ph-open-delta, 3ph-closed-delta
+
+  Three secondary configurations, two of which share a transformer:
+    split phase 120/240   center-tapped single-phase can; legs 180° apart
+    three phase 120/208   three-phase transformer, customer pulls all phases
+    single phase 120/208  same transformer, customer pulls two legs only;
+                          legs 120° apart, so L-L is 208 V and the neutral
+                          carries the vector sum rather than the difference
+  Use --service-type 1ph-208 for the third. Its Blue Book fault current is
+  read from the three-phase rows, because it is the same transformer.
 
 TOPOLOGY  (--topology)
   auto          Inferred from loaded channels: no Vcn → split-phase (default)
@@ -255,6 +267,8 @@ def main():
         isc_source=isc_source,
         transformer_kva=args.transformer_kva,
         customer_class=args.customer_class,
+        service_type=args.service_type,
+        topology=args.topology,
     )
 
     # ── Choose adapter ────────────────────────────────────────────────────────

@@ -53,6 +53,7 @@ try:
     from pq_analyzer import (
         _BLUE_BOOK_ISC,
         _SERVICE_TYPE_LABEL,
+        isc_lookup_type,
         _infer_secondary_v,
         _lookup_isc,
         Thresholds,
@@ -113,6 +114,10 @@ except Exception as _import_exc:
 _TYPE_ORDER = [
     "1ph-overhead",
     "1ph-padmount",
+    # Two legs of a three-phase 120/208 transformer — condos and apartments.
+    # Sits with the single-phase entries because that is what the customer has;
+    # the transformer is the same one a three-phase 120/208 service uses.
+    "1ph-208",
     "3ph-padmount",
     "3ph-overhead-wye",
     "3ph-open-delta",
@@ -131,7 +136,7 @@ def _resolve_secondary_v(svc_type: str, nominal_v: float) -> int:
     the same Blue Book row.
     """
     try:
-        return _infer_secondary_v(svc_type, nominal_v)
+        return _infer_secondary_v(isc_lookup_type(svc_type), nominal_v)
     except Exception:
         return 240
 
@@ -140,8 +145,12 @@ def _kva_options(svc_type: str, nominal_v: float) -> list:
     """Return sorted list of kVA sizes available in the Blue Book for this type/voltage."""
     if svc_type == _PRIMARY_KEY or not svc_type:
         return []
+    # A single-phase 120/208 service reads the three-phase rows -- same
+    # transformer, fewer wires -- so filtering on its own key would leave the
+    # Size picker permanently empty.
+    lookup = isc_lookup_type(svc_type)
     sec_v = _resolve_secondary_v(svc_type, nominal_v)
-    return sorted({k[1] for k in _BLUE_BOOK_ISC if k[0] == svc_type and k[2] == sec_v})
+    return sorted({k[1] for k in _BLUE_BOOK_ISC if k[0] == lookup and k[2] == sec_v})
 
 
 def _isc_for(svc_type: str, kva: int, nominal_v: float):
@@ -212,6 +221,13 @@ class PQApp(tk.Tk):
 
     def _build_ui(self):
         pad = {"padx": 12, "pady": 6}
+
+        # ── Broken-install banner ─────────────────────────────────────────────
+        # If the pq_analyzer import failed, the Blue Book tables are empty and
+        # every transformer type will report "no entries".  Say so here rather
+        # than letting the ISC lookup look merely unlucky.
+        if not _BOOK_AVAILABLE:
+            self._build_import_error_banner()
 
         # ── File row ──────────────────────────────────────────────────────────
         file_frame = tk.Frame(self, bg=_BG)
@@ -353,8 +369,10 @@ class PQApp(tk.Tk):
                  font=_FONT_UI).pack(side="left", padx=(3, 16))
         self._kva_combo.bind("<<ComboboxSelected>>", self._on_kva_change)
 
-        # ISC auto-label
-        self._isc_auto_var = tk.StringVar(value="")
+        # ISC auto-label — seeded with the same hint _refresh_kva_options would
+        # show, since that callback hasn't run yet on a fresh window.
+        self._isc_auto_var = tk.StringVar(
+            value="Pick a transformer Type above to enable Size")
         self._isc_auto_lbl = tk.Label(
             kva_frame, textvariable=self._isc_auto_var,
             bg=_BG, fg=_ISC_NONE, font=_FONT_UI_S, anchor="w",
@@ -575,9 +593,12 @@ class PQApp(tk.Tk):
             return
 
         if not key:
+            # Size stays disabled until a Type is chosen.  Say why — a greyed-out
+            # control with no explanation reads as a broken tool.
             self._kva_combo.config(state="disabled", values=[])
             self._kva_var.set("")
-            self._isc_auto_var.set("")
+            self._isc_auto_var.set("Pick a transformer Type above to enable Size")
+            self._isc_auto_lbl.config(fg=_ISC_NONE)
             return
 
         try:
@@ -589,8 +610,14 @@ class PQApp(tk.Tk):
         if not sizes:
             self._kva_combo.config(state="disabled", values=[])
             self._kva_var.set("")
-            self._isc_auto_var.set("No Blue Book entries for this type/voltage "
-                                   "combination — use Override below")
+            if not _BOOK_AVAILABLE:
+                # The tables are empty because the import failed, not because
+                # this type/voltage is missing from the Blue Book.
+                self._isc_auto_var.set("Blue Book unavailable — this install is "
+                                       "broken (see banner at top)")
+            else:
+                self._isc_auto_var.set("No Blue Book entries for this type/voltage "
+                                       "combination — use Override below")
             self._isc_auto_lbl.config(fg=_ISC_NONE)
             return
 
@@ -640,6 +667,68 @@ class PQApp(tk.Tk):
         if path:
             self._file_var.set(path)
             self._address_var.set(Path(path).stem)
+
+    def _build_import_error_banner(self):
+        """Red banner shown when pq_analyzer failed to import.
+
+        Without this the tool opens and looks healthy, but the Blue Book tables
+        are empty, so the kVA picker never enables and ISC never autopopulates.
+        """
+        banner = tk.Frame(self, bg="#7a1c1c")
+        banner.pack(fill="x", side="top")
+
+        inner = tk.Frame(banner, bg="#7a1c1c")
+        inner.pack(fill="x", padx=12, pady=8)
+
+        tk.Label(
+            inner,
+            text="This install is broken — a required library failed to load.",
+            bg="#7a1c1c", fg="#ffffff", font=_FONT_UI_B, anchor="w",
+        ).pack(fill="x")
+
+        tk.Label(
+            inner,
+            text=("Transformer/ISC lookup is disabled and analysis will fail.\n"
+                  "From a Command Prompt in the pq-analyzer folder, run:\n"
+                  "    python check_install.py\n"
+                  "It will identify the problem and give you the fix."),
+            bg="#7a1c1c", fg="#f0c0c0", font=_FONT_MONO, anchor="w", justify="left",
+        ).pack(fill="x", pady=(4, 6))
+
+        btns = tk.Frame(inner, bg="#7a1c1c")
+        btns.pack(fill="x")
+        tk.Button(btns, text="Show the error details",
+                  command=self._show_import_error,
+                  font=_FONT_UI_S).pack(side="left")
+        tk.Label(btns, text="  (send these to the maintainer)",
+                 bg="#7a1c1c", fg="#f0c0c0", font=_FONT_UI_S).pack(side="left")
+
+    def _show_import_error(self):
+        """Display import_error.log so the user can copy the traceback."""
+        log_path = Path(__file__).parent / "import_error.log"
+        try:
+            detail = log_path.read_text()
+        except Exception:
+            detail = ("import_error.log could not be read.\n\n"
+                      "Run the tool from a Command Prompt to see the error:\n"
+                      "    python run.py")
+
+        win = tk.Toplevel(self)
+        win.title("Import error details")
+        win.configure(bg=_BG)
+        win.geometry("900x500")
+
+        txt = tk.Text(win, bg=_LOG_BG, fg=_LOG_FG, font=_FONT_MONO, wrap="none")
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("1.0", detail)
+        txt.config(state="disabled")
+
+        def _copy():
+            self.clipboard_clear()
+            self.clipboard_append(detail)
+
+        tk.Button(win, text="Copy to clipboard", command=_copy,
+                  font=_FONT_UI).pack(pady=(0, 8))
 
     def _open_folder(self):
         folder = _SCRIPT.parent / "pq_output"
@@ -707,6 +796,10 @@ class PQApp(tk.Tk):
             "xfmr_key":       xfmr_key,
             "kva":            kva,
             "isc_amps":       isc_amps,
+            # The service-type and topology pickers decide how many phases the
+            # report and its charts describe; without these the plots fall back
+            # to guessing from which channels happen to be present.
+            "topology":       self._topo_var.get(),
         }
 
         self._log_clear()
@@ -756,6 +849,8 @@ class PQApp(tk.Tk):
             isc_amps=isc_amps,
             isc_source=isc_source,
             transformer_kva=kva,
+            service_type=params.get("xfmr_key"),
+            topology=params.get("topology", "auto"),
         )
 
         # ── Adapter ───────────────────────────────────────────────────────────
@@ -1338,6 +1433,208 @@ class PQApp(tk.Tk):
         )
 
         # ── Analysis Methods & Diagnostics ────────────────────────────────
+        # ── Neutral integrity ──────────────────────────────────────────────
+        # Written to be read start to finish. The neutral is the one part of a
+        # service where the correct interpretation flips depending on the
+        # secondary configuration, and where the same measurement can mean
+        # "healthy" or "failing" depending on which service you are looking at.
+        section("Neutral Integrity — Theory and Diagnostics")
+
+        concept(
+            "1. What the neutral actually carries",
+            "The neutral is the return path for whatever the phase conductors do not\n"
+            "return to each other.  It does not carry the arithmetic sum of the phase\n"
+            "currents — it carries their vector sum, and the angles between the phases\n"
+            "decide the result.  Almost everything confusing about neutrals follows\n"
+            "from that one fact.\n"
+            "\n"
+            "Three secondary configurations matter here, and they behave differently:\n"
+            "\n"
+            "  Split phase 120/240   One center-tapped single-phase transformer.\n"
+            "                        The two legs are 180° apart.\n"
+            "  Three phase 120/208   A three-phase transformer, all three phases taken.\n"
+            "                        The phases are 120° apart.\n"
+            "  Single phase 120/208  The same three-phase transformer, but the customer\n"
+            "                        pulls only two legs.  Still 120° apart.\n"
+            "\n"
+            "The last two share a transformer.  The difference is only how many wires\n"
+            "the customer pulls — which is exactly why the neutral behaves differently.",
+        )
+
+        concept(
+            "2. Why balanced load does not mean zero neutral current",
+            "Take equal current I on every leg and add the phasors:\n"
+            "\n"
+            "  Split phase, legs 180° apart\n"
+            "     I∠0° + I∠180° = 0.        Neutral current ≈ 0.\n"
+            "     The legs oppose, so a balanced service returns nothing on the neutral.\n"
+            "\n"
+            "  Three phase, three legs 120° apart\n"
+            "     I∠0° + I∠120° + I∠240° = 0.   Neutral current ≈ 0.\n"
+            "     All three cancel — the classic balanced wye result.\n"
+            "\n"
+            "  Single phase 120/208, two legs 120° apart\n"
+            "     I∠0° + I∠120° = I∠60°, magnitude I.   Neutral current ≈ I.\n"
+            "     Two of three do not cancel.  The neutral carries a full leg's worth\n"
+            "     of current even when the load is perfectly balanced.\n"
+            "\n"
+            "This is the single most misread result in this tool.  A 120/208 service\n"
+            "with a neutral at 100% of leg current is behaving exactly as designed.\n"
+            "The same reading on a 120/240 service means something is badly wrong.\n"
+            "\n"
+            "Practical consequence: on a 120/208 single-phase service the neutral must\n"
+            "be sized as a full current-carrying conductor.  It is not a \"return only\n"
+            "the imbalance\" conductor the way a split-phase neutral is.",
+        )
+
+        concept(
+            "3. Harmonics — why triplens break the cancellation",
+            "Phase angle multiplies with harmonic order.  A conductor whose fundamental\n"
+            "sits at angle θ has its h-th harmonic at h × θ.  Work that through:\n"
+            "\n"
+            "  Split phase, legs 180° apart\n"
+            "     3rd harmonic: 3 × 180° = 540° ≡ 180°.\n"
+            "     Still opposed, so triplens subtract in the neutral just as the\n"
+            "     fundamental does.  A split-phase neutral does not accumulate triplens.\n"
+            "\n"
+            "  Any wye, legs 120° apart\n"
+            "     3rd harmonic: 3 × 120° = 360° ≡ 0°.\n"
+            "     The triplens land in phase with each other and ADD arithmetically.\n"
+            "     H3, H9, H15 are \"zero-sequence\" for exactly this reason.\n"
+            "\n"
+            "So on any wye-derived service — full three-phase or two legs of one —\n"
+            "single-phase nonlinear loads (computers, LED drivers, switching supplies)\n"
+            "pile their 3rd harmonic into the shared neutral.  Neutral current can\n"
+            "exceed phase current, which is why NEC requires the neutral of such a\n"
+            "circuit to be treated as a current-carrying conductor.\n"
+            "\n"
+            "Reading it: on a 120/208 service, neutral at roughly leg current is the\n"
+            "geometry.  Neutral ABOVE leg current is the harmonics on top of it.",
+        )
+
+        concept(
+            "4. The open neutral — what physically happens",
+            "An open or high-resistance neutral is the failure this section exists to\n"
+            "find, and the mechanism is worth understanding because it explains every\n"
+            "symptom.\n"
+            "\n"
+            "With the neutral intact, each leg's load is fed from its own 120 V source.\n"
+            "The legs are independent, and the neutral carries the difference.\n"
+            "\n"
+            "Open the neutral and the two loads are suddenly in SERIES across the\n"
+            "line-to-line voltage.  The point where they meet — what used to be the\n"
+            "neutral — is no longer tied to anything.  It floats to wherever the two\n"
+            "load impedances divide the L-L voltage.\n"
+            "\n"
+            "  The lightly loaded leg (high impedance) takes most of the voltage and\n"
+            "     rises toward the full L-L value.\n"
+            "  The heavily loaded leg (low impedance) collapses toward zero.\n"
+            "\n"
+            "That is the damage mechanism: equipment on the lightly loaded side sees\n"
+            "an overvoltage that can approach 240 V (or 208 V) on a 120 V circuit.\n"
+            "It also explains the signatures below — as load shifts between legs, the\n"
+            "floating midpoint moves, so one leg rises exactly as the other falls.",
+        )
+
+        concept(
+            "5. The five diagnostics, and what each can and cannot see",
+            "The tool combines five independent indicators.  None is conclusive alone;\n"
+            "the value is in which ones agree.\n"
+            "\n"
+            "  a) Cross-leg correlation (Pearson r between L1 and L2)\n"
+            "     Healthy: both legs move together as the transformer loads and unloads,\n"
+            "       so r > 0.8.\n"
+            "     Open neutral: the floating midpoint means one leg rises as the other\n"
+            "       falls, driving r toward −1.\n"
+            "     This is the primary open-neutral test, and it works on both 120/240\n"
+            "       and 120/208 services.\n"
+            "     Blind spot: needs load variation.  A perfectly steady service gives\n"
+            "       no correlation to measure, and the tool reports it as not computable\n"
+            "       rather than guessing.\n"
+            "\n"
+            "  b) Voltage sum (L1 + L2) — and this one depends on the service\n"
+            "     On 120/240, the legs are collinear, so L1 + L2 = the line-to-line\n"
+            "       voltage, 240 V.  Open the neutral and the loads sit in series across\n"
+            "       that same 240 V — so the sum is STILL 240 V.  On a split-phase\n"
+            "       service the sum tells you nothing about the neutral.  A rock-steady\n"
+            "       240 V is not evidence the neutral is sound.\n"
+            "     On 120/208, a healthy service reads 120 + 120 = 240 V, but an open\n"
+            "       neutral puts the loads in series across the line-to-line 208 V, so\n"
+            "       the sum COLLAPSES toward 208.  Here the sum is a real discriminator.\n"
+            "     The tool applies this per configuration and says which case it is in.\n"
+            "\n"
+            "  c) Voltage asymmetry |L1 − L2|\n"
+            "     Sustained asymmetry means the legs are unequally loaded, the neutral\n"
+            "       has resistance, or both.  Useful, but it cannot separate ordinary\n"
+            "       unbalanced loading from a degrading neutral on its own.\n"
+            "\n"
+            "  d) Neutral-to-earth voltage (Vne)\n"
+            "     The most direct measurement of neutral impedance available, when the\n"
+            "       meter records it.  Current through a resistive neutral develops a\n"
+            "       voltage along it, and Vne is what that looks like from the far end.\n"
+            "     Under 0.5 V is normal.  Above 2 V indicates significant impedance.\n"
+            "       Above 5 V is a shock hazard — the \"grounded\" metal in the premises\n"
+            "       is no longer at earth potential.\n"
+            "\n"
+            "  e) Coincident opposing sag/swell\n"
+            "     One leg drops below 90% while the other simultaneously exceeds 110%.\n"
+            "     This is the open-neutral signature in its clearest form and needs\n"
+            "       cycle-level (adaptive) records to catch.",
+        )
+
+        concept(
+            "6. Assessing a neutral in the field",
+            "A practical order of operations:\n"
+            "\n"
+            "  1. Establish the configuration first.  Everything above depends on it.\n"
+            "     Set Service Type before reading any neutral result.\n"
+            "\n"
+            "  2. Ask whether the neutral current is explained by geometry.\n"
+            "     120/240: balanced load should give a near-zero neutral.\n"
+            "     120/208 two-leg: balanced load gives a neutral near full leg current.\n"
+            "     Only current beyond that needs an explanation.\n"
+            "\n"
+            "  3. If the neutral is high, separate imbalance from harmonics.\n"
+            "     Compare the neutral's H3 content against the phases.  Triplen-dominated\n"
+            "     neutral current is a harmonics problem — the fix is load-side, not a\n"
+            "     wiring fault.  Broadband neutral current tracking load imbalance is a\n"
+            "     balancing problem.\n"
+            "\n"
+            "  4. Suspect an open neutral when the legs move in opposition.\n"
+            "     Negative cross-leg correlation, coincident opposing sag/swell, or\n"
+            "     elevated Vne.  Any one warrants a physical inspection; two together\n"
+            "     make it likely.\n"
+            "\n"
+            "  5. Inspect from the meter socket outward.  Open and high-resistance\n"
+            "     neutrals are overwhelmingly connection failures — socket jaws, the\n"
+            "     service-entrance lug, the drop connector — not conductor failures.",
+        )
+
+        concept(
+            "7. What this analysis cannot tell you",
+            "Stated plainly so the results are not over-read:\n"
+            "\n"
+            "  It cannot locate the fault.  Every indicator is measured at one point,\n"
+            "    so it describes the neutral between the meter and the source as a\n"
+            "    whole.  It cannot distinguish a bad socket jaw from a bad drop.\n"
+            "\n"
+            "  It cannot see a neutral problem that never manifests.  A high-resistance\n"
+            "    neutral only shows up under load imbalance.  A recording taken during\n"
+            "    a quiet week may look clean on a neutral that fails in the evening.\n"
+            "\n"
+            "  On a 120/240 service the voltage sum contributes nothing, so the finding\n"
+            "    rests on correlation, asymmetry and Vne.  If load was steady and Vne\n"
+            "    was not recorded, the tool has very little to go on and says so.\n"
+            "\n"
+            "  On a 120/208 service it sees only two of the three phases, so it cannot\n"
+            "    assess unbalance at the transformer itself — only the difference\n"
+            "    between the two legs this customer is served from.\n"
+            "\n"
+            "  Severity here is an engineering judgment built from indicators that\n"
+            "    agree, not a standards compliance result.  There is no ANSI or IEEE\n"
+            "    limit for \"neutral health\"; the thresholds are practical ones.",
+        )
+
         section("Analysis Methods & Diagnostics")
 
         concept(

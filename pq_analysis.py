@@ -8,6 +8,21 @@ import numpy as np
 import pandas as pd
 
 from pq_constants import (
+    SEVERITY_LABEL,
+    SEVERITY_ORDER,
+    SEVERITY_SEVERE_MARGIN,
+    SEVERITY_SEVERE_MARGIN_ALONE,
+    SEVERITY_SEVERE_PERSISTENCE,
+    SEVERITY_SIGNIFICANT_MARGIN,
+    SEVERITY_SIGNIFICANT_PERSISTENCE,
+    LOAD_FAMILY_LABEL,
+    SEVERITY_WATCH_FRACTION,
+    SEVERITY_WATCH_FRACTION_FLOOR,
+    is_single_phase_208,
+    ll_factor,
+    SIGNATURE_ABSOLUTE_FLOOR,
+    SIGNATURE_FAMILY_SEPARATION,
+    SIGNATURE_MEMBER_SEPARATION,
     Thresholds,
     _H519_ORDERS,
     _LOAD_SIGNATURES,
@@ -27,12 +42,114 @@ from pq_adapter import PQDataset
 #: for a single order.
 _HARMONIC_COL = re.compile(r"h\d+_(current|voltage)_")
 
+#: Voltage THD is only meaningful while the fundamental is intact.  Below this
+#: fraction of nominal the measurement is a sag, an interruption or a meter
+#: dropout, and V_h/V_1 reports distortion that is not physically there.  0.5 pu
+#: is deliberately permissive: IEEE 1159 calls anything under 0.9 pu a sag, but
+#: real distortion during a shallow sag is still worth seeing, whereas nothing
+#: below half nominal is a valid steady-state THD reading.
+_VTHD_VALID_PU = 0.5
+
+#: A maximum this many times the 95th percentile is a spike rather than a
+#: condition, and the report says so instead of leading with the number.
+_VTHD_OUTLIER_RATIO = 3.0
+
 log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. ANALYSIS ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
+
+def grade_finding(
+    passes: Optional[bool],
+    measured: Optional[float] = None,
+    limit: Optional[float] = None,
+    persistence_pct: Optional[float] = None,
+    confidence_notes: Optional[List[str]] = None,
+    lower_is_worse: bool = False,
+) -> dict:
+    """Grade one compliance finding on severity, separately from pass/fail.
+
+    Compliance answers "was this inside the limit"; severity answers "how much
+    should anyone care".  Collapsing both into one red FAIL makes an isolated
+    artifact look like a sustained overload, which is what makes a report
+    alarming out of proportion to what it found.
+
+    Severity comes from two measured quantities -- how far past the limit
+    (margin) and how much of the recording was past it (persistence) -- and is
+    then downgraded one band when the underlying number is known to be less
+    trustworthy.  The downgrade reason is returned so the report can print it:
+    a discount a reader cannot see is indistinguishable from hand-waving.
+
+    ``lower_is_worse`` covers metrics like power factor, where falling below the
+    limit is the failure and the margin therefore inverts.
+    """
+    notes = [n for n in (confidence_notes or []) if n]
+
+    if passes is None:
+        return {"band": "not_assessed", "label": SEVERITY_LABEL["not_assessed"],
+                "reason": "", "margin": None, "downgraded": False}
+
+    # ── Margin: how far past the limit, as a ratio ────────────────────────────
+    margin: Optional[float] = None
+    if measured is not None and limit is not None and limit > 0 and measured > 0:
+        margin = (limit / measured) if lower_is_worse else (measured / limit)
+
+    if passes:
+        # Inside the limit.  Only distinguish "comfortably" from "close to it".
+        band = "compliant"
+        reason = ""
+        watch_at = (SEVERITY_WATCH_FRACTION_FLOOR if lower_is_worse
+                    else SEVERITY_WATCH_FRACTION)
+        if margin is not None and margin >= watch_at:
+            band = "watch"
+            reason = (f"within the limit but only {(1 / margin - 1) * 100:.0f}% "
+                      "above it" if lower_is_worse
+                      else f"within the limit but at {margin * 100:.0f}% of it")
+        # A pass built on soft data is still worth qualifying -- a one-day
+        # recording that meets a weekly statistical test has met less than the
+        # test asks for, and the reader should be told without being alarmed.
+        if notes:
+            reason = (reason + "; " if reason else "") + "; ".join(notes)
+        return {"band": band, "label": SEVERITY_LABEL[band], "reason": reason,
+                "margin": margin, "downgraded": False}
+
+    # ── Outside the limit: grade it ───────────────────────────────────────────
+    p = persistence_pct if persistence_pct is not None else 0.0
+    m = margin if margin is not None else 1.0
+
+    if m >= SEVERITY_SEVERE_MARGIN_ALONE or (
+            m >= SEVERITY_SEVERE_MARGIN and p >= SEVERITY_SEVERE_PERSISTENCE):
+        band = "severe"
+    elif m >= SEVERITY_SIGNIFICANT_MARGIN or p >= SEVERITY_SIGNIFICANT_PERSISTENCE:
+        band = "significant"
+    else:
+        band = "minor"
+
+    # ── Confidence downgrade ──────────────────────────────────────────────────
+    downgraded = False
+    if notes and band != "minor":
+        band = SEVERITY_ORDER[SEVERITY_ORDER.index(band) - 1]
+        downgraded = True
+
+    bits = []
+    if margin is not None:
+        # "1.02x the limit" reads backwards for a floor like power factor, where
+        # the failure is falling short of it rather than rising above it.
+        bits.append(f"{(m - 1) * 100:.0f}% below the limit" if lower_is_worse
+                    else f"{m:.2f}x the limit")
+    if persistence_pct is not None:
+        bits.append(f"{p:.1f}% of the recording")
+    reason = ", ".join(bits)
+    if notes:
+        reason = (reason + "; " if reason else "") + "; ".join(notes)
+        if downgraded:
+            reason += " (severity reduced one band)"
+
+    return {"band": band, "label": SEVERITY_LABEL[band], "reason": reason,
+            "margin": margin, "downgraded": downgraded}
+
 
 def _require(df: pd.DataFrame, *cols: str) -> bool:
     """Return True if all cols exist in df and have at least one finite value."""
@@ -622,16 +739,62 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "error": "Voltage THD channel(s) present but no usable samples.",
             }
         else:
+            # Voltage THD is V_h/V_1 — the same ratio structure that makes
+            # current THD explode at light load.  When the fundamental collapses
+            # (a sag, a momentary interruption, a meter dropout at the edges of
+            # the recording) the denominator approaches zero and THD runs to
+            # tens of percent.  Those samples are measurement artifacts, not
+            # distortion, and IEEE 519-2022 evaluates against normal operating
+            # conditions.  Drop them before judging anything.
+            raw_n = len(worst)
+            v_cols = [c for c in ["voltage_a", "voltage_b", "voltage_c"]
+                      if c in df.columns]
+            sag_floor = thresh.nominal_voltage * _VTHD_VALID_PU
+            artifact_samples = 0
+            if v_cols:
+                v_min = df[v_cols].min(axis=1).reindex(worst.index)
+                valid = v_min.notna() & (v_min >= sag_floor)
+                if valid.any():
+                    artifact_samples = int((~valid).sum())
+                    worst = worst[valid]
+
             exceed = worst > thresh.thd_voltage_limit
+            # IEEE 519-2022 Clause 5 judges voltage THD on the 95th percentile of
+            # short-time values, not on every sample.  A single artifact sample
+            # must not fail a site, so the percentile is the verdict and the
+            # maximum is reported as context.
+            p95 = float(worst.quantile(0.95))
+            p99 = float(worst.quantile(0.99))
+            v_max = float(worst.max())
             result["voltage"] = {
                 "available":        True,
                 "limit_pct":        thresh.thd_voltage_limit,
-                "max_thd_pct":      float(worst.max()),
+                "max_thd_pct":      v_max,
                 "mean_thd_pct":     float(worst.mean()),
+                "p95_thd_pct":      p95,
+                "p99_thd_pct":      p99,
+                "p95_limit_pct":    thresh.thd_voltage_limit,
+                "p99_limit_pct":    thresh.thd_voltage_limit * 1.5,
+                "p95_pass":         p95 <= thresh.thd_voltage_limit,
+                "p99_pass":         p99 <= thresh.thd_voltage_limit * 1.5,
                 "pct_exceeding":    float(exceed.mean() * 100),
+                "sample_count":     len(worst),
+                "artifact_samples": artifact_samples,
+                "artifact_floor_v": round(sag_floor, 1),
+                # A maximum far above the 95th percentile is a spike, not a
+                # condition; the report says so rather than leading with it.
+                "max_is_outlier":   bool(p95 > 0 and v_max > p95 * _VTHD_OUTLIER_RATIO
+                                         and p95 <= thresh.thd_voltage_limit),
                 "violation_timestamps": worst.index[exceed].tolist(),
             }
             result["available"] = True
+            if artifact_samples:
+                log.info(
+                    "Voltage THD: %d of %d samples dropped — measured voltage "
+                    "below %.1f V (%.0f%% of nominal), where the THD ratio is "
+                    "not meaningful.",
+                    artifact_samples, raw_n, sag_floor, _VTHD_VALID_PU * 100,
+                )
 
     # ── Current TDD (or THD fallback) ─────────────────────────────────────────
     i_thd_cols = [c for c in ["thd_current_a", "thd_current_b", "thd_current_c"]
@@ -801,6 +964,10 @@ def check_individual_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
 
     worst_pct = 0.0
     worst_order = None
+    worst_margin = 0.0
+    worst_margin_order = None
+    worst_margin_pct = 0.0
+    worst_margin_limit = None
 
     for ph in ("a", "b", "c"):
         ph_result = {}
@@ -831,11 +998,25 @@ def check_individual_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
             if max_pct > worst_pct:
                 worst_pct = max_pct
                 worst_order = (h, ph)
+            # Severity depends on the worst *margin*, not the worst magnitude:
+            # the per-order limits fall steeply with h, so a small high-order
+            # current can be further past its limit than a large H3.
+            ratio = max_pct / limit_pct
+            if ratio > worst_margin:
+                worst_margin       = ratio
+                worst_margin_order = (h, ph)
+                worst_margin_pct   = max_pct
+                worst_margin_limit = limit_pct
 
         result["phases"][ph] = ph_result
 
     result["worst_order"] = worst_order
     result["worst_pct_of_il"] = round(worst_pct, 2)
+    result["worst_margin"] = round(worst_margin, 3) if worst_margin else None
+    result["worst_margin_order"] = worst_margin_order
+    result["worst_margin_pct_of_il"] = (round(worst_margin_pct, 2)
+                                        if worst_margin_order else None)
+    result["worst_limit_pct"] = worst_margin_limit if worst_margin_order else None
     return result
 
 
@@ -1352,11 +1533,29 @@ def check_harmonic_statistics(df: pd.DataFrame, thresh: Thresholds) -> dict:
             if not d["pass"]:
                 overall_pass = False
 
+    # Name the case that actually binds.  "P95 within limits for all orders"
+    # tells a reader nothing about how close the service came; the tightest
+    # margin does, and it is what a follow-up measurement should watch.
+    binding = None
+    for key, per_phase in weekly.items():
+        for ph, w in per_phase.items():
+            if not w.get("limit"):
+                continue
+            ratio = w["p95"] / w["limit"]
+            if binding is None or ratio > binding["ratio"]:
+                binding = {
+                    "order": key, "phase": ph,
+                    "p95": w["p95"], "limit": w["limit"],
+                    "ratio": round(ratio, 3),
+                    "p95_pass": w["p95_pass"],
+                }
+
     result.update({
         "weekly": weekly, "daily_vst": daily_vst,
         "overall_pass": overall_pass,
         "tdd_limit": round(tdd_lim, 1),
         "isc_class": _tdd_class(isc_il),
+        "binding": binding,
     })
     return result
 
@@ -1384,9 +1583,42 @@ def check_voltage_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
             "violation_timestamps": pd.DatetimeIndex([]),
         }
 
-    avg  = vdf.mean(axis=1)
-    dev  = (vdf.subtract(avg, axis=0)).abs().max(axis=1)
-    imbalance = np.where(avg > 0, dev / avg * 100, np.nan)
+    if len(v_cols) >= 3:
+        # NEMA MG1 as defined: max deviation from the average of the three line
+        # voltages, over that average. The concern it encodes is negative-
+        # sequence heating in three-phase motors.
+        avg  = vdf.mean(axis=1)
+        dev  = (vdf.subtract(avg, axis=0)).abs().max(axis=1)
+        imbalance = np.where(avg > 0, dev / avg * 100, np.nan)
+        metric, metric_label = "nema_mg1", "NEMA MG1 voltage unbalance"
+        basis = ("Max deviation from the three-phase average, per NEMA MG1.")
+        note = None
+    else:
+        # Two legs. NEMA MG1 is defined for three-phase systems and its formula
+        # does not carry over: applied to two elements the deviation from their
+        # own mean is half their difference, so a 4 V spread on 120 V legs
+        # reported 1.67% where an engineer would say the legs are 3.3% apart.
+        # There is also no negative sequence on a single-phase service and no
+        # three-phase motor to derate, so what matters is the leg difference
+        # itself -- an indicator of unequal loading or neutral impedance.
+        diff = (vdf.iloc[:, 0] - vdf.iloc[:, 1]).abs()
+        base = thresh.nominal_voltage if thresh.nominal_voltage > 0 else np.nan
+        imbalance = (diff / base * 100).to_numpy()
+        metric, metric_label = "leg_difference", "Leg-to-leg voltage difference"
+        basis = ("Difference between the two legs as a percentage of nominal. "
+                 "NEMA MG1 unbalance is defined for three-phase systems and is "
+                 "not applicable to a single-phase service.")
+        if is_single_phase_208(thresh.service_type):
+            # Only two of the three wye phases are measured, so the source's
+            # own unbalance cannot be separated from the customer's loading.
+            note = ("This service takes two legs of a three-phase 120/208 "
+                    "transformer, so only two of the three phases are "
+                    "measured. True three-phase unbalance at the transformer "
+                    "cannot be determined from this recording; the figure "
+                    "below is the difference between the two legs served.")
+        else:
+            note = None
+
     imb_series = pd.Series(imbalance, index=vdf.index)
     exceed = imb_series > thresh.imbalance_limit
 
@@ -1394,6 +1626,10 @@ def check_voltage_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "available":            True,
         "error":                None,
         "limit_pct":            thresh.imbalance_limit,
+        "metric":               metric,
+        "metric_label":         metric_label,
+        "basis":                basis,
+        "note":                 note,
         "max_imbalance_pct":    float(np.nanmax(imbalance)),
         "mean_imbalance_pct":   float(np.nanmean(imbalance)),
         "pct_exceeding":        float(exceed.mean() * 100),
@@ -1783,16 +2019,28 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
     """
     Assess split-phase neutral integrity. Only meaningful for split-phase topology.
 
-    Combines four independent indicators:
-    - Voltage sum stability  : Van + Vbn should hold near 240 V
+    Combines five independent indicators:
     - Cross-leg correlation  : healthy legs track together (r > 0.8);
-                               open neutral causes opposition (r → −1)
+                               open neutral causes opposition (r → −1).
+                               The primary test, and valid on both
+                               configurations.
+    - Voltage sum stability  : diagnostic only on a 120/208 two-leg service,
+                               where an open neutral collapses the sum from
+                               2 x nominal toward the line-to-line voltage.
+                               On 120/240 the legs are collinear, so the sum
+                               equals the line-to-line voltage whether the
+                               neutral is intact or open -- see the note in
+                               section 1 below.
+    - Voltage asymmetry      : |L1 - L2| sustained above a few percent of
+                               nominal indicates unequal loading, neutral
+                               resistance, or both.
     - Neutral-to-earth Vne   : elevated Vne indicates neutral impedance
     - Coincident opposing events: one leg sags while the other swells
     """
     topology = ds.meta.get("topology", "unknown")
-    if topology != "split-phase":
-        return {"available": False, "reason": "not split-phase topology"}
+    two_leg_208 = is_single_phase_208(thresh.service_type)
+    if topology != "split-phase" and not two_leg_208:
+        return {"available": False, "reason": "not a two-leg service"}
 
     df = ds.df
     if "voltage_a" not in df.columns or "voltage_b" not in df.columns:
@@ -1812,12 +2060,45 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
     nom  = thresh.nominal_voltage
 
     # ── 1. Voltage sum ────────────────────────────────────────────────────────
+    # What the sum can tell you differs by configuration, and the difference is
+    # not cosmetic:
+    #
+    #   120/240 split-phase -- the legs are collinear (180 deg apart), so their
+    #     scalar sum is the line-to-line voltage, 240 V.  Open the neutral and
+    #     the two loads sit in series across that same 240 V, so the sum is
+    #     still 240 V.  The sum therefore carries no open-neutral information
+    #     here; it only confirms the measurement is sane.
+    #
+    #   120/208 two-leg -- healthy, the legs are 120 deg apart and each reads
+    #     120 V, so the scalar sum is still 240 V.  But open the neutral and
+    #     the loads sit in series across the *line-to-line* voltage, 208 V, so
+    #     the sum collapses toward 208.  On this configuration the sum is a
+    #     genuine open-neutral discriminator.
     vsum     = va_a + vb_a
     sum_mean = float(vsum.mean())
     sum_std  = float(vsum.std())
+    healthy_sum = 2.0 * nom
+    # The gate above already established which configuration this is, so read
+    # the factor from that rather than from ll_factor's default -- with no
+    # picker set ll_factor assumes three-phase, which would wrongly mark a
+    # 120/240 service's sum as diagnostic.
+    open_neutral_sum = nom * ((3.0 ** 0.5) if two_leg_208 else 2.0)
+    sum_is_diagnostic = abs(healthy_sum - open_neutral_sum) > 0.05 * nom
+    sum_toward_open = None
+    if sum_is_diagnostic:
+        # 1.0 means the sum sits where an open neutral would put it, 0.0 where
+        # a healthy service would.
+        span = healthy_sum - open_neutral_sum
+        sum_toward_open = float((healthy_sum - sum_mean) / span) if span else None
 
     # ── 2. Cross-leg Pearson correlation ─────────────────────────────────────
+    # Undefined when either leg is perfectly flat -- there is no variation to
+    # correlate. That is not a fault, so report it as unavailable rather than
+    # letting a NaN reach the page or read as a negative correlation.
     leg_corr = float(va_a.corr(vb_a))
+    corr_available = not (np.isnan(leg_corr))
+    if not corr_available:
+        leg_corr = 1.0
 
     # ── 3. Voltage asymmetry |L1 − L2| ───────────────────────────────────────
     asym      = (va_a - vb_a).abs()
@@ -1909,12 +2190,41 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
     if sum_std > 3.0:
         findings.append(
             f"Voltage sum (L1 + L2) is unstable: mean {sum_mean:.1f} V, std {sum_std:.1f} V. "
-            "A solid neutral holds L1 + L2 near 240 V with std < 1 V."
+            f"A solid neutral holds L1 + L2 near {healthy_sum:.0f} V with std < 1 V."
         )
     elif sum_std > 1.0:
         findings.append(
             f"Voltage sum (L1 + L2) shows moderate variation: "
             f"mean {sum_mean:.1f} V, std {sum_std:.2f} V."
+        )
+
+    # On a 120/208 two-leg service the sum separates a healthy neutral from an
+    # open one; on a 120/240 service it cannot, and saying so stops a steady
+    # 240 V reading being taken as evidence the neutral is sound.
+    if sum_is_diagnostic:
+        if sum_toward_open is not None and sum_toward_open > 0.5:
+            findings.append(
+                f"Voltage sum has collapsed toward the line-to-line value: "
+                f"L1 + L2 = {sum_mean:.1f} V against {healthy_sum:.0f} V for a "
+                f"healthy neutral and {open_neutral_sum:.0f} V if the two legs "
+                f"were in series across the line-to-line voltage. On a "
+                f"single-phase 120/208 service that is the open-neutral "
+                f"signature."
+            )
+        else:
+            findings.append(
+                f"Voltage sum sits at {sum_mean:.1f} V, near the "
+                f"{healthy_sum:.0f} V expected of a healthy neutral rather "
+                f"than the {open_neutral_sum:.0f} V an open neutral would "
+                f"produce on this 120/208 service."
+            )
+    else:
+        findings.append(
+            f"On a 120/240 service both legs are collinear, so L1 + L2 equals "
+            f"the line-to-line voltage ({healthy_sum:.0f} V) whether the "
+            f"neutral is intact or open. The sum confirms the measurement is "
+            f"consistent but carries no open-neutral information here — the "
+            f"cross-leg correlation and asymmetry below do."
         )
 
     if asym_pct > 5.0:
@@ -1937,11 +2247,17 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
 
     return {
         "available":         True,
-        "topology":          "split-phase",
+        "topology":          "1ph-208" if two_leg_208 else "split-phase",
         "sample_count":      len(aligned),
         "sum_mean_v":        round(sum_mean, 2),
         "sum_std_v":         round(sum_std, 3),
-        "leg_correlation":   round(leg_corr, 3),
+        "healthy_sum_v":     round(healthy_sum, 1),
+        "open_neutral_sum_v": round(open_neutral_sum, 1),
+        "sum_is_diagnostic": sum_is_diagnostic,
+        "sum_toward_open":   (round(sum_toward_open, 3)
+                              if sum_toward_open is not None else None),
+        "leg_correlation":   round(leg_corr, 3) if corr_available else None,
+        "leg_correlation_available": corr_available,
         "asym_mean_v":       round(asym_mean, 2),
         "asym_max_v":        round(asym_max, 2),
         "asym_pct":          round(asym_pct, 2),
@@ -1989,8 +2305,24 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+#: Smallest power-factor correction worth recommending as an action.  Below
+#: this the required kVAR is under the smallest practical switched capacitor
+#: step, so an "install correction" line is bulk rather than advice.
+_MIN_ACTIONABLE_KVAR = 5.0
+
+#: Readable service names for the signature findings.  The tariff codes mean
+#: nothing to a customer reading the report.
+_CLASS_SERVICE_NAME = {
+    "r":  "residential",
+    "c":  "small commercial",
+    "sg": "commercial / industrial secondary",
+    "pg": "commercial / industrial primary",
+}
+
+
 def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
-                               significance: Optional[dict] = None) -> List[dict]:
+                               significance: Optional[dict] = None,
+                               customer_class: Optional[str] = None) -> List[dict]:
     """
     Score each entry in _LOAD_SIGNATURES against the measured harmonic spectrum
     using cosine similarity, then return the top matches as finding dicts.
@@ -1999,6 +2331,13 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
     affect which load type wins.  A variability modifier adjusts scores up/down based
     on whether the measured H5 inter-interval CV matches the load type's expected
     stability (steady-state vs. intermittent).
+
+    The candidate set is restricted to load types that are plausible for the
+    service class.  Cosine similarity will always return a nearest neighbour, so
+    an unrestricted library named an arc furnace as the best match for a house —
+    a shape match against equipment that cannot be there, which discredits the
+    rest of the report.  A house is scored against air conditioning, EV charging
+    and rooftop PV; an arc furnace is only offered to a primary-metered service.
     """
     _ORDERS = [3, 5, 7, 9, 11, 13]
     # Matching a load signature is a statement about spectral shape, so it is
@@ -2040,9 +2379,23 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
             return 0.5
         return float(np.exp(-0.5 * (np.log(r_measured / r_ref) / sigma) ** 2))
 
+    # Restrict the library to equipment that can plausibly exist at this class
+    # of service before scoring anything.
+    candidates = [s for s in _LOAD_SIGNATURES
+                  if not customer_class
+                  or customer_class in s.get("classes", set())]
+    if not candidates:
+        log.info("No load signatures apply to customer class %r; "
+                 "signature matching skipped.", customer_class)
+        return []
+    if customer_class:
+        log.info("Load-signature matching against %d of %d reference loads "
+                 "applicable to customer class %r.",
+                 len(candidates), len(_LOAD_SIGNATURES), customer_class)
+
     # Score each signature
     scored = []
-    for sig in _LOAD_SIGNATURES:
+    for sig in candidates:
         ref = np.array(sig["spectrum"], dtype=float)
         ref_h3, ref_h5, ref_h7 = ref[0], ref[1], ref[2]
 
@@ -2077,47 +2430,180 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
     )
 
     findings = []
-    rank_labels = ["Best match", "Contributing load", "Contributing load"]
-    for rank, (sim, sig) in enumerate(scored[:3]):
-        if sim < 0.75:
-            break
-        conf = "high" if sim >= 0.95 else ("medium" if sim >= 0.85 else "low")
-        # Only the top match restates the full measured spectrum -- the runner-up
-        # candidates are scored against that same spectrum, so repeating it verbatim
-        # in every finding just triplicates the same block of text in the report.
-        if rank == 0:
-            finding_text = (
-                f"Spectral similarity {sim:.0%}. Measured spectrum: {spectrum_str}. "
-                f"H5/H7={h5_h7:.2f}, H3/H5={h3_h5:.2f}, H5 variability (CV)={h5_cv:.2f}."
-            )
-        else:
-            finding_text = (
-                f"Spectral similarity {sim:.0%} against the same measured spectrum "
-                f"reported in the best-match finding above."
-            )
-        findings.append({
+    class_note = ""
+    if customer_class:
+        class_note = (f" Scored against the {len(candidates)} load types "
+                      f"plausible for a {_CLASS_SERVICE_NAME.get(customer_class, customer_class)} "
+                      f"service; equipment that does not belong at this class of "
+                      f"service was not considered.")
+
+    measured_note = (
+        f"Measured spectrum: {spectrum_str}. "
+        f"H5/H7={h5_h7:.2f}, H3/H5={h3_h5:.2f}, H5 variability (CV)={h5_cv:.2f}."
+    )
+
+    top_score, top_sig = scored[0]
+
+    # ── Is the spectrum recognisable at all? ─────────────────────────────────
+    # Nearest-neighbour scoring always returns something.  Against 20,000
+    # random decaying spectra this library's top score had a median of 0.87 and
+    # cleared 0.95 nearly a third of the time, so a match that merely "scores
+    # well" is not evidence of anything.  Below the floor the report says so
+    # rather than naming the nearest entry.
+    if top_score < SIGNATURE_ABSOLUTE_FLOOR:
+        log.info("No load signature recognised: best score %.3f is below the "
+                 "%.2f floor.", top_score, SIGNATURE_ABSOLUTE_FLOOR)
+        return [{
             "category":       "harmonics",
             "severity":       "info",
-            "title":          f"{rank_labels[rank]}: {sig['title']}",
-            "finding":        finding_text,
-            "cause":          sig["cause"],
-            "origin_evidence": (
-                "Load signatures describe equipment downstream of the meter. "
-                "This is a match on spectral shape, not a measurement of "
-                "direction."
+            "title":          "No recognised load signature",
+            # Informational: there is nothing here to act on, so this
+            # must not become a line item in Recommended Actions.
+            "no_action":      True,
+            "finding":        (
+                f"The measured harmonic spectrum does not correspond to any "
+                f"reference load type closely enough to name one (best score "
+                f"{top_score:.0%}, below the {SIGNATURE_ABSOLUTE_FLOOR:.0%} "
+                f"threshold required to report a match). {measured_note}"
             ),
-            "recommendation": sig["recommendation"],
-            "confidence":     conf,
-            "evidence":       {
-                "similarity":   round(sim, 3),
-                "signature_id": sig["id"],
-                "rank":         rank + 1,
-                "h5_h7_ratio":  round(h5_h7, 2),
-                "h3_h5_ratio":  round(h3_h5, 2),
-                "h5_cv":        round(h5_cv, 3),
+            "cause": (
+                "This usually means the service carries a mix of loads whose "
+                "combined spectrum matches no single reference type, or that "
+                "distortion is low enough that spectrum shape is dominated by "
+                "measurement noise. It is not itself a problem finding."
+            ),
+            "origin_evidence": (
+                "Reported because the analysis ran and found nothing it could "
+                "name, which is different from the analysis not running."
+            ),
+            "recommendation": (
+                "Interpret the measured spectrum directly, or identify loads by "
+                "site survey. If a specific load type is suspected, a recording "
+                "taken while that load is cycled on and off will separate its "
+                "contribution far more reliably than spectrum matching."
+            ),
+            "confidence": "low",
+            "evidence": {
+                "similarity":       round(top_score, 3),
+                "floor":            SIGNATURE_ABSOLUTE_FLOOR,
+                "nearest_rejected": top_sig["id"],
+                "h5_h7_ratio":      round(h5_h7, 2),
+                "h3_h5_ratio":      round(h3_h5, 2),
+                "h5_cv":            round(h5_cv, 3),
                 **{f"h{h}_pct_il": h_pcts[h] for h in _ORDERS},
             },
-        })
+        }]
+
+    # ── Does it separate from the next *family*? ─────────────────────────────
+    # Within a family the entries are the same topology and cannot be told
+    # apart, so only the gap to a different family carries information.
+    top_family = top_sig.get("family")
+    next_family_score = next(
+        (sc for sc, sg in scored if sg.get("family") != top_family), None)
+    family_sep = (top_score - next_family_score
+                  if next_family_score is not None else 1.0)
+
+    if family_sep < SIGNATURE_FAMILY_SEPARATION:
+        other = next(sg for sc, sg in scored if sg.get("family") != top_family)
+        log.info("Load signature ambiguous across families: %s vs %s separated "
+                 "by %.3f.", top_family, other.get("family"), family_sep)
+        return [{
+            "category":       "harmonics",
+            "severity":       "info",
+            "title":          "No recognised load signature",
+            # Informational: there is nothing here to act on, so this
+            # must not become a line item in Recommended Actions.
+            "no_action":      True,
+            "finding":        (
+                f"The measured spectrum sits between two unrelated load "
+                f"families and cannot be assigned to either: "
+                f"\"{LOAD_FAMILY_LABEL.get(top_family, top_family)}\" "
+                f"({top_score:.0%}) and "
+                f"\"{LOAD_FAMILY_LABEL.get(other.get('family'), other.get('family'))}\" "
+                f"({next_family_score:.0%}) are separated by only "
+                f"{family_sep * 100:.1f} points. {measured_note}"
+            ),
+            "cause": (
+                "A spectrum that matches two unrelated topologies equally well "
+                "is usually a blend of several loads rather than one dominant "
+                "source."
+            ),
+            "origin_evidence": (
+                "Reported rather than resolved: naming either family would "
+                "present a coin toss as a conclusion."
+            ),
+            "recommendation": (
+                "Identify loads by site survey, or record again while "
+                "individual loads are switched, rather than relying on spectrum "
+                "shape alone."
+            ),
+            "confidence": "low",
+            "evidence": {
+                "similarity":     round(top_score, 3),
+                "family_a":       top_family,
+                "family_b":       other.get("family"),
+                "family_separation": round(family_sep, 3),
+                **{f"h{h}_pct_il": h_pcts[h] for h in _ORDERS},
+            },
+        }]
+
+    # ── Resolved to a family; can it be resolved to one member? ──────────────
+    same_family = [(sc, sg) for sc, sg in scored
+                   if sg.get("family") == top_family]
+    member_sep = (same_family[0][0] - same_family[1][0]
+                  if len(same_family) > 1 else 1.0)
+    resolved_member = member_sep >= SIGNATURE_MEMBER_SEPARATION
+
+    if resolved_member:
+        title = f"Possible load type: {top_sig['title']}"
+        detail = ""
+        conf = "high" if family_sep >= 0.15 else "medium"
+    else:
+        # Name the family.  The specific entry is not distinguishable, and
+        # picking one would be arbitrary.
+        title = (f"Possible load family: "
+                 f"{LOAD_FAMILY_LABEL.get(top_family, top_family)}")
+        peers = ", ".join(f'"{sg["title"]}"' for _, sg in same_family[:3])
+        detail = (f" The individual load type is not resolvable from the "
+                  f"spectrum -- {peers} share this topology and score within "
+                  f"{member_sep * 100:.1f} points of each other -- so the "
+                  f"family is reported rather than a specific piece of "
+                  f"equipment.")
+        conf = "medium" if family_sep >= 0.15 else "low"
+
+    findings.append({
+        "category":       "harmonics",
+        "severity":       "info",
+        "title":          title,
+        "finding":        (
+            f"Spectral similarity {top_score:.0%}, separated from the next load "
+            f"family by {family_sep * 100:.1f} points. {measured_note}"
+            f"{detail}{class_note}"
+        ),
+        "cause":          top_sig["cause"],
+        "origin_evidence": (
+            "Load signatures describe equipment downstream of the meter. "
+            "This is a match on spectral shape against a reference library, "
+            "not a measurement of direction and not an identification of the "
+            "equipment present. Treat it as a hypothesis to confirm on site, "
+            "not as a finding in its own right."
+        ),
+        "recommendation": top_sig["recommendation"],
+        "confidence":     conf,
+        "evidence":       {
+            "similarity":        round(top_score, 3),
+            "signature_id":      top_sig["id"],
+            "family":            top_family,
+            "family_separation": round(family_sep, 3),
+            "member_separation": round(member_sep, 3),
+            "resolved_to_member": resolved_member,
+            "rank":              1,
+            "h5_h7_ratio":       round(h5_h7, 2),
+            "h3_h5_ratio":       round(h3_h5, 2),
+            "h5_cv":             round(h5_cv, 3),
+            **{f"h{h}_pct_il": h_pcts[h] for h in _ORDERS},
+        },
+    })
 
     return findings
 
@@ -2215,7 +2701,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
     # ── Harmonic signature detection ──────────────────────────────────────────
     if il_amps > 0 and any(f"h5_current_{p}" in df.columns for p in "abc"):
         findings.extend(_detect_harmonic_signature(
-            df, il_amps, harmonic_spectrum_significance(df, thresh)))
+            df, il_amps, harmonic_spectrum_significance(df, thresh),
+            customer_class=thresh.customer_class))
 
     # ── TDD approaching limit (marginal compliance warning) ──────────────────
     c_thd = thd.get("current", {})
@@ -2373,13 +2860,15 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                         f" The site draws {abs(kvar_mean):.1f} kVAR leading — "
                         "capacitor banks are likely present and are a probable resonance source."
                     )
-            if thresh.customer_class == "r":
+            # A commissioned impedance sweep is not a proportionate ask of a
+            # house or a corner store; both get the review wording.
+            if thresh.customer_class in ("r", "c"):
                 res_cause = (
                     "Parallel resonance forms when feeder or service-entrance inductance resonates "
                     "with capacitance on the system (power-factor correction banks, a neighboring "
                     "customer's capacitors, or cable charging capacitance). Residential "
                     "services do not typically include capacitor banks, which bears on where "
-                    "the capacitance is likely to sit.{cap_note}"
+                    f"the capacitance is likely to sit.{cap_note}"
                 )
                 res_rec = (
                     "If confirmed, this would warrant a distribution engineering review of "
@@ -2596,7 +3085,36 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
         target_pf = thresh.power_factor_limit
         # kVAR needed to correct from current PF to target PF
         kvar_needed = p_mean * (math.tan(math.acos(pf_mean)) - math.tan(math.acos(target_pf)))
-        findings.append({
+        # Below a few kVAR the correction is smaller than the smallest practical
+        # switched capacitor step, so recommending an install is not actionable
+        # advice -- it just adds a line to the report.
+        if kvar_needed < _MIN_ACTIONABLE_KVAR:
+            log.info("Power factor correction of %.1f kVAR is below the %.0f kVAR "
+                     "actionable floor; not raised as a recommendation.",
+                     kvar_needed, _MIN_ACTIONABLE_KVAR)
+            findings.append({
+                "category":   "power_factor",
+                "severity":   "info",
+                "title":      "Power factor below tariff limit by a small margin",
+                "finding":    (f"Mean PF {pf_mean:.3f} lagging against a "
+                               f"{target_pf:.2f} limit. Correcting to the limit "
+                               f"needs about {kvar_needed:.1f} kVAR, which is "
+                               f"below the smallest practical switched capacitor "
+                               f"step."),
+                "cause":      ("The shortfall is small enough that it is more "
+                               "likely to reflect light-load operation than an "
+                               "uncorrected inductive load."),
+                "origin_evidence": ("Reactive demand is set by the load's own "
+                                    "characteristics."),
+                "recommendation": ("No correction equipment is warranted at this "
+                                   "margin. Re-evaluate if load grows."),
+                "no_action":  True,
+                "confidence": "medium",
+                "evidence":   {"mean_pf": round(pf_mean, 4),
+                               "kvar_needed": round(kvar_needed, 1)},
+            })
+        else:
+            findings.append({
             "category":       "power_factor",
             "severity":       "warning",
             "title":          "Low power factor — capacitor correction needed",

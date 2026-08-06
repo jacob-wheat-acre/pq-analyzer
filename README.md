@@ -137,9 +137,21 @@ Xcel's network is intercepting the connection to the package server.  Don't
 apply workarounds that disable certificate checking — open a ticket asking for
 access to pypi.org and files.pythonhosted.org.
 
+**Anything looks wrong and you don't know why — start here**
+Run `python check_install.py` from inside the pq-analyzer folder.  It verifies
+the Python version, every required library, and the analysis engine itself,
+then tells you exactly what to run to fix what's broken.  Include its output
+when reporting a problem.
+
+**The transformer Size dropdown is greyed out**
+If you haven't chosen a transformer **Type** yet, that's expected — Size
+enables once a Type is selected.  If it stays greyed out after selecting a
+Type, the install is broken: run `python check_install.py`.
+
 **"Module not found" error when launching**
 Run `pip install -r pq_analyzer_requirements.txt` again from inside the
-pq-analyzer folder.
+pq-analyzer folder.  If it still fails, run `python check_install.py` — the
+usual cause is pip installing into a different Python than the launcher runs.
 
 **No report generated / Word section blank**
 python-docx is missing.  Run `pip install python-docx`.
