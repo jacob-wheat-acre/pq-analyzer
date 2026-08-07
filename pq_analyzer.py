@@ -26,6 +26,8 @@ from pq_constants import (
     _SERVICE_TYPE_LABEL,
     _infer_secondary_v,
     _lookup_isc,
+    conductor_label,
+    conductor_options,
     is_single_phase_208,
     isc_lookup_type,
     ll_factor,
@@ -49,6 +51,8 @@ from pq_analysis import (
     check_individual_harmonics,
     check_individual_voltage_harmonics,
     check_neutral_harmonics,
+    check_harmonic_direction,
+    check_source_impedance,
     check_harmonic_sources,
     check_spectral_shape,
     check_harmonic_statistics,
@@ -79,6 +83,7 @@ from pq_plots import (
     plot_demand_profile,
     plot_harmonic_trend,
     plot_imbalance,
+    plot_flicker,
     plot_pf_load,
     plot_waveform_capture,
 )
@@ -146,7 +151,9 @@ TOPOLOGY  (--topology)
 OUTPUT
   Plots (.png)  Voltage, THD, summary, harmonic spectrum, ITIC, neutral health
   CSV           Per-interval data export alongside the plots
-  Word (.docx)  Full engineering response letter; requires --report flag
+  Word (.docx)  Two documents, both written with --report:
+                <stem>_internal_engineering_report.docx  (internal, all classes)
+                <stem>_customer_letter.docx              (customer, all classes)
 
 EXAMPLES
   Residential — 120 V split-phase, open-neutral check, Word report:
@@ -199,6 +206,16 @@ EXAMPLES
                    help=("Transformer service type for Blue Book ISC lookup. "
                          "Choices: " + ", ".join(_SERVICE_TYPE_LABEL.keys()) + ". "
                          "Default: 3ph-padmount when --nominal≥200, else 1ph-padmount."))
+    p.add_argument("--conductor", default=None,
+                   choices=[k for k, _label in conductor_options()],
+                   metavar="KEY",
+                   help=("Service conductor between the transformer and the "
+                         "meter, for the expected-impedance comparison. "
+                         "Choices: " + ", ".join(k for k, _l in conductor_options())))
+    p.add_argument("--run-length-ft", type=float, default=None,
+                   help=("Length of that run in feet, transformer to meter. "
+                         "Needed with --conductor; without both, the service "
+                         "impedance is measured but not compared."))
     p.add_argument("--resample",  default=None,  help="Resample interval, e.g. '1s', '1min', '10min'")
     p.add_argument("--outdir",    default=str(Path(__file__).parent / "pq_output"),
                    help="Output directory (default: pq_output/ next to this script)")
@@ -269,6 +286,8 @@ def main():
         customer_class=args.customer_class,
         service_type=args.service_type,
         topology=args.topology,
+        conductor_key=args.conductor,
+        run_length_ft=args.run_length_ft,
     )
 
     # ── Choose adapter ────────────────────────────────────────────────────────
@@ -331,6 +350,8 @@ def main():
     neutral_harm_result = check_neutral_harmonics(df, thresh)
     source_harm_result   = check_harmonic_sources(df, thresh)
     spectral_shape_result = check_spectral_shape(df, thresh, source_harm_result)
+    direction_result      = check_harmonic_direction(ds, thresh)
+    impedance_result      = check_source_impedance(df, thresh)
     stat_result         = check_harmonic_statistics(df, thresh)
     event_result        = detect_events(ds, thresh)
     neutral_health_result = check_neutral_health(ds, thresh)
@@ -348,6 +369,8 @@ def main():
         source_harm_result, stat_result, event_result, thresh,
         neutral_health_result=neutral_health_result,
         spectral_shape_result=spectral_shape_result,
+        direction_result=direction_result,
+        impedance_result=impedance_result,
         itic_result=itic_result,
         ll_volt_result=ll_volt_result,
         frequency_result=frequency_result,
@@ -376,6 +399,7 @@ def main():
         plot_harmonic_trend(df, outdir=outdir, stem=stem)
         plot_imbalance(df, imb_result, curr_imb_result, outdir=outdir, stem=stem)
         plot_pf_load(df, pf_result, outdir=outdir, stem=stem)
+        plot_flicker(df, flicker_result, outdir=outdir, stem=stem)
         plot_waveform_capture(ds, thresh, outdir=outdir, stem=stem)
         log.info("All plots saved to %s/", outdir)
 

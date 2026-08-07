@@ -24,9 +24,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 import struct
+import zlib
 
 import pqdif
 from pq_constants import (
+    SEVERITY_ORDER,
     Thresholds,
     _h519_limit,
     _tdd_limit,
@@ -599,6 +601,482 @@ class TestHarmonicSources:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 9b. Harmonic source direction — which side of the meter
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _FakeDataset:
+    """Just the two attributes the direction check reads off a dataset."""
+
+    def __init__(self, df, waveforms=()):
+        self.df = df
+        self.waveforms = list(waveforms)
+
+
+def _capture(v_phasors, i_phasors, fs=19200.0, cycles=10, f0=60.0,
+             phases=("a", "b")):
+    """One synthetic point-on-wave capture.
+
+    *v_phasors* and *i_phasors* map harmonic order to (amplitude, phase in
+    degrees), so a test states the angle between voltage and current directly
+    -- which is the only thing the sign of harmonic power depends on.
+    """
+    n = int(round(fs * cycles / f0))
+    t = np.arange(n) / fs
+
+    def build(spec):
+        out = np.zeros(n)
+        for h, (amp, deg) in spec.items():
+            out += amp * np.cos(2 * np.pi * f0 * h * t + np.radians(deg))
+        return out
+
+    return {
+        "timestamp": None, "label": "synthetic", "t": t, "fs_hz": fs,
+        "voltages": {p: build(v_phasors) for p in phases},
+        "currents": {p: build(i_phasors) for p in phases},
+        "vne": None,
+    }
+
+
+class TestHarmonicDirectionFromIntervals:
+    """Direction inferred from magnitudes over the whole recording.
+
+    The discriminator is the intercept: distortion that persists when the
+    premises stop drawing harmonic current came from somewhere else.
+    """
+
+    @staticmethod
+    def _df(v_of_i, n=400, seed=3):
+        import pandas as pd
+        rng = np.random.default_rng(seed)
+        idx = pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC")
+        # A load that swings over the day, so there are quiet intervals to
+        # measure the background against and loaded ones to fit a slope on.
+        duty = 0.5 + 0.5 * np.sin(np.linspace(0, 6 * np.pi, n))
+        data = {"current_a": 20.0 * duty + 2.0}
+        for h in (3, 5, 7):
+            ih = (4.0 / h) * duty + rng.normal(0, 0.02, n) + 0.2
+            data[f"h{h}_current_a"] = ih.clip(0.05)
+            data[f"h{h}_voltage_a"] = np.clip(v_of_i(h, data[f"h{h}_current_a"])
+                                              + rng.normal(0, 0.01, n), 0, None)
+        return pd.DataFrame(data, index=idx)
+
+    def test_distortion_that_tracks_the_load_reads_as_customer_side(self):
+        from pq_analysis import harmonic_direction_from_intervals
+        df = self._df(lambda h, i: 0.4 * h * i)          # no background term
+        r = harmonic_direction_from_intervals(df, Thresholds(nominal_voltage=120.0))
+        assert r["available"] is True
+        assert r["overall"] == "downstream"
+        assert all(od["indication"] == "downstream" for od in r["orders"].values())
+
+    def test_distortion_that_ignores_the_load_reads_as_utility_side(self):
+        from pq_analysis import harmonic_direction_from_intervals
+        rng = np.random.default_rng(11)
+        # Voltage distortion present regardless of what the premises draws.
+        df = self._df(lambda h, i: 3.0 / h + rng.normal(0, 0.05, len(i)))
+        r = harmonic_direction_from_intervals(df, Thresholds(nominal_voltage=120.0))
+        assert r["overall"] == "upstream"
+        for h, od in r["orders"].items():
+            assert od["indication"] == "upstream"
+            # The intercept and the directly measured quiet-interval average
+            # are the same claim by two routes; they should agree.
+            assert od["v_at_quiet_v"] == pytest.approx(od["v_background_v"],
+                                                       rel=0.25)
+
+    def test_a_spectrum_at_the_meters_resolution_is_not_assessed(self):
+        from pq_analysis import harmonic_direction_from_intervals
+        df = self._df(lambda h, i: 0.4 * h * i)
+        for h in (3, 5, 7):
+            df[f"h{h}_current_a"] *= 0.02          # down into quantization
+        r = harmonic_direction_from_intervals(df, Thresholds(nominal_voltage=120.0))
+        assert r["overall"] == "not_assessed"
+        assert all(od["indication"] == "not_assessed" for od in r["orders"].values())
+        # The measurements survive even though no conclusion is drawn from them.
+        assert r["orders"][3]["slope_ohm"] is not None
+
+
+class TestHarmonicDirectionFromWaveforms:
+    """Direction measured from the sign of harmonic power in the captures."""
+
+    THRESH = Thresholds(nominal_voltage=120.0)
+    V1 = (120.0 * np.sqrt(2), 0.0)
+    I1 = (10.0 * np.sqrt(2), 0.0)          # 10 A rms, in phase → importing
+
+    def _run(self, captures):
+        from pq_analysis import harmonic_direction_from_waveforms
+        import pandas as pd
+        return harmonic_direction_from_waveforms(
+            _FakeDataset(pd.DataFrame(), captures), self.THRESH)
+
+    def test_harmonic_power_leaving_the_premises_reads_as_customer_side(self):
+        # V3 and I3 in antiphase: P3 < 0, harmonic power flowing to the system.
+        cap = _capture({1: self.V1, 3: (4.0, 180.0)},
+                       {1: self.I1, 3: (2.0, 0.0)})
+        r = self._run([cap, cap])
+        assert r["available"] is True
+        assert r["orders"][3]["indication"] == "downstream"
+        assert r["orders"][3]["median_p_w"] < 0
+        assert r["overall"] == "downstream"
+
+    def test_harmonic_power_entering_the_premises_reads_as_utility_side(self):
+        cap = _capture({1: self.V1, 3: (4.0, 0.0)},
+                       {1: self.I1, 3: (2.0, 0.0)})
+        r = self._run([cap, cap])
+        assert r["orders"][3]["indication"] == "upstream"
+        assert r["orders"][3]["median_p_w"] > 0
+
+    def test_reversed_cts_are_detected_and_corrected(self):
+        # Same physical situation as the customer-side case, with the clamps
+        # on backwards: every current inverted, including the fundamental.
+        cap = _capture({1: self.V1, 3: (4.0, 180.0)},
+                       {1: (-self.I1[0], 0.0), 3: (-2.0, 0.0)})
+        r = self._run([cap, cap])
+        assert r["ct_polarity_inverted"] is True
+        assert r["ct_polarity_verified"] is True
+        assert "reversed" in r["polarity_note"]
+        # The conclusion must match the un-reversed installation, not invert.
+        assert r["orders"][3]["indication"] == "downstream"
+
+    def test_captures_taken_during_an_event_are_excluded(self):
+        sag = _capture({1: (70.0 * np.sqrt(2), 0.0), 3: (4.0, 180.0)},
+                       {1: self.I1, 3: (2.0, 0.0)})
+        r = self._run([sag, sag])
+        assert r["excluded_event"] == 2
+        assert r["captures_used"] == 0
+        assert r["available"] is False
+        assert "voltage event" in r["note"]
+
+    def test_a_transient_capture_is_too_short_to_read(self):
+        # Pronto's 153 kHz transient captures are a fraction of a cycle.
+        short = _capture({1: self.V1, 3: (4.0, 180.0)},
+                         {1: self.I1, 3: (2.0, 0.0)},
+                         fs=153600.0, cycles=1)
+        r = self._run([short])
+        assert r["excluded_short"] == 1
+        assert r["captures_used"] == 0
+
+    def test_an_unloaded_capture_is_not_read_for_direction(self):
+        idle = _capture({1: self.V1, 3: (4.0, 180.0)},
+                        {1: (0.1, 0.0), 3: (0.05, 0.0)})
+        r = self._run([idle])
+        assert r["excluded_light_load"] == 1
+        assert r["available"] is False
+
+    def test_an_order_below_the_current_floor_is_not_given_a_direction(self):
+        # 0.02 A rms of H5: an angle measured on that is noise.
+        cap = _capture({1: self.V1, 3: (4.0, 180.0), 5: (1.0, 180.0)},
+                       {1: self.I1, 3: (2.0, 0.0), 5: (0.03, 0.0)})
+        r = self._run([cap, cap])
+        assert 3 in r["orders"]
+        assert 5 not in r["orders"]
+
+    def test_the_measured_fundamental_is_used_not_the_nominal_one(self):
+        # An off-nominal system: at 59.3 Hz, projecting onto 60 Hz would walk
+        # the third harmonic's angle right across the sign boundary.
+        cap = _capture({1: self.V1, 3: (4.0, 180.0)},
+                       {1: self.I1, 3: (2.0, 0.0)}, f0=59.3)
+        r = self._run([cap, cap])
+        assert r["fundamental_hz"] == pytest.approx(59.3, abs=0.05)
+        assert r["orders"][3]["indication"] == "downstream"
+
+    def test_a_file_with_no_captures_says_so_rather_than_failing(self):
+        r = self._run([])
+        assert r["available"] is False
+        assert r["captures_total"] == 0
+        assert "No point-on-wave captures" in r["note"]
+
+
+class TestHarmonicDirectionCombined:
+    """The two methods together, including when they disagree."""
+
+    THRESH = Thresholds(nominal_voltage=120.0)
+
+    def _ds(self, v_of_i, wave_angle_deg):
+        df = TestHarmonicDirectionFromIntervals._df(v_of_i)
+        cap = _capture({1: TestHarmonicDirectionFromWaveforms.V1,
+                        3: (4.0, wave_angle_deg)},
+                       {1: TestHarmonicDirectionFromWaveforms.I1, 3: (2.0, 0.0)})
+        return _FakeDataset(df, [cap, cap])
+
+    def test_agreement_is_recorded_per_order(self):
+        from pq_analysis import check_harmonic_direction
+        ds = self._ds(lambda h, i: 0.4 * h * i, 180.0)   # both say customer
+        r = check_harmonic_direction(ds, self.THRESH)
+        assert r["agreement"][3] == "agree"
+        assert r["overall"] == "downstream"
+        assert r["methods_agree"] is True
+
+    def test_disagreement_is_reported_rather_than_resolved(self):
+        from pq_analysis import check_harmonic_direction
+        rng = np.random.default_rng(5)
+        # Trend says the distortion is background; the captures say the
+        # premises is exporting H3. Both readings stand.
+        ds = self._ds(lambda h, i: 3.0 / h + rng.normal(0, 0.05, len(i)), 180.0)
+        r = check_harmonic_direction(ds, self.THRESH)
+        assert r["agreement"][3] == "disagree"
+        assert r["overall"] == "conflicting"
+        assert r["methods_agree"] is False
+
+    def test_the_report_section_prints_both_methods(self):
+        from pq_analysis import check_harmonic_direction
+        from pq_report import _direction_summary_sentence
+        ds = self._ds(lambda h, i: 0.4 * h * i, 180.0)
+        hd = check_harmonic_direction(ds, self.THRESH)
+        sentence = _direction_summary_sentence(hd)
+        assert "customer side" in sentence
+        assert "agree at H3" in sentence
+
+    def _rendered(self, customer_class):
+        docx = pytest.importorskip("docx")
+        from pq_analysis import check_harmonic_direction
+        from pq_report import _word_harmonic_direction
+        ds = self._ds(lambda h, i: 0.4 * h * i, 180.0)
+        thresh = Thresholds(nominal_voltage=120.0, customer_class=customer_class)
+        doc = docx.Document()
+        _word_harmonic_direction(
+            doc, {"harmonic_direction": check_harmonic_direction(ds, thresh)},
+            thresh)
+        return "\n".join(p.text for p in doc.paragraphs)
+
+    def test_the_engineering_report_gets_the_section(self):
+        text = self._rendered("sg")
+        assert "Harmonic Source Direction" in text
+        assert "Engineer's assessment" in text
+        # Direction, never fault: the section names a side of the meter, says
+        # in as many words that this is not an attribution, and leaves the
+        # assessment blank for the engineer signing the report.
+        assert "do not assign responsibility" in text
+        assert "Neither method establishes what equipment is responsible" in text
+        for claim in ("customer is responsible", "caused by the customer",
+                      "the customer must", "Xcel will"):
+            assert claim not in text
+
+    def test_a_residential_report_does_not_get_it(self):
+        # A homeowner's report carries no harmonic content at all.
+        assert "Harmonic Source Direction" not in self._rendered("r")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9c. Service impedance and high-impedance screening
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stepped_load(n=600, seed=4, peak=25.0):
+    """A load that switches on and off, the way a real service's does."""
+    rng = np.random.default_rng(seed)
+    base = np.zeros(n)
+    level = 4.0
+    for k in range(n):
+        if rng.random() < 0.25:                    # something switches
+            level = float(rng.uniform(2.0, peak))
+        base[k] = level + rng.normal(0, 0.05)
+    return np.clip(base, 0.5, None)
+
+
+def _service_frame(r_ohm=0.05, x_ohm=0.02, n=600, seed=4, v0=120.0,
+                   phases=("a",), pf_varies=True, neutral_r=None,
+                   per_phase_r=None, noise_v=0.01):
+    """Interval data for a service of known impedance.
+
+    Built forwards from the physics the check works backwards from: each
+    phase's voltage is the no-load voltage less its own load's drop, so a
+    test can state the answer and see whether it comes back.
+    """
+    import pandas as pd
+    rng = np.random.default_rng(seed + 1)
+    idx = pd.date_range("2024-06-01", periods=n, freq="5min", tz="UTC")
+    pf = (rng.uniform(0.75, 1.0, n) if pf_varies else np.full(n, 0.9))
+    data = {"power_factor": pf}
+    for k, ph in enumerate(phases):
+        i = _stepped_load(n, seed=seed + k)
+        r = (per_phase_r or {}).get(ph, r_ohm)
+        drop = r * i * pf + x_ohm * i * np.sqrt(np.clip(1 - pf ** 2, 0, 1))
+        data[f"current_{ph}"] = i
+        data[f"voltage_{ph}"] = v0 - drop + rng.normal(0, noise_v, n)
+    if neutral_r is not None:
+        i_n = _stepped_load(n, seed=seed + 50, peak=15.0)
+        data["current_neutral"] = i_n
+        data["voltage_neutral"] = neutral_r * i_n + rng.normal(0, 0.005, n)
+    return pd.DataFrame(data, index=idx)
+
+
+class TestServiceImpedanceMeasurement:
+    """Reading the impedance between the source and the meter off the load steps."""
+
+    THRESH = Thresholds(nominal_voltage=120.0)
+
+    def test_a_known_impedance_comes_back(self):
+        from pq_analysis import check_source_impedance
+        df = _service_frame(r_ohm=0.05, x_ohm=0.02)
+        r = check_source_impedance(df, self.THRESH)
+        fit = r["phases"]["a"]
+        assert fit["identifiable"] is True
+        assert fit["separated"] is True
+        assert fit["r_ohm"] == pytest.approx(0.05, abs=0.005)
+        assert fit["x_ohm"] == pytest.approx(0.02, abs=0.005)
+
+    def test_a_steady_power_factor_gives_a_magnitude_not_a_split(self):
+        from pq_analysis import check_source_impedance
+        # Without pf variation the real and reactive parts of the current are
+        # the same shape, and R and X are not separately identifiable.
+        df = _service_frame(r_ohm=0.05, x_ohm=0.02, pf_varies=False)
+        fit = check_source_impedance(df, self.THRESH)["phases"]["a"]
+        assert fit["identifiable"] is True
+        assert fit["separated"] is False
+        assert fit.get("x_ohm") is None
+        # The effective magnitude along the load's own angle still lands.
+        assert fit["z_ohm"] == pytest.approx(0.05 * 0.9 + 0.02 * 0.436, abs=0.006)
+
+    def test_feeder_wide_droop_is_not_read_as_this_services_impedance(self):
+        # The failure this estimator exists to avoid: a voltage that sags on
+        # the same daily cycle as the load, with no local impedance at all.
+        # Fitting the levels finds an impedance; fitting the steps must not.
+        from pq_analysis import check_source_impedance
+        df = _service_frame(r_ohm=0.0, x_ohm=0.0, noise_v=0.02)
+        daily = 3.0 * np.sin(np.linspace(0, 4 * np.pi, len(df)))
+        df["voltage_a"] = df["voltage_a"] - daily
+        df["current_a"] = df["current_a"] + 4.0 * np.sin(
+            np.linspace(0, 4 * np.pi, len(df)))
+        level_slope = np.polyfit(df["current_a"], df["voltage_a"], 1)[0]
+        assert level_slope < -0.1          # the naive fit would claim >0.1 Ω
+
+        fit = check_source_impedance(df, self.THRESH)["phases"]["a"]
+        assert fit["identifiable"] is False
+        assert "not this service" in fit["reason"]
+
+    def test_a_drop_below_the_meters_resolution_is_reported_as_such(self):
+        from pq_analysis import check_source_impedance
+        df = _service_frame(r_ohm=0.0, x_ohm=0.0, noise_v=0.0)
+        fit = check_source_impedance(df, self.THRESH)["phases"]["a"]
+        assert fit["identifiable"] is False
+        assert fit["at_resolution"] is True
+        assert "resolution" in fit["reason"]
+
+    def test_one_bad_phase_is_flagged_against_the_others(self):
+        from pq_analysis import check_source_impedance
+        df = _service_frame(r_ohm=0.03, x_ohm=0.0,
+                            phases=("a", "b", "c"),
+                            per_phase_r={"c": 0.12})   # a degrading connection
+        r = check_source_impedance(df, self.THRESH)
+        asym = r["asymmetry"]
+        assert asym["worst_phase"] == "C"
+        assert asym["flagged"] is True
+        assert asym["ratio"] > 2.0
+        assert r["overall"] == "high_impedance_suspected"
+
+    def test_balanced_phases_are_not_flagged(self):
+        from pq_analysis import check_source_impedance
+        df = _service_frame(r_ohm=0.03, x_ohm=0.0, phases=("a", "b", "c"))
+        assert check_source_impedance(df, self.THRESH)["asymmetry"]["flagged"] is False
+
+    def test_a_resistive_neutral_is_measured_from_its_own_rise(self):
+        from pq_analysis import check_source_impedance
+        df = _service_frame(r_ohm=0.03, x_ohm=0.0, neutral_r=0.25)
+        neutral = check_source_impedance(df, self.THRESH)["neutral"]
+        assert neutral["identifiable"] is True
+        assert neutral["r_ohm"] == pytest.approx(0.25, abs=0.02)
+        assert neutral["elevated"] is True
+        assert neutral["rise_at_peak_v"] > 2.0
+
+    def test_a_sound_neutral_reads_as_below_resolution(self):
+        from pq_analysis import check_source_impedance
+        df = _service_frame(r_ohm=0.03, x_ohm=0.0, neutral_r=0.0)
+        neutral = check_source_impedance(df, self.THRESH)["neutral"]
+        assert neutral["identifiable"] is False
+        assert neutral["at_resolution"] is True
+
+    def test_a_service_that_never_moves_is_not_measured(self):
+        import pandas as pd
+        from pq_analysis import check_source_impedance
+        idx = pd.date_range("2024-06-01", periods=200, freq="5min", tz="UTC")
+        df = pd.DataFrame({"voltage_a": 120.0, "current_a": 10.0}, index=idx)
+        fit = check_source_impedance(df, self.THRESH)["phases"]["a"]
+        assert fit["identifiable"] is False
+        assert "load step" in fit["reason"]
+
+
+class TestExpectedServiceImpedance:
+    """What the picked transformer and conductor say the impedance should be."""
+
+    def test_a_single_phase_run_counts_the_neutral_return(self):
+        from pq_constants import conductor_impedance
+        out = conductor_impedance("al-4-0-triplex", 150.0, return_path=True)
+        one_way = conductor_impedance("al-4-0-triplex", 150.0, return_path=False)
+        # 4/0 AL at 0.100 Ω/1000 ft: 150 ft out and 150 ft back.
+        assert out[0] == pytest.approx(0.030, abs=1e-6)
+        assert one_way[0] == pytest.approx(0.015, abs=1e-6)
+
+    def test_the_isc_path_includes_the_primary_system(self):
+        from pq_constants import expected_service_impedance
+        thresh = Thresholds(nominal_voltage=120.0, service_type="3ph-padmount",
+                            transformer_kva=150, isc_amps=8000,
+                            conductor_key="al-350-urd", run_length_ft=200)
+        e = expected_service_impedance(thresh)
+        assert e["available"] is True
+        assert e["upstream_ohm"] == pytest.approx(120.0 / 8000)
+        assert "primary system and the transformer" in e["upstream_source"]
+        assert e.get("upstream_is_floor") is None
+
+    def test_without_isc_the_expected_value_is_called_a_floor(self):
+        from pq_constants import expected_service_impedance
+        thresh = Thresholds(nominal_voltage=120.0, service_type="1ph-overhead",
+                            transformer_kva=25, topology="split-phase",
+                            conductor_key="al-4-0-triplex", run_length_ft=150)
+        e = expected_service_impedance(thresh)
+        # 25 kVA at 1.6–2.4%: V_LN²/S is the base the L-N path sits on.
+        assert e["transformer_ohm_range"][0] == pytest.approx(
+            0.016 * 120.0 ** 2 / 25000.0)
+        assert e["upstream_is_floor"] is True
+        assert "floor" in e["upstream_source"]
+
+    def test_nothing_picked_means_no_expected_value(self):
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(Thresholds(nominal_voltage=120.0))
+        assert e["available"] is False
+        assert "run length" in e["reason"]
+
+    def test_the_comparison_calls_a_large_excess_high(self):
+        from pq_analysis import check_source_impedance
+        thresh = Thresholds(nominal_voltage=120.0, service_type="1ph-overhead",
+                            transformer_kva=25, topology="split-phase",
+                            conductor_key="al-4-0-triplex", run_length_ft=150)
+        df = _service_frame(r_ohm=0.20, x_ohm=0.0)     # far above ~0.043 Ω
+        r = check_source_impedance(df, thresh)
+        assert r["comparison"]["verdict"] == "high"
+        assert r["comparison"]["ratio"] > 2.5
+        assert r["comparison"]["excess_v_at_peak"] > 1.0
+        assert r["overall"] == "high_impedance_suspected"
+
+    def test_an_as_built_service_reads_as_consistent(self):
+        from pq_analysis import check_source_impedance
+        thresh = Thresholds(nominal_voltage=120.0, service_type="1ph-overhead",
+                            transformer_kva=25, topology="split-phase",
+                            conductor_key="al-4-0-triplex", run_length_ft=150)
+        # 0.0115 Ω transformer + 0.030 Ω of conductor ≈ 0.043 Ω expected.
+        df = _service_frame(r_ohm=0.042, x_ohm=0.010, pf_varies=False)
+        r = check_source_impedance(df, thresh)
+        assert r["comparison"]["verdict"] == "consistent"
+        assert r["overall"] == "consistent_with_expected"
+
+    def test_the_report_section_states_the_constants_are_generic(self):
+        docx = pytest.importorskip("docx")
+        from pq_analysis import check_source_impedance
+        from pq_report import _word_service_impedance
+        thresh = Thresholds(nominal_voltage=120.0, customer_class="r",
+                            service_type="1ph-overhead", transformer_kva=25,
+                            topology="split-phase",
+                            conductor_key="al-4-0-triplex", run_length_ft=150)
+        df = _service_frame(r_ohm=0.20, x_ohm=0.0)
+        doc = docx.Document()
+        _word_service_impedance(
+            doc, {"service_impedance": check_source_impedance(df, thresh)}, thresh)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "Service Impedance" in text
+        # The engineer has to be able to see that the expected side is generic.
+        assert "generic published values" in text
+        assert "not PSCo Blue Book figures" in text
+        assert "Engineer's assessment" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 10. detect_events — adaptive vs interval path
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1153,6 +1631,177 @@ class TestFlickerAllPhases:
         assert check_flicker(_frame(voltage_a=[120.0] * 5), Thresholds())["available"] is False
 
 
+class TestShortAndLongTermFlickerAreReportedSeparately:
+    """Pst and Plt measure different windows and fail independently.
+
+    Both were always read and analysed per phase; the narrative section and
+    the key findings took their numbers from phase A's columns, so a service
+    whose second leg reached Pst 4.98 was described by phase A's 1.43.
+    """
+
+    @staticmethod
+    def _report(**cols):
+        from pq_analysis import check_flicker
+        df = _frame(**cols)
+        return {"flicker": check_flicker(df, Thresholds()),
+                "file_summary": {"duration_hours": 68.0}}, df
+
+    def test_the_status_used_by_the_summary_follows_the_worst_phase(self):
+        from pq_report import _flicker_status
+        report, _df = self._report(flicker_pst=[0.5] * 10, flicker_pst_b=[4.98] * 10,
+                                   flicker_plt=[0.2] * 10, flicker_plt_b=[2.21] * 10)
+        status = _flicker_status(report)
+        assert status["pst_max"] == 4.98 and status["pst_phase"] == "B"
+        assert status["plt_max"] == 2.21 and status["plt_phase"] == "B"
+        assert status["passes"] is False
+
+    def test_a_long_term_failure_alone_is_named_as_a_cycling_load(self):
+        docx = pytest.importorskip("docx")
+        from pq_report import _word_flicker
+        # Every ten-minute value inside its limit, the two-hour aggregate over:
+        # the pattern a repeatedly cycling load makes.
+        report, df = self._report(flicker_pst=[0.9] * 10, flicker_plt=[0.75] * 10)
+        doc = docx.Document()
+        _word_flicker(doc, report, df)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "cycles repeatedly" in text
+        assert "aggregates twelve consecutive Pst values" in text
+
+    def test_both_measures_appear_for_every_phase(self):
+        docx = pytest.importorskip("docx")
+        from pq_report import _word_flicker
+        report, df = self._report(flicker_pst=[0.5] * 10, flicker_pst_b=[4.98] * 10,
+                                  flicker_plt=[0.2] * 10, flicker_plt_b=[2.21] * 10)
+        doc = docx.Document()
+        _word_flicker(doc, report, df)
+        rows = [[c.text for c in row.cells] for row in doc.tables[0].rows]
+        measures = {(r[0].split(",")[0], r[1]) for r in rows[1:]}
+        assert measures == {("Pst (10 min)", "A"), ("Pst (10 min)", "B"),
+                            ("Plt (2 h)", "A"), ("Plt (2 h)", "B")}
+        # The phase that fails must be the one quoted in the narrative.
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "4.98 on phase B" in text
+
+    def test_the_equipment_limit_is_not_presented_as_a_system_limit(self):
+        docx = pytest.importorskip("docx")
+        from pq_report import _word_flicker
+        report, df = self._report(flicker_pst=[0.4] * 10, flicker_plt=[0.3] * 10)
+        doc = docx.Document()
+        _word_flicker(doc, report, df)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "equipment may emit" in text
+        assert "IEEE 1453-2015" in text and "0.8" in text
+        # The recording is shorter than the week both standards assess over.
+        assert "not a week" in text
+
+    def test_held_values_are_not_mistaken_for_measurement_windows(self):
+        from pq_analysis import check_flicker
+        # Twelve intervals carrying three distinct Pst values.
+        df = _frame(flicker_pst=[0.3, 0.3, 0.3, 0.3, 0.9, 0.9,
+                                 0.9, 0.9, 0.5, 0.5, 0.5, 0.5])
+        r = check_flicker(df, Thresholds())
+        assert r["pst"]["A"]["distinct_values"] == 3
+
+
+class TestFlickerSeverity:
+    """How much a flicker exceedance matters, separately from whether it passed.
+
+    Grading on the single worst reading made one bad ten-minute window look
+    like a sustained condition: a Pst of 4.98 in a quiet week is 4.98x the
+    limit, which the bands call severe on its own. Severity is graded at the
+    95th percentile with the share of time over the limit, the same way
+    voltage THD is; the maximum still decides pass or fail.
+    """
+
+    @staticmethod
+    def _sev(pst, plt_=None, hours=167.0):
+        import pandas as pd
+        from pq_analysis import check_flicker
+        from pq_report import _flicker_severities
+        idx = pd.date_range("2024-01-01", periods=len(pst), freq="5min", tz="UTC")
+        cols = {"flicker_pst": pd.Series(pst, index=idx)}
+        if plt_ is not None:
+            cols["flicker_plt"] = pd.Series(plt_, index=idx)
+        fl = check_flicker(pd.DataFrame(cols), Thresholds())
+        return fl, _flicker_severities(fl, {"file_summary": {"duration_hours": hours}})
+
+    def test_a_lone_spike_fails_compliance_but_is_only_minor(self):
+        quiet = [0.2] * 500
+        quiet[7] = 5.0                      # one ten-minute window, five times the limit
+        fl, sev = self._sev(quiet)
+        assert fl["overall_pass"] is False          # compliance stays binary
+        assert sev["flicker"]["band"] == "minor"    # severity does not
+        assert "0.2% of the recording" in sev["flicker"]["reason"]
+
+    def test_a_sustained_exceedance_is_significant(self):
+        # Over the limit for a third of the recording, never dramatically.
+        values = [1.2] * 170 + [0.3] * 330
+        fl, sev = self._sev(values)
+        assert sev["flicker"]["band"] in ("significant", "severe")
+        assert "34.0% of the recording" in sev["flicker"]["reason"]
+
+    def test_severity_is_graded_for_each_measure_separately(self):
+        # Pst quiet with one spike, Plt over limit most of the time: the two
+        # must not be collapsed into one band before the report sees them.
+        pst = [0.2] * 500
+        pst[3] = 4.0
+        plt_ = [0.9] * 400 + [0.2] * 100
+        fl, sev = self._sev(pst, plt_)
+        assert sev["flicker_pst"]["band"] == "minor"
+        assert sev["flicker_plt"]["band"] in ("significant", "severe")
+        # The headline follows the worse of the two.
+        assert sev["flicker"]["band"] == sev["flicker_plt"]["band"]
+
+    def test_a_comfortable_pass_is_not_dressed_up_as_a_watch(self):
+        fl, sev = self._sev([0.3] * 300, [0.2] * 300)
+        assert sev["flicker"]["band"] == "compliant"
+
+    def test_close_to_the_limit_reads_as_watch(self):
+        fl, sev = self._sev([0.92] * 300)
+        assert sev["flicker"]["band"] == "watch"
+        assert "within the limit" in sev["flicker"]["reason"]
+
+    def test_a_recording_shorter_than_a_day_is_discounted_a_band(self):
+        values = [1.4] * 200 + [0.3] * 100
+        _fl, full = self._sev(values, hours=72.0)
+        _fl, short = self._sev(values, hours=8.0)
+        assert SEVERITY_ORDER.index(short["flicker"]["band"]) \
+            < SEVERITY_ORDER.index(full["flicker"]["band"])
+        assert short["flicker"]["downgraded"] is True
+        assert "two-hour windows" in short["flicker"]["reason"]
+
+    def test_a_multi_day_recording_is_not_discounted(self):
+        # Every survey is shorter than the week the standards assess over, so
+        # that alone must not discount every finding forever.
+        _fl, sev = self._sev([1.4] * 200 + [0.3] * 100, hours=72.0)
+        assert sev["flicker"]["downgraded"] is False
+
+
+class TestFlickerPlot:
+    def test_the_chart_is_written_with_both_measures(self, tmp_path):
+        pytest.importorskip("matplotlib")
+        import pandas as pd
+        from pq_analysis import check_flicker
+        from pq_plots import plot_flicker
+        idx = pd.date_range("2024-01-01", periods=300, freq="5min", tz="UTC")
+        df = pd.DataFrame({
+            "flicker_pst":   pd.Series([0.4] * 299 + [3.0], index=idx),
+            "flicker_pst_b": pd.Series([0.5] * 300, index=idx),
+            "flicker_plt":   pd.Series([0.9] * 300, index=idx),
+        }, index=idx)
+        plot_flicker(df, check_flicker(df, Thresholds()),
+                     outdir=tmp_path, stem="site")
+        written = list(tmp_path.glob("*flicker.png"))
+        assert written and written[0].stat().st_size > 10_000
+
+    def test_no_chart_without_flicker_data(self, tmp_path):
+        pytest.importorskip("matplotlib")
+        from pq_plots import plot_flicker
+        plot_flicker(_frame(voltage_a=[120.0] * 5), {"available": False},
+                     outdir=tmp_path, stem="site")
+        assert not list(tmp_path.glob("*flicker.png"))
+
+
 class TestLineToLineVoltage:
     def test_wye_nominal_inferred_and_snapped(self):
         from pq_analysis import check_line_to_line_voltage
@@ -1465,6 +2114,192 @@ class TestTwoLegServiceRigor:
         assert r["available"] and r["topology"] == "1ph-208"
 
 
+@pytest.fixture
+def gui_app():
+    """A real window, skipped where no display can be opened."""
+    import run
+    try:
+        app = run.PQApp()
+    except Exception as exc:                      # no display, no Tk
+        pytest.skip(f"Tk unavailable: {exc}")
+    app.update_idletasks()
+    yield app
+    app.destroy()
+
+
+class TestClearAll:
+    """Clear All resets every entry, including the ones that cascade.
+
+    The field that quietly keeps its value is the one that carries the last
+    site's transformer or engineer details into the next run, so the defaults
+    are snapshotted from the widgets rather than listed by hand.
+    """
+
+    @staticmethod
+    def _fill(app):
+        import run
+        app._file_var.set("/tmp/site.pqd")
+        app._site_var.set("1500 S Hudson Mile Rd")
+        app._cclass_var.set("Schedule R — Residential")
+        app._topo_var.set("split-phase")
+        app._nominal_var.set("277")
+        app._xfmr_type_var.set(run._TYPE_DISPLAY["1ph-padmount"])
+        app._on_type_change()
+        app._isc_override_var.set(True)
+        app._on_isc_override_toggle()
+        app._isc_manual_var.set("9000")
+        app._conductor_var.set("4/0 AL triplex (overhead drop)")
+        app._run_length_var.set("150")
+        app._eng_name_var.set("A. Engineer")
+
+    def test_every_service_entry_returns_to_its_default(self, gui_app, monkeypatch):
+        import run
+        monkeypatch.setattr(run.messagebox, "askyesno", lambda *a, **k: True)
+        defaults = dict(gui_app._input_defaults)
+        assert len(defaults) > 10, "the form's entries should be tracked"
+
+        self._fill(gui_app)
+        assert any(getattr(gui_app, n).get() != d for n, d in defaults.items())
+
+        gui_app._clear_all()
+        still_set = {n: getattr(gui_app, n).get()
+                     for n, d in defaults.items() if getattr(gui_app, n).get() != d}
+        assert not still_set
+
+    def test_the_engineers_own_details_survive(self, gui_app, monkeypatch):
+        # They describe who is running the tool, not which service was
+        # measured, and they go out on a customer document.
+        import run
+        monkeypatch.setattr(run.messagebox, "askyesno", lambda *a, **k: True)
+        self._fill(gui_app)
+        gui_app._eng_title_var.set("Electric Area Engineer")
+        gui_app._eng_phone_var.set("303-555-0100")
+        gui_app._eng_email_var.set("a@example.com")
+
+        gui_app._clear_all()
+
+        assert gui_app._eng_name_var.get() == "A. Engineer"
+        assert gui_app._eng_title_var.get() == "Electric Area Engineer"
+        assert gui_app._eng_phone_var.get() == "303-555-0100"
+        assert gui_app._eng_email_var.get() == "a@example.com"
+        # ...while the service they were entered against is gone.
+        assert gui_app._site_var.get() == ""
+        assert gui_app._file_var.get() == ""
+
+    def test_engineer_details_alone_do_not_trigger_the_confirmation(
+            self, gui_app, monkeypatch):
+        # Nothing clearable is set, so the dialog would ask to clear nothing.
+        import run
+        asked = []
+        monkeypatch.setattr(run.messagebox, "askyesno",
+                            lambda *a, **k: asked.append(a) or True)
+        gui_app._eng_name_var.set("A. Engineer")
+        gui_app._clear_all()
+        assert not asked
+        assert gui_app._eng_name_var.get() == "A. Engineer"
+
+    def test_the_dependent_pickers_are_reset_too(self, gui_app, monkeypatch):
+        import run
+        monkeypatch.setattr(run.messagebox, "askyesno", lambda *a, **k: True)
+        self._fill(gui_app)
+        assert str(gui_app._isc_entry["state"]) == "normal"
+
+        gui_app._clear_all()
+        # Not just the variables: the widget states derived from them.
+        assert gui_app._xfmr_type_key is None
+        assert str(gui_app._isc_entry["state"]) == "disabled"
+        assert str(gui_app._kva_combo["state"]) == "disabled"
+        assert "Pick a transformer Type" in gui_app._isc_auto_var.get()
+
+    def test_a_clean_form_clears_without_asking(self, gui_app, monkeypatch):
+        import run
+        asked = []
+        monkeypatch.setattr(run.messagebox, "askyesno",
+                            lambda *a, **k: asked.append(a) or True)
+        gui_app._clear_all()
+        assert not asked
+
+    def test_declining_the_confirmation_keeps_the_entries(self, gui_app, monkeypatch):
+        import run
+        monkeypatch.setattr(run.messagebox, "askyesno", lambda *a, **k: False)
+        self._fill(gui_app)
+        gui_app._clear_all()
+        assert gui_app._site_var.get() == "1500 S Hudson Mile Rd"
+        assert gui_app._run_length_var.get() == "150"
+
+
+class TestBothDocumentsOpen:
+    """A run produces two documents, so a run opens two documents.
+
+    Only the internal report opened before, and the customer document had to
+    be found by hand — which is how a document goes out unread.
+    """
+
+    class _FakeApp:
+        """Enough of the window for the opener: a log, a button, an `after`."""
+
+        def __init__(self):
+            self.errors = []
+
+        def _log_write(self, text, tag=None):
+            if tag == "error":
+                self.errors.append(text)
+
+        def after(self, _delay, fn):
+            fn()
+
+        class _Btn:
+            def __init__(self):
+                self.state = "disabled"
+
+            def config(self, state=None, **_kw):
+                if state:
+                    self.state = state
+
+        _open_btn = None
+
+    def _run_opener(self, monkeypatch, tmp_path, files):
+        import run
+        for name in files:
+            (tmp_path / name).write_bytes(b"docx")
+        monkeypatch.setattr(run, "_SCRIPT", tmp_path / "run.py")
+        (tmp_path / "pq_output").mkdir(exist_ok=True)
+        for name in files:
+            (tmp_path / "pq_output" / name).write_bytes(b"docx")
+
+        launched = []
+        monkeypatch.setattr(run.subprocess, "Popen",
+                            lambda cmd, **kw: launched.append(cmd))
+        app = self._FakeApp()
+        app._open_btn = self._FakeApp._Btn()
+        run.PQApp._open_documents(app, "site")
+        return app, launched
+
+    def test_both_documents_are_opened(self, monkeypatch, tmp_path):
+        app, launched = self._run_opener(monkeypatch, tmp_path, [
+            "site_customer_letter.docx",
+            "site_internal_engineering_report.docx",
+        ])
+        opened = [" ".join(str(part) for part in cmd) for cmd in launched]
+        assert len(opened) == 2
+        assert any("customer_letter" in o for o in opened)
+        assert any("internal_engineering_report" in o for o in opened)
+        # The internal report goes last so it lands in front.
+        assert "internal_engineering_report" in opened[-1]
+        assert app._open_btn.state == "normal"
+        assert not app.errors
+
+    def test_a_missing_document_is_reported_not_silently_skipped(
+            self, monkeypatch, tmp_path):
+        app, launched = self._run_opener(monkeypatch, tmp_path, [
+            "site_internal_engineering_report.docx",
+        ])
+        assert len(launched) == 1
+        assert app.errors and "customer document" in app.errors[0]
+        # The one that did get written still opens.
+        assert app._open_btn.state == "normal"
+
+
 class TestSinglePhase208Service:
     """A single-phase service taken from two legs of a 208Y/120 wye.
 
@@ -1534,7 +2369,7 @@ class TestSinglePhase208Service:
              "--customer-class", "r", "--service-type", "1ph-208",
              "--report", "--no-plots", "--outdir", str(tmp_path)],
             check=True, capture_output=True)
-        d = Document(glob.glob(str(tmp_path / "**" / "*_report.docx"),
+        d = Document(glob.glob(str(tmp_path / "**" / "*_internal_engineering_report.docx"),
                                recursive=True)[0])
         body = " ".join(p.text for p in d.paragraphs)
         if "Neutral current averaged" in body:
@@ -1633,7 +2468,7 @@ class TestSectionOrder:
              os.path.join(root, "test_data", "test_commercial_large.pqd"),
              "--isc", "10000", "--nominal", "277", "--report", "--no-plots",
              "--outdir", str(out)], check=True, capture_output=True)
-        path = glob.glob(str(out / "**" / "*_report.docx"), recursive=True)[0]
+        path = glob.glob(str(out / "**" / "*_internal_engineering_report.docx"), recursive=True)[0]
         d = Document(path)
         return [p.text.strip() for p in d.paragraphs
                 if p.style.name == "Heading 1" and p.text.strip()]
@@ -1673,7 +2508,7 @@ class TestSectionOrder:
              os.path.join(root, "test_data", "test_commercial_small.pqd"),
              "--report", "--no-plots", "--outdir", str(out)],
             check=True, capture_output=True)
-        d = Document(glob.glob(str(out / "**" / "*_report.docx"), recursive=True)[0])
+        d = Document(glob.glob(str(out / "**" / "*_internal_engineering_report.docx"), recursive=True)[0])
         body = " ".join(p.text for p in d.paragraphs)
         assert "recommended actions are presented first" not in body
 
@@ -2354,6 +3189,145 @@ class TestTruncatedFile:
             _ = pqdif.PQDIFFile(broken).observations
 
 
+@pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
+class TestRecordThatWillNotInflate:
+    """A body that will not inflate has several causes, and they differ.
+
+    The files are customer data that cannot be shared for a second look, so
+    the reader has to recover the causes it can and, for the one it cannot,
+    say enough in the failure itself to tell the two apart from the message
+    alone: a damaged file to re-export, or a file this reader reads wrongly.
+    """
+
+    SRC = Path(__file__).parent / "test_data" / "test_commercial_small.pqd"
+
+    @staticmethod
+    def _rebuild(records, path):
+        """Re-emit a record chain, relinking it around new body lengths."""
+        out = bytearray()
+        for i, (tag, payload, declared) in enumerate(records):
+            last = i == len(records) - 1
+            next_pos = 0 if last else (
+                len(out) + pqdif.RECORD_HEADER_SIZE + len(payload))
+            header = bytearray(pqdif.RECORD_HEADER_SIZE)
+            header[0:16] = pqdif.RECORD_SIGNATURE.bytes_le
+            header[16:32] = tag.bytes_le
+            struct.pack_into("<IIII", header, 32, pqdif.RECORD_HEADER_SIZE,
+                             len(payload) if declared is None else declared,
+                             next_pos, zlib.crc32(payload) & 0xFFFFFFFF)
+            out += header + payload
+        path.write_bytes(bytes(out))
+        return path
+
+    def _records(self):
+        raw = self.SRC.read_bytes()
+        return [(r.tag, raw[r.position + r.header_size:
+                            r.position + r.header_size + r.body_size], None)
+                for r in pqdif.PQDIFFile(self.SRC).records]
+
+    def test_a_size_field_that_under_declares_its_body_is_read_anyway(self, tmp_path):
+        # Every byte is present and the chain is intact; only the size field
+        # is short, which cuts the deflate stream off mid-way.
+        records = self._records()
+        for i, (tag, payload, _) in enumerate(records):
+            if tag == pqdif.TAG_OBSERVATION:
+                records[i] = (tag, payload, len(payload) - 40)
+        f = pqdif.PQDIFFile(self._rebuild(records, tmp_path / "short_size.pqd"))
+        assert f.observations
+        assert f.unreadable_observations == []
+
+    def test_an_uncompressed_record_in_a_compressed_file_is_read_anyway(self, tmp_path):
+        records = self._records()
+        for i, (tag, payload, _) in enumerate(records):
+            if tag == pqdif.TAG_OBSERVATION:
+                records[i] = (tag, zlib.decompress(payload), None)
+        f = pqdif.PQDIFFile(self._rebuild(records, tmp_path / "plain.pqd"))
+        assert f.observations
+        assert f.unreadable_observations == []
+
+    def test_an_incomplete_stream_in_a_whole_file_is_named_as_damage(self, tmp_path):
+        # The field case: the header inflates as far as its first bytes and
+        # then the stream stops, while the file itself is not short at all.
+        records = self._records()
+        first = next(i for i, (tag, _, _) in enumerate(records)
+                     if tag == pqdif.TAG_OBSERVATION)
+        records[first] = (records[first][0], records[first][1][:2], None)
+        f = pqdif.PQDIFFile(self._rebuild(records, tmp_path / "cut_stream.pqd"))
+        _ = f.observations
+
+        reason = f.unreadable_observations[0][1]
+        assert "incomplete or truncated stream" in reason
+        # The distinction the message exists to draw: the file is whole, so a
+        # re-export is the answer, and no byte count went missing.
+        assert "cut short" not in reason
+        assert "damaged in place" in reason
+        assert "zlib_header=valid" in reason
+        assert "present=2 to_next_record=2" in reason
+        assert "next_header=intact" in reason
+
+    def test_a_body_that_is_not_a_zlib_stream_says_so_instead(self, tmp_path):
+        # A different cause with the same surface symptom, and the evidence
+        # has to separate them without anyone opening the file.
+        raw = bytearray(self.SRC.read_bytes())
+        for record in pqdif.PQDIFFile(self.SRC).records:
+            if record.tag == pqdif.TAG_OBSERVATION:
+                start = record.position + record.header_size
+                raw[start:start + 8] = b"\x00" * 8
+        broken = tmp_path / "damaged.pqd"
+        broken.write_bytes(bytes(raw))
+
+        f = pqdif.PQDIFFile(broken)
+        with pytest.raises(pqdif.PQDIFError):
+            _ = f.observations
+        reason = f.unreadable_observations[0][1]
+        assert "not begin with a zlib stream" in reason
+        assert "zlib_header=not a zlib header" in reason
+        assert "cut short" not in reason
+        assert "present=" in reason and "to_next_record=" in reason
+
+    def test_a_truncated_file_still_says_the_file_was_cut_short(self, tmp_path):
+        # The evidence must not drown the one cause that is not about this
+        # record at all: bytes the file never received.
+        raw = self.SRC.read_bytes()
+        short = tmp_path / "short.pqd"
+        short.write_bytes(raw[:len(raw) - 3000])
+        f = pqdif.PQDIFFile(short)
+        _ = f.observations
+        assert f.missing_bytes == 3000
+        # Whatever inflated is kept; only a record that yields nothing fails.
+        for _pos, reason in f.unreadable_observations:
+            assert "cut short" in reason
+
+    def test_the_evidence_survives_into_the_report(self, tmp_path):
+        # The message is only useful if it reaches the document the engineer
+        # actually reads, whole rather than summarised away.
+        from pq_report import _integrity_note
+        raw = bytearray(self.SRC.read_bytes())
+        observations = [r for r in pqdif.PQDIFFile(self.SRC).records
+                        if r.tag == pqdif.TAG_OBSERVATION]
+        start = observations[0].position + observations[0].header_size
+        raw[start:start + 8] = b"\x00" * 8
+        broken = tmp_path / "one_bad.pqd"
+        broken.write_bytes(bytes(raw))
+
+        f = pqdif.PQDIFFile(broken)
+        _ = f.observations
+        note = _integrity_note({
+            "unreadable_observations": len(f.unreadable_observations),
+            "total_observations": f.observation_count,
+            "missing_bytes": f.missing_bytes,
+            "unreadable_detail": [{"offset": pos, "name": "", "reason": reason}
+                                  for pos, reason in f.unreadable_observations],
+        }, {})
+        assert "Evidence: declared_body=" in note
+        assert "partial_inflate=" in note
+
+    def test_an_intact_file_needs_none_of_it(self, tmp_path):
+        f = pqdif.PQDIFFile(self.SRC)
+        assert f.observations and f.unreadable_observations == []
+        assert all(r.next_header_intact in (None, True) for r in f.records)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 13. Harmonic conclusions are gated on measurable load
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2688,10 +3662,10 @@ class TestRecordingOverview:
 
 
 class TestCustomerLetter:
-    """The second, customer-facing document.
+    """The customer-facing document, one per service class.
 
-    It must be residential-only, must state no attribution, and must commit
-    Xcel Energy to nothing.
+    It must state no attribution, commit Xcel Energy to nothing, and never
+    tell the customer an internal report exists.
     """
 
     def _report(self, path, customer_class="r", nominal=120.0):
@@ -2735,14 +3709,17 @@ class TestCustomerLetter:
         out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
         assert out == stale and stale.read_bytes() != b"letter from a two-hour download"
 
-    def test_a_class_that_gets_no_letter_clears_the_previous_one(self, tmp_path):
+    def test_a_reclassified_service_replaces_the_previous_letter(self, tmp_path):
+        # The stale letter described the same file read as a different class,
+        # so it must be replaced rather than left beside the new one.
         from pq_report import generate_customer_letter
         stale = tmp_path / "t_customer_letter.docx"
         stale.write_bytes(b"letter from when this was billed residential")
         rep, th = self._report(Path("test_data/test_residential.pqd"),
                                customer_class="sg")
-        assert generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t") is None
-        assert not stale.exists()
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        assert out is not None and out.exists()
+        assert out.read_bytes() != b"letter from when this was billed residential"
 
     def test_a_letter_that_cannot_be_replaced_stops_the_run(self, tmp_path, monkeypatch):
         # Word holds the file open on Windows, so the unlink is what fails. The
@@ -2768,12 +3745,91 @@ class TestCustomerLetter:
         assert out is not None and out.exists()
 
     @pytest.mark.parametrize("cls", ["sg", "pg"])
-    def test_not_written_above_50kw(self, tmp_path, cls):
-        # At that scale the engineering report is the customer document.
+    def test_every_class_gets_its_own_customer_document(self, tmp_path, cls):
+        # The engineering report is internal for every class, so a customer
+        # document is written at every scale -- what differs is the register.
         from pq_report import generate_customer_letter
         rep, th = self._report(Path("test_data/test_commercial_large.pqd"),
                                customer_class=cls, nominal=277.0)
-        assert generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t") is None
+        out = generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t")
+        assert out is not None and out.exists()
+
+    def test_the_internal_report_is_named_and_unsigned(self, tmp_path):
+        """The internal document says what it is and is addressed to nobody."""
+        docx = pytest.importorskip("docx")
+        import glob as _glob
+        from pq_report import generate_word_report
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        ds = extract_dataset(ProntoAdapter(Path("test_data/test_residential.pqd")),
+                             ChannelMapper())
+        generate_word_report(
+            report=rep, thresh=th, ds=ds, outdir=tmp_path, stem="t",
+            site_name="Site", site_address="1 Test St",
+            engineer_name="A. Engineer", engineer_contact="",
+            engineer_title="Electric Area Engineer")
+        written = _glob.glob(str(tmp_path / "*_internal_engineering_report.docx"))
+        assert written, "the internal report is named as such on disk"
+
+        d = docx.Document(written[0])
+        text = "\n".join(p.text for p in d.paragraphs)
+        assert "Internal Engineering Report" in text
+        assert "internal working document" in text
+        # No sign-off block: the document is not addressed to anyone.
+        assert "Sincerely," not in text
+        # Whose work it is survives, as a header field rather than a signature.
+        table_text = " ".join(c.text for t in d.tables for r in t.rows for c in r.cells)
+        assert "Prepared by" in table_text and "A. Engineer" in table_text
+
+    def test_the_register_changes_with_the_class(self, tmp_path):
+        """A homeowner is told what a meter does; a plant engineer is not."""
+        docx = pytest.importorskip("docx")
+        from pq_report import generate_customer_letter
+        texts = {}
+        for cls, path, nominal in (("r", "test_data/test_residential.pqd", 120.0),
+                                   ("pg", "test_data/test_commercial_large.pqd", 277.0)):
+            rep, th = self._report(Path(path), customer_class=cls, nominal=nominal)
+            out = generate_customer_letter(rep, th, "1 Test St", "Eng",
+                                           tmp_path / cls, "t")
+            texts[cls] = "\n".join(p.text for p in docx.Document(str(out)).paragraphs)
+
+        assert "your home" in texts["r"]
+        assert "measured the voltage and current many times a second" in texts["r"]
+
+        assert "your facility" in texts["pg"]
+        # The terse register states what was logged without explaining metering.
+        assert "measured the voltage and current many times a second" not in texts["pg"]
+        assert "interval resolution" in texts["pg"]
+        # A primary-metered customer owns the transformer, and the letter says so.
+        assert "transformer at this site is yours" in texts["pg"]
+
+    def test_the_power_factor_tariff_sheet_follows_the_class(self):
+        from pq_report import _customer_conditions
+        sheets = {}
+        for cls in ("c", "sg", "pg"):
+            rep, th = self._report(Path("test_data/test_commercial_small.pqd"),
+                                   customer_class=cls)
+            pf = [c for c in _customer_conditions(rep, th)
+                  if "power factor" in c["headline"].lower()]
+            sheets[cls] = pf[0]["measured"] if pf else ""
+        assert "Sheet R73 (Schedule C)" in sheets["c"]
+        assert "Sheet R73 (Schedule SG)" in sheets["sg"]
+        # Schedule PG asks for near unity, not a 0.90 floor.
+        assert "Sheet R121 (Schedule PG)" in sheets["pg"]
+        assert "near unity" in sheets["pg"] and "0.90" not in sheets["pg"]
+
+    def test_no_customer_document_mentions_the_internal_report(self, tmp_path):
+        docx = pytest.importorskip("docx")
+        from pq_report import generate_customer_letter
+        for cls, path, nominal in (("r", "test_data/test_residential.pqd", 120.0),
+                                   ("c", "test_data/test_commercial_small.pqd", 120.0),
+                                   ("sg", "test_data/test_commercial_large.pqd", 277.0),
+                                   ("pg", "test_data/test_commercial_large.pqd", 277.0)):
+            rep, th = self._report(Path(path), customer_class=cls, nominal=nominal)
+            out = generate_customer_letter(rep, th, "1 Test St", "Eng",
+                                           tmp_path / cls, "t")
+            text = "\n".join(p.text for p in docx.Document(str(out)).paragraphs).lower()
+            for forbidden in ("engineering report", "internal report", "attached report"):
+                assert forbidden not in text, f"{cls}: {forbidden}"
 
     def test_business_letter_covers_power_factor_and_distortion(self):
         from pq_report import _customer_conditions

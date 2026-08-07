@@ -56,6 +56,7 @@ try:
         isc_lookup_type,
         _infer_secondary_v,
         _lookup_isc,
+        conductor_options,
         Thresholds,
         ProntoAdapter,
         PQDIFAdapter,
@@ -71,6 +72,8 @@ try:
         check_individual_harmonics,
         check_individual_voltage_harmonics,
         check_neutral_harmonics,
+        check_harmonic_direction,
+        check_source_impedance,
         check_harmonic_sources,
         check_spectral_shape,
         check_harmonic_statistics,
@@ -89,7 +92,8 @@ try:
         plot_demand_profile,
         plot_harmonic_trend,
         plot_imbalance,
-        plot_pf_load,
+        plot_flicker,
+    plot_pf_load,
         plot_waveform_capture,
         check_neutral_health,
         check_itic,
@@ -101,10 +105,19 @@ try:
     )
     from pq_report import _LETTER_CLASSES
     _BOOK_AVAILABLE = True
+    _IMPORT_TRACEBACK = ""
 except Exception as _import_exc:
     import traceback
-    _log_path = Path(__file__).parent / "import_error.log"
-    _log_path.write_text(traceback.format_exc())
+    # Held in memory as well as on disk. The window that shows this is the
+    # only place the user can see why the tool will not run, and a file is
+    # the part of that chain most likely to be missing -- deleted, never
+    # written because the install directory is read-only, or written next to
+    # a different copy of run.py.
+    _IMPORT_TRACEBACK = traceback.format_exc()
+    try:
+        (Path(__file__).parent / "import_error.log").write_text(_IMPORT_TRACEBACK)
+    except Exception:
+        pass
     _BLUE_BOOK_ISC = {}
     _SERVICE_TYPE_LABEL = {}
     _LETTER_CLASSES = {}
@@ -127,6 +140,21 @@ _TYPE_DISPLAY = {k: _SERVICE_TYPE_LABEL.get(k, k) for k in _TYPE_ORDER}
 # Sentinel for primary-metered services (no Blue Book kVA/ISC lookup)
 _PRIMARY_KEY    = "__primary__"
 _PRIMARY_LABEL  = "Primary metered"
+# Sentinel for the service-conductor picker
+_CONDUCTOR_NONE = "— not specified —"
+
+#: Variables the form derives rather than accepts: the ISC hint label is
+#: rewritten by the transformer cascade, and the details panel's open state is
+#: how the window looks, not an entry the run reads. Clearing either would
+#: either be undone immediately or would fold a panel the user just opened.
+_DERIVED_VARS = {"_isc_auto_var", "_details_open"}
+
+#: Entries that describe the engineer rather than the service. They are the
+#: same on every run this person makes, so Clear All leaves them: clearing
+#: between sites would mean retyping one's own name and email each time, and
+#: a field left blank by accident goes out on a customer document.
+_STICKY_VARS = {"_eng_name_var", "_eng_title_var",
+                "_eng_phone_var", "_eng_email_var"}
 
 
 def _resolve_secondary_v(svc_type: str, nominal_v: float) -> int:
@@ -401,6 +429,34 @@ class PQApp(tk.Tk):
         tk.Label(isc_frame, text="A  (from fault study or manual calculation)",
                  bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left")
 
+        # ── Service conductor row ──────────────────────────────────────────────
+        # The run between that transformer and the meter. With it the measured
+        # service impedance gets an expected value to be compared against;
+        # without it the measurement still stands, uncompared.
+        cond_frame = tk.Frame(self, bg=_BG)
+        cond_frame.pack(fill="x", padx=12, pady=(0, 6))
+
+        tk.Label(cond_frame, text="Service conductor", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+
+        self._conductor_labels = {label: key for key, label in conductor_options()}
+        self._conductor_var = tk.StringVar(value=_CONDUCTOR_NONE)
+        self._conductor_combo = ttk.Combobox(
+            cond_frame, textvariable=self._conductor_var, state="readonly",
+            values=[_CONDUCTOR_NONE] + list(self._conductor_labels.keys()),
+            width=32, font=_FONT_UI,
+        )
+        self._conductor_combo.pack(side="left")
+
+        tk.Label(cond_frame, text="Run", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(10, 3))
+        self._run_length_var = tk.StringVar(value="")
+        tk.Entry(cond_frame, textvariable=self._run_length_var,
+                 font=_FONT_UI, width=7).pack(side="left")
+        tk.Label(cond_frame, text="ft  (transformer to meter — enables the "
+                                  "expected-impedance check)",
+                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(3, 0))
+
         ttk.Separator(self, orient="horizontal").pack(fill="x", padx=12, pady=(4, 0))
 
         # ── Report details section (collapsible) ──────────────────────────────
@@ -492,6 +548,13 @@ class PQApp(tk.Tk):
         self._open_btn.config(state="disabled")
 
         tk.Button(
+            btn_frame, text="Clear All",
+            command=self._clear_all,
+            font=_FONT_UI, relief="flat", cursor="hand2",
+            bg=_BG, padx=12, pady=8,
+        ).pack(side="left", padx=(8, 0))
+
+        tk.Button(
             btn_frame, text="? Help",
             command=self._show_help,
             font=_FONT_UI, relief="flat", cursor="hand2",
@@ -524,6 +587,59 @@ class PQApp(tk.Tk):
         scroll.pack(side="right", fill="y")
         self._log.pack(side="left", fill="both", expand=True)
 
+        # Snapshot every entry's starting value now that the form is built.
+        # Taken from the widgets rather than written out a second time: a
+        # hand-maintained list of defaults drifts the moment a field is added,
+        # and the field that silently keeps its old value across a Clear All
+        # is the one that carries the previous site's data into this run.
+        self._input_defaults = {
+            name: var.get() for name, var in vars(self).items()
+            if isinstance(var, tk.Variable)
+            and name not in _DERIVED_VARS and name not in _STICKY_VARS
+        }
+
+        self._log_write("Ready.  Select a .pqd file and click Run Analysis.\n")
+
+    # ── Clear ─────────────────────────────────────────────────────────────────
+
+    def _clear_all(self):
+        """Reset the service entries to the values they had when the window opened.
+
+        The engineer's own name, title, phone and email are left alone: they
+        describe who is running the tool rather than which service was
+        measured, and they go out on a customer document, where a field
+        blanked by an unrelated button is worse than one left stale.
+
+        Confirmed only when there is something to lose: a form already at its
+        defaults clears silently, so the button never nags, but one carrying a
+        typed address and a picked transformer asks first.
+        """
+        dirty = [name for name, default in self._input_defaults.items()
+                 if getattr(self, name).get() != default]
+        if dirty and not messagebox.askyesno(
+                "Clear all entries?",
+                f"This resets {len(dirty)} entr"
+                f"{'y' if len(dirty) == 1 else 'ies'} — including the file, "
+                "the transformer and conductor pickers, and the site details "
+                "— back to their defaults.\n\nYour engineer name, title, phone "
+                "and email are kept.\n\nClear the rest?"):
+            return
+
+        for name, default in self._input_defaults.items():
+            getattr(self, name).set(default)
+
+        # The pickers cascade: kVA options, the ISC label and the ISC entry's
+        # enabled state are derived from the type and the override checkbox,
+        # so they are refreshed rather than set, or the form would read as
+        # cleared while still offering the previous transformer's sizes.
+        self._xfmr_type_key = None
+        self._on_type_change()
+        self._on_isc_override_toggle()
+        self._on_topo_change()
+
+        self._log_clear()
+        self._log_write("Cleared.  Service entries are back to their defaults; "
+                        "engineer details kept.\n")
         self._log_write("Ready.  Select a .pqd file and click Run Analysis.\n")
 
     # ── Details section toggle ────────────────────────────────────────────────
@@ -704,14 +820,27 @@ class PQApp(tk.Tk):
                  bg="#7a1c1c", fg="#f0c0c0", font=_FONT_UI_S).pack(side="left")
 
     def _show_import_error(self):
-        """Display import_error.log so the user can copy the traceback."""
-        log_path = Path(__file__).parent / "import_error.log"
-        try:
-            detail = log_path.read_text()
-        except Exception:
-            detail = ("import_error.log could not be read.\n\n"
-                      "Run the tool from a Command Prompt to see the error:\n"
-                      "    python run.py")
+        """Display the traceback that stopped the tool loading.
+
+        Preferred from memory: it is the traceback this running copy actually
+        hit. The file is a fallback for the case where the failure happened in
+        an earlier run, and the instructions are the last resort.
+        """
+        detail = _IMPORT_TRACEBACK
+        if not detail:
+            log_path = Path(__file__).parent / "import_error.log"
+            try:
+                detail = (f"From a previous run ({log_path}):\n\n"
+                          + log_path.read_text())
+            except Exception:
+                detail = (
+                    "No traceback was recorded, which usually means this "
+                    "window is left over from a run that has since been "
+                    "fixed.\n\n"
+                    "Close the tool and start it again. If the banner comes "
+                    "back, run it from a Command Prompt to see the error:\n"
+                    "    python run.py"
+                )
 
         win = tk.Toplevel(self)
         win.title("Import error details")
@@ -770,6 +899,26 @@ class PQApp(tk.Tk):
                     messagebox.showerror("Invalid input", "Override ISC must be a number (e.g. 5000).")
                     return
 
+        # Service conductor run length — only meaningful with a conductor
+        # picked, and a typo here would silently skew the expected impedance.
+        run_length_ft = None
+        run_str = self._run_length_var.get().strip()
+        if run_str:
+            try:
+                run_length_ft = float(run_str)
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid input",
+                    "Run length must be a number of feet (e.g. 150).")
+                return
+        if self._conductor_labels.get(self._conductor_var.get()) and not run_length_ft:
+            messagebox.showerror(
+                "Invalid input",
+                "A service conductor was picked without a run length. Enter "
+                "the length in feet from the transformer to the meter, or set "
+                "the conductor back to \u2014 not specified \u2014.")
+            return
+
         # Transformer kVA
         xfmr_key = self._xfmr_type_key
         kva = None
@@ -800,6 +949,8 @@ class PQApp(tk.Tk):
             # report and its charts describe; without these the plots fall back
             # to guessing from which channels happen to be present.
             "topology":       self._topo_var.get(),
+            "conductor_key":  self._conductor_labels.get(self._conductor_var.get()),
+            "run_length_ft":  run_length_ft,
         }
 
         self._log_clear()
@@ -851,6 +1002,8 @@ class PQApp(tk.Tk):
             transformer_kva=kva,
             service_type=params.get("xfmr_key"),
             topology=params.get("topology", "auto"),
+            conductor_key=params.get("conductor_key"),
+            run_length_ft=params.get("run_length_ft"),
         )
 
         # ── Adapter ───────────────────────────────────────────────────────────
@@ -882,6 +1035,8 @@ class PQApp(tk.Tk):
         neutral_harm_result = check_neutral_harmonics(df, thresh)
         source_harm_result   = check_harmonic_sources(df, thresh)
         spectral_shape_result = check_spectral_shape(df, thresh, source_harm_result)
+        direction_result      = check_harmonic_direction(ds, thresh)
+        impedance_result      = check_source_impedance(df, thresh)
         stat_result         = check_harmonic_statistics(df, thresh)
         event_result        = detect_events(ds, thresh)
         neutral_health_result = check_neutral_health(ds, thresh)
@@ -898,6 +1053,8 @@ class PQApp(tk.Tk):
             source_harm_result, stat_result, event_result, thresh,
             neutral_health_result=neutral_health_result,
             spectral_shape_result=spectral_shape_result,
+            direction_result=direction_result,
+            impedance_result=impedance_result,
             itic_result=itic_result,
             ll_volt_result=ll_volt_result,
             frequency_result=frequency_result,
@@ -921,6 +1078,7 @@ class PQApp(tk.Tk):
         plot_harmonic_trend(df, outdir=outdir, stem=stem)
         plot_imbalance(df, imb_result, curr_imb_result, outdir=outdir, stem=stem)
         plot_pf_load(df, pf_result, outdir=outdir, stem=stem)
+        plot_flicker(df, flicker_result, outdir=outdir, stem=stem)
         plot_waveform_capture(ds, thresh, outdir=outdir, stem=stem)
 
         # ── Word report ───────────────────────────────────────────────────────
@@ -956,12 +1114,8 @@ class PQApp(tk.Tk):
         )
         if letter:
             self._log_write(
-                "\nCustomer letter written alongside the engineering report.\n")
-        elif params["cclass_key"] not in _LETTER_CLASSES:
-            self._log_write(
-                "\nNo customer letter: the plain-language version is residential "
-                "and small commercial only. This class gets the engineering "
-                "report.\n")
+                "\nCustomer document written alongside the internal "
+                "engineering report.\n")
         else:
             # Anything else means the letter could not be produced. Saying
             # "residential-only" here would send the reader to whatever letter
@@ -970,19 +1124,49 @@ class PQApp(tk.Tk):
                 "\nCustomer letter was NOT written — see the error above.\n",
                 tag="error")
 
-        self._log_write("\nDone.  Word report and plots saved to pq_output/\n", tag="done")
-        self._open_report(stem)
+        self._log_write(
+            "\nDone.  Internal engineering report, customer document and plots "
+            "saved to pq_output/\n", tag="done")
+        self._open_documents(stem)
 
-    def _open_report(self, stem: str):
-        report = _SCRIPT.parent / "pq_output" / f"{stem}_report.docx"
-        if report.exists():
+    def _open_documents(self, stem: str):
+        """Open both documents a run produces, not just the internal one.
+
+        The customer document is opened first and the internal report second,
+        so the internal one ends up in front -- it is the one the engineer
+        reads first, and it was the only one that opened before this. Both are
+        on screen either way, which is the point: the pair is written to be
+        read against each other, and a customer document that has to be found
+        by hand tends not to be read at all before it is sent.
+        """
+        outdir = _SCRIPT.parent / "pq_output"
+        documents = [
+            ("customer document", outdir / f"{stem}_customer_letter.docx"),
+            ("internal engineering report",
+             outdir / f"{stem}_internal_engineering_report.docx"),
+        ]
+        opened = 0
+        for label, path in documents:
+            if not path.exists():
+                self._log_write(
+                    f"\nThe {label} was not written, so it could not be "
+                    "opened. See the log above.\n", tag="error")
+                continue
+            try:
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", str(path)])
+                elif sys.platform == "win32":
+                    subprocess.Popen(["start", "", str(path)], shell=True)
+                else:
+                    subprocess.Popen(["xdg-open", str(path)])
+                opened += 1
+            except OSError as exc:
+                # Failing to launch Word must not lose the run: the files are
+                # written and the folder button still reaches them.
+                self._log_write(f"\nCould not open the {label} ({exc}). "
+                                f"It is saved at {path}.\n", tag="error")
+        if opened:
             self.after(0, lambda: self._open_btn.config(state="normal"))
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", str(report)])
-            elif sys.platform == "win32":
-                subprocess.Popen(["start", "", str(report)], shell=True)
-            else:
-                subprocess.Popen(["xdg-open", str(report)])
 
     def _reset_run_btn(self):
         self._run_btn.config(state="normal", text="Run Analysis")

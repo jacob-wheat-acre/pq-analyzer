@@ -29,6 +29,7 @@ from pq_constants import (
     _SERVICE_TYPE_LABEL,
     _h519_limit,
     _impedance_range,
+    expected_service_impedance,
     _itic_lower_v,
     _itic_upper_v,
     _lookup_isc,
@@ -274,9 +275,15 @@ def check_flicker(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "column":       col,
                 "max":          float(s.max()),
                 "mean":         float(s.mean()),
+                "median":       float(s.median()),
                 "p95":          float(s.quantile(0.95)),
                 "pct_exceeding": float((s > limit).mean() * 100),
                 "pass":         bool(s.max() <= limit),
+                # The meter carries one flicker value forward across several
+                # intervals, so the number of readings is not the number of
+                # measurement windows. Reported so nobody reads the interval
+                # count as a sample size.
+                "distinct_values": int(s.nunique()),
             }
 
     if not out["pst"] and not out["plt"]:
@@ -296,6 +303,14 @@ def check_flicker(df: pd.DataFrame, thresh: Thresholds) -> dict:
     out["worst_ratio_of_limit"] = round(worst_ratio, 3)
     out["pst_max"] = max((v["max"] for v in out["pst"].values()), default=None)
     out["plt_max"] = max((v["max"] for v in out["plt"].values()), default=None)
+    out["pst_p95"] = max((v["p95"] for v in out["pst"].values()), default=None)
+    out["plt_p95"] = max((v["p95"] for v in out["plt"].values()), default=None)
+    # Which phase carries the worst of each, since a service-wide statement
+    # that quotes phase A while phase B is over limit reads as a pass.
+    for kind in ("pst", "plt"):
+        if out[kind]:
+            out[f"{kind}_worst_phase"] = max(
+                out[kind], key=lambda p: out[kind][p]["max"])
     out["overall_pass"] = all(
         v["pass"] for kind in ("pst", "plt") for v in out[kind].values()
     )
@@ -1329,6 +1344,484 @@ def check_spectral_shape(df: pd.DataFrame, thresh: Thresholds, source_harm: dict
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Harmonic source direction
+#
+# Two independent readings of the same question -- is the dominant harmonic
+# source at the point of common coupling on the utility side or the customer
+# side -- because the data supports two and they fail in different ways.
+#
+#   * The interval method regresses harmonic voltage on harmonic current over
+#     the whole recording.  It needs no phase angles, so it works on every
+#     file, and its intercept is a direct measurement of the distortion
+#     present when the customer is drawing no harmonic current at all.
+#   * The waveform method takes the sign of harmonic power from point-on-wave
+#     captures, which carry V and I sampled simultaneously and so do carry the
+#     angle.  It is the physically direct measurement, but only at the instants
+#     the meter happened to capture.
+#
+# Neither is proof.  The power-direction sign is a screening indicator whose
+# validity depends on the relative impedances either side of the PCC (Xu, Liu
+# & Liu, "On the validity of the power direction method for harmonic source
+# determination", IEEE Trans. Power Delivery 18(1), 2003), and the regression
+# infers direction from covariance rather than measuring it.  Both are
+# reported as evidence of where distortion appears to originate, never as an
+# attribution of responsibility.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Pearson r at or above this, with a positive slope, means the harmonic
+#: voltage genuinely tracks the customer's harmonic current.
+_DIRECTION_MIN_R = 0.50
+
+#: Fewer aligned intervals than this and the regression is fitting noise.
+_DIRECTION_MIN_POINTS = 20
+
+#: Share of the harmonic voltage at high load that must be attributable to the
+#: customer's own current before the indication is called downstream.
+_DIRECTION_LOAD_SHARE = 0.60
+
+#: Intervals in the lowest decile of customer harmonic current: what the PCC
+#: distortion looks like when the customer is contributing least.
+_BACKGROUND_QUANTILE = 0.10
+
+#: A capture whose RMS voltage is this far from nominal is an event capture.
+#: Harmonic direction during a sag describes the sag, not the steady state.
+_WAVE_EVENT_PU = 0.10
+
+#: Floor on the harmonic current in a capture before its angle means anything.
+_WAVE_MIN_HARMONIC_A = 0.1
+
+#: Fraction of the fundamental below which a harmonic phasor is angle noise.
+_WAVE_MIN_HARMONIC_FRACTION = 0.005
+
+#: Captures shorter than this cannot resolve the orders being asked about.
+#: Set at three rather than a full ten because Pronto's event captures are
+#: short by design -- the sub-two-cycle transient captures are still excluded,
+#: but the 53 ms captures at 19.2 kHz carry three usable cycles.
+_WAVE_MIN_CYCLES = 3.0
+
+#: Phase-captures an order needs before its sign is a finding rather than an
+#: anecdote: one capture on three phases is three readings of one instant.
+_WAVE_MIN_SAMPLES = 3
+
+#: Share of usable capture-phases that must agree on a sign before the order
+#: gets a direction rather than "mixed".
+_WAVE_AGREEMENT = 0.70
+
+
+def _phasor(x: np.ndarray, window: np.ndarray, fs: float, freq: float) -> complex:
+    """Complex peak-amplitude phasor of *x* at exactly *freq*.
+
+    Projected onto the reference at the measured frequency rather than read
+    out of an FFT bin: the capture is not an integer number of cycles, so no
+    bin lands on 60 Hz, and a bin-quantized angle is wrong by tens of degrees
+    at the higher orders -- which is the whole measurement here.  The same
+    window multiplies V and I, so the angle *difference* is unaffected by it,
+    and dividing by the window sum restores the amplitude.
+    """
+    n = len(x)
+    ref = np.exp(-2j * np.pi * freq * np.arange(n) / fs)
+    return complex(2.0 * np.sum(x * window * ref) / np.sum(window))
+
+
+def _fundamental_hz(x: np.ndarray, fs: float, nominal: float = 60.0
+                    ) -> Tuple[float, bool]:
+    """Measured fundamental frequency of a capture, and whether to trust it.
+
+    A capture is a fraction of a second, so an FFT bin is several hertz wide
+    and the bin index alone is far too coarse: the reference the phasors are
+    projected onto has to sit on the real fundamental.  The bin peak is
+    therefore only a starting point, refined by maximising the projected
+    magnitude itself.
+
+    An estimate outside a few percent of nominal means the estimator was
+    handed a transient or an interruption rather than a steady fundamental.
+    Nominal is returned instead, and the caller is told, rather than every
+    harmonic reference being built on a frequency the system never ran at.
+    """
+    n = len(x)
+    if n < 16 or fs <= 0:
+        return nominal, False
+    window = np.hanning(n)
+    spec = np.abs(np.fft.rfft((x - x.mean()) * window))
+    freqs = np.fft.rfftfreq(n, 1.0 / fs)
+    band = (freqs > nominal * 0.8) & (freqs < nominal * 1.2)
+    if not band.any() or spec.max() <= 0:
+        return nominal, False
+
+    bin_hz = fs / n
+    coarse = float(freqs[int(np.argmax(np.where(band, spec, 0.0)))])
+    grid = np.arange(coarse - bin_hz, coarse + bin_hz, bin_hz / 50.0)
+    grid = grid[grid > 0]
+    if len(grid):
+        magnitudes = [abs(_phasor(x, window, fs, f)) for f in grid]
+        coarse = float(grid[int(np.argmax(magnitudes))])
+
+    if abs(coarse / nominal - 1.0) > 0.05:
+        return nominal, False
+    return coarse, True
+
+
+def harmonic_direction_from_intervals(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """Where the harmonic voltage at the PCC comes from, from magnitudes alone.
+
+    For each order, the interval harmonic voltage is regressed on the interval
+    harmonic current:
+
+        V_h = Z_h · I_h + V_bg
+
+    The slope is the apparent harmonic impedance seen looking upstream, so
+    Z_h · I_h is the part of the PCC distortion the customer's own current
+    accounts for.  The intercept is the part that is there regardless -- the
+    background distortion arriving from the system -- and it is checked
+    against a direct measurement: the mean harmonic voltage over the intervals
+    in the lowest decile of harmonic current, when the customer is
+    contributing least.
+
+    This runs on the whole recording rather than on the handful of instants a
+    waveform capture covers, which is what makes it worth having alongside the
+    phasor method even though it infers direction instead of measuring it.
+    """
+    significance = harmonic_spectrum_significance(df, thresh)
+    orders: Dict[int, dict] = {}
+
+    for h in _SOURCE_ORDERS:
+        v_parts, i_parts = [], []
+        for ph in ("a", "b", "c"):
+            cv, ci = f"h{h}_voltage_{ph}", f"h{h}_current_{ph}"
+            if cv in df.columns and ci in df.columns:
+                v_al, i_al = df[cv].align(df[ci], join="inner")
+                valid = v_al.notna() & i_al.notna() & (i_al > 0)
+                if valid.sum():
+                    v_parts.append(v_al[valid])
+                    i_parts.append(i_al[valid])
+        if not v_parts:
+            continue
+
+        v = pd.concat(v_parts).groupby(level=0).mean()
+        i = pd.concat(i_parts).groupby(level=0).mean()
+        v, i = v.align(i, join="inner")
+        if len(v) < _DIRECTION_MIN_POINTS:
+            continue
+
+        slope, intercept = np.polyfit(i.to_numpy(float), v.to_numpy(float), 1)
+        r = float(v.corr(i))
+        i_high = float(i.quantile(0.95))
+        v_from_load = max(float(slope) * i_high, 0.0)
+        v_background = max(float(intercept), 0.0)
+        total = v_from_load + v_background
+        load_share = (v_from_load / total) if total > 0 else None
+
+        # The intercept is an extrapolation; this is the same quantity read
+        # straight off the data, and the two disagreeing is worth seeing.
+        quiet = i <= i.quantile(_BACKGROUND_QUANTILE)
+        v_quiet = float(v[quiet].mean()) if quiet.any() else None
+
+        orders[h] = {
+            "slope_ohm":      round(float(slope), 4),
+            "intercept_v":    round(float(intercept), 4),
+            "corr":           round(r, 3) if np.isfinite(r) else None,
+            "points":         int(len(v)),
+            "i_p95_a":        round(i_high, 3),
+            "v_from_load_v":  round(v_from_load, 4),
+            "v_background_v": round(v_background, 4),
+            "v_at_quiet_v":   round(v_quiet, 4) if v_quiet is not None else None,
+            "v_mean_v":       round(float(v.mean()), 4),
+            "load_share":     round(load_share, 3) if load_share is not None else None,
+        }
+
+    if not orders:
+        return {"available": False,
+                "note": "No order has both a harmonic voltage and a harmonic "
+                        "current channel with enough aligned intervals."}
+
+    if not significance["usable"]:
+        for od in orders.values():
+            od["indication"] = "not_assessed"
+        return {
+            "available": True, "orders": orders, "overall": "not_assessed",
+            "significance": significance,
+            "note": ("Direction was not assessed: " + significance["reason"]
+                     + " The regressions above are reported as measured data only."),
+        }
+
+    for od in orders.values():
+        r = od["corr"]
+        tracks_load = (r is not None and r >= _DIRECTION_MIN_R
+                       and od["slope_ohm"] > 0
+                       and od["load_share"] is not None
+                       and od["load_share"] >= _DIRECTION_LOAD_SHARE)
+        # Distortion that stays put while the customer's harmonic current
+        # falls away has to be arriving from somewhere else.
+        background_dominates = (
+            od["v_mean_v"] > 0
+            and od["v_background_v"] >= 0.5 * od["v_mean_v"]
+            and (r is None or r < _DIRECTION_MIN_R)
+        )
+        if tracks_load:
+            od["indication"] = "downstream"
+        elif background_dominates:
+            od["indication"] = "upstream"
+        else:
+            od["indication"] = "indeterminate"
+
+    return {
+        "available":    True,
+        "orders":       orders,
+        "overall":      _direction_consensus(
+            [od["indication"] for od in orders.values()]),
+        "significance": significance,
+        "note": (
+            "Direction inferred from how the harmonic voltage at the meter "
+            "moves with the harmonic current drawn through it, over the whole "
+            "recording. It indicates where the distortion appears to originate, "
+            "not responsibility for it."
+        ),
+    }
+
+
+def harmonic_direction_from_waveforms(ds: PQDataset, thresh: Thresholds) -> dict:
+    """Direction of harmonic power flow, measured from point-on-wave captures.
+
+    Each capture carries voltage and current sampled simultaneously, so the
+    harmonic phasors carry an angle and the harmonic active power
+
+        P_h = ½ · Re(V_h · conj(I_h))
+
+    has a sign.  Positive is power flowing the same way as the fundamental --
+    into the customer, from a source upstream.  Negative is harmonic power
+    leaving the customer for the system, which is what a downstream source
+    looks like.
+
+    The fundamental sets the sign convention: at a load service P₁ flows into
+    the customer, so a negative P₁ means the CTs were installed backwards and
+    every harmonic sign with them.  That is detected and corrected here rather
+    than being left to invert the conclusion silently.
+
+    Captures taken during a sag or swell are excluded: their distortion
+    describes the disturbance, not the steady state.
+    """
+    captures = list(getattr(ds, "waveforms", None) or [])
+    out: dict = {
+        "available": False, "captures_total": len(captures), "captures_used": 0,
+        "excluded_event": 0, "excluded_light_load": 0, "excluded_short": 0,
+        "excluded_no_fundamental": 0, "orders": {}, "overall": "indeterminate",
+    }
+    if not captures:
+        out["note"] = ("No point-on-wave captures in this file, so harmonic "
+                       "power direction could not be measured.")
+        return out
+
+    nominal = thresh.nominal_voltage
+    # (order, phase-capture) -> P_h, before the polarity convention is fixed.
+    samples: Dict[int, List[dict]] = {h: [] for h in (1,) + tuple(_SOURCE_ORDERS)}
+    f0_seen: List[float] = []
+
+    for cap in captures:
+        fs = cap.get("fs_hz")
+        voltages = cap.get("voltages") or {}
+        currents = cap.get("currents") or {}
+        phases = [p for p in ("a", "b", "c") if p in voltages and p in currents]
+        if not fs or fs <= 0 or not phases:
+            continue
+
+        n = min(min(len(voltages[p]) for p in phases),
+                min(len(currents[p]) for p in phases))
+        if n / fs * thresh.frequency_nominal < _WAVE_MIN_CYCLES:
+            out["excluded_short"] += 1
+            continue
+
+        # Ordered so each capture is counted under the first thing wrong with
+        # it: a capture taken during a deep sag has no steady fundamental
+        # either, and calling it an event says more than calling it unreadable.
+        v_rms = float(np.sqrt(np.mean(
+            np.asarray(voltages[phases[0]][:n], float) ** 2)))
+        if nominal > 0 and abs(v_rms / nominal - 1.0) > _WAVE_EVENT_PU:
+            out["excluded_event"] += 1
+            continue
+
+        f0, f0_ok = _fundamental_hz(np.asarray(voltages[phases[0]][:n], float),
+                                    fs, thresh.frequency_nominal)
+        if not f0_ok:
+            # Without a fundamental to build the harmonic references on, every
+            # angle below would be measured against the wrong frequency.
+            out["excluded_no_fundamental"] += 1
+            continue
+
+        window = np.hanning(n)
+        used_any = False
+        for ph in phases:
+            v = np.asarray(voltages[ph][:n], dtype=float)
+            i = np.asarray(currents[ph][:n], dtype=float)
+            v1 = _phasor(v, window, fs, f0)
+            i1 = _phasor(i, window, fs, f0)
+            if abs(i1) / np.sqrt(2.0) < _MIN_LOADED_AMPS:
+                continue
+            used_any = True
+            samples[1].append({"p": 0.5 * float(np.real(v1 * np.conj(i1)))})
+            for h in _SOURCE_ORDERS:
+                vh = _phasor(v, window, fs, f0 * h)
+                ih = _phasor(i, window, fs, f0 * h)
+                floor = max(_WAVE_MIN_HARMONIC_A,
+                            _WAVE_MIN_HARMONIC_FRACTION * abs(i1) / np.sqrt(2.0))
+                if abs(ih) / np.sqrt(2.0) < floor:
+                    continue
+                samples[h].append({
+                    "p": 0.5 * float(np.real(vh * np.conj(ih))),
+                    # Wrapped to ±180° by construction: an unwrapped
+                    # difference of -249° is the same angle as +111° and
+                    # medians of the two say opposite things.
+                    "angle_deg": float(np.degrees(np.angle(vh * np.conj(ih)))),
+                })
+        if used_any:
+            out["captures_used"] += 1
+            f0_seen.append(f0)
+        else:
+            out["excluded_light_load"] += 1
+
+    if not out["captures_used"]:
+        out["note"] = (
+            f"None of the {len(captures)} capture(s) were usable: "
+            f"{out['excluded_event']} were taken during a voltage event, "
+            f"{out['excluded_light_load']} at less than {_MIN_LOADED_AMPS:.0f} A "
+            f"of load, {out['excluded_short']} too short to resolve the orders, "
+            f"{out['excluded_no_fundamental']} with no steady fundamental to "
+            "measure against."
+        )
+        return out
+
+    # CT polarity, from the fundamental: a load service imports real power, so
+    # a negative P1 means the clamps went on backwards. Only worth reading
+    # when there is enough real power for its sign to mean anything.
+    p1 = float(np.median([s["p"] for s in samples[1]])) if samples[1] else 0.0
+    polarity_floor = 0.5 * _MIN_LOADED_AMPS * thresh.nominal_voltage
+    polarity_verified = abs(p1) >= polarity_floor
+    inverted = polarity_verified and p1 < 0
+    sign = -1.0 if inverted else 1.0
+
+    orders: Dict[int, dict] = {}
+    for h in _SOURCE_ORDERS:
+        vals = [sign * s["p"] for s in samples[h]]
+        if len(vals) < _WAVE_MIN_SAMPLES:
+            continue
+        toward_customer = sum(1 for p in vals if p > 0)
+        toward_system = len(vals) - toward_customer
+        share_out = toward_system / len(vals)
+        if share_out >= _WAVE_AGREEMENT:
+            indication = "downstream"
+        elif (1.0 - share_out) >= _WAVE_AGREEMENT:
+            indication = "upstream"
+        else:
+            indication = "mixed"
+        orders[h] = {
+            "samples":          len(vals),
+            "toward_system":    toward_system,
+            "toward_customer":  toward_customer,
+            "median_p_w":       round(float(np.median(vals)), 4),
+            "median_angle_deg": round(float(np.median(
+                [s["angle_deg"] for s in samples[h]])), 1),
+            "indication":       indication,
+        }
+
+    out.update({
+        "available":            bool(orders),
+        "orders":               orders,
+        "fundamental_hz":       round(float(np.median(f0_seen)), 3) if f0_seen else None,
+        "ct_polarity_inverted": inverted,
+        "ct_polarity_verified": polarity_verified,
+        "median_p1_w":          round(abs(p1), 1),
+        "overall":              _direction_consensus(
+            [od["indication"] for od in orders.values()]),
+        "note": (
+            "Measured from the sign of harmonic power in "
+            f"{out['captures_used']} point-on-wave capture(s). Captures are "
+            "triggered snapshots, so this covers those instants and not the "
+            "whole recording. The sign is a screening indicator: it identifies "
+            "the side whose harmonic source dominates at the meter, and is "
+            "least reliable when the impedances either side of the meter are "
+            "comparable (Xu, Liu & Liu, IEEE T-PWRD 18(1), 2003)."
+        ),
+    })
+    if inverted:
+        out["polarity_note"] = (
+            "The fundamental real power measured as flowing out of the "
+            "premises, which at a load service means the CTs were installed "
+            "reversed. Every direction here is stated with that inversion "
+            "corrected; if the service has on-site generation exporting during "
+            "the captures, the correction is wrong and the directions invert."
+        )
+    elif not polarity_verified:
+        out["polarity_note"] = (
+            f"The captures carried only {abs(p1):.0f} W of fundamental real "
+            "power, too little for its sign to confirm the CT orientation, so "
+            "the directions below assume the CTs were installed with the "
+            "arrow toward the load. Reversed CTs would invert every one."
+        )
+    if not orders:
+        out["note"] = (
+            f"{out['captures_used']} capture(s) were readable, but no harmonic "
+            f"order reached {_WAVE_MIN_HARMONIC_A} A in at least "
+            f"{_WAVE_MIN_SAMPLES} phase-captures, so no direction could be "
+            "measured from them."
+        )
+    return out
+
+
+def _direction_consensus(indications: List[str]) -> str:
+    """One verdict from the per-order ones, without averaging away conflict."""
+    real = [i for i in indications if i in ("downstream", "upstream")]
+    if not real:
+        return "indeterminate"
+    if all(i == "downstream" for i in real):
+        return "downstream"
+    if all(i == "upstream" for i in real):
+        return "upstream"
+    return "mixed"
+
+
+def check_harmonic_direction(ds: PQDataset, thresh: Thresholds) -> dict:
+    """Both readings of harmonic source direction, and whether they agree.
+
+    Agreement between a method that needs no angles and one that measures them
+    is the strongest statement this data can support; disagreement is reported
+    rather than resolved, because the two look at different things -- the whole
+    recording versus a few triggered instants -- and either can be the more
+    representative one.
+    """
+    intervals = harmonic_direction_from_intervals(ds.df, thresh)
+    waveforms = harmonic_direction_from_waveforms(ds, thresh)
+
+    agreement: Dict[int, str] = {}
+    for h in _SOURCE_ORDERS:
+        a = (intervals.get("orders") or {}).get(h, {}).get("indication")
+        b = (waveforms.get("orders") or {}).get(h, {}).get("indication")
+        decided = [x for x in (a, b) if x in ("downstream", "upstream")]
+        if len(decided) == 2:
+            agreement[h] = "agree" if a == b else "disagree"
+        elif decided:
+            agreement[h] = "single_method"
+
+    overalls = [r.get("overall") for r in (intervals, waveforms)
+                if r.get("available")]
+    decided = [o for o in overalls if o in ("downstream", "upstream")]
+    if len(set(decided)) == 1 and decided:
+        overall = decided[0]
+    elif len(set(decided)) > 1:
+        overall = "conflicting"
+    else:
+        overall = "indeterminate"
+
+    return {
+        "available":  bool(intervals.get("available") or waveforms.get("available")),
+        "interval":   intervals,
+        "waveform":   waveforms,
+        "agreement":  agreement,
+        "overall":    overall,
+        "methods_agree": (bool(agreement) and "disagree" not in agreement.values()
+                          and "agree" in agreement.values()),
+    }
+
+
 def check_individual_voltage_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """IEEE 519-2022 Table 1 per-order voltage harmonic check.
 
@@ -2268,6 +2761,301 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
         "severity":          severity,
         "findings":          findings,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Service impedance
+#
+# The same idea as the resonance screen, at the fundamental: voltage that
+# falls as current rises is measuring the impedance between the source and the
+# meter. Here it is quantified rather than correlated, and compared against
+# what the picked transformer and service conductor ought to give.
+#
+# A high-impedance connection -- a corroded splice, a loose lug, an undersized
+# or degraded conductor -- shows up three ways, and the first two need no
+# conductor table at all:
+#
+#   * one phase reading materially higher than the others, which is what a
+#     single bad connection looks like and is self-referencing;
+#   * neutral-to-earth voltage rising with neutral current, which measures the
+#     neutral connection directly;
+#   * a total above what the transformer and conductor account for.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Load steps needed before a slope through them means anything.
+_IMPEDANCE_MIN_STEPS = 30
+
+#: A step in current has to be this big to be this customer's load switching
+#: rather than interval-to-interval noise: half an amp, or a twentieth of the
+#: peak, whichever is larger.
+_IMPEDANCE_STEP_MIN_A = 0.5
+_IMPEDANCE_STEP_FRACTION = 0.05
+
+#: Share of load steps whose voltage moves the opposite way, as series
+#: impedance requires. At chance the fit is measuring something else.
+_IMPEDANCE_MIN_CONSISTENCY = 0.65
+
+#: The meter reports voltage to a tenth of a volt; a drop smaller than that
+#: across the whole load range was never measurable.
+_VOLTAGE_RESOLUTION_V = 0.1
+
+#: Above this correlation between the real and reactive regressors, the power
+#: factor did not move enough to separate R from X.
+_IMPEDANCE_COLLINEAR_R = 0.98
+
+#: Ratios of measured to expected impedance that change what the report says.
+_IMPEDANCE_ELEVATED = 1.5
+_IMPEDANCE_HIGH = 2.5
+
+#: A phase whose resistance exceeds the lowest phase's by this much, and by
+#: enough volts at peak load to matter, is the loose-connection signature.
+_PHASE_ASYMMETRY_RATIO = 1.5
+_PHASE_ASYMMETRY_VOLTS = 1.0
+
+#: Neutral-to-earth volts at peak neutral current. Two is the level the
+#: neutral integrity section already calls significant.
+_NEUTRAL_RISE_VOLTS = 2.0
+
+
+def _impedance_fit(v: pd.Series, i: pd.Series, pf: Optional[pd.Series],
+                   rises_with_current: bool = False) -> Optional[dict]:
+    """Series impedance from what each step in load does to the voltage.
+
+    Fitted on differences between consecutive intervals, not on the levels.
+    Regressing voltage on current directly measures the wrong thing at a
+    residential service: the whole neighbourhood's air conditioning runs at
+    the same time of day as this customer's, so feeder-wide droop is
+    correlated with this load and lands in the slope. On a real 150 ft drop
+    that read 0.29 Ω, against an expected 0.04 Ω -- a false positive on
+    essentially every site.
+
+    Differencing removes it. Feeder loading and regulator action drift over
+    hours; a load switching on moves this meter's current and voltage in the
+    same interval. So the estimator uses only intervals where the current
+    stepped, and fits through the origin:
+
+        ΔV = −R·Δ(I·cosφ) − X·Δ(I·sinφ)
+
+    R and X separate only when the power factor moved; otherwise the
+    effective magnitude is returned alone rather than a split that looks
+    precise and is arbitrary. A last guard is the share of steps where
+    voltage moved the opposite way to current: series impedance requires
+    that of nearly all of them, and at chance the fit is reading something
+    else entirely.
+    """
+    v, i = v.align(i, join="inner")
+    valid = v.notna() & i.notna() & (v > 0) & (i > 0)
+    if pf is not None:
+        pf = pf.reindex(v.index)
+        valid &= pf.notna() & (pf.abs() <= 1.0)
+    v, i = v[valid], i[valid]
+    if len(v) < _IMPEDANCE_MIN_STEPS:
+        return None
+
+    i_max = float(i.max())
+    dv = v.diff().to_numpy(float)
+    di = i.diff().to_numpy(float)
+    floor = max(_IMPEDANCE_STEP_MIN_A, _IMPEDANCE_STEP_FRACTION * i_max)
+    steps = np.isfinite(dv) & np.isfinite(di) & (np.abs(di) >= floor)
+    n_steps = int(steps.sum())
+
+    out: dict = {"points": int(len(v)), "i_max_a": round(i_max, 2),
+                 "steps": n_steps, "step_floor_a": round(floor, 2)}
+
+    if n_steps < _IMPEDANCE_MIN_STEPS:
+        out.update({"identifiable": False, "reason": (
+            f"Only {n_steps} interval(s) showed a load step of {floor:.1f} A "
+            "or more, which is too few to measure a voltage drop against.")})
+        return out
+
+    # A voltage that never moves is not a failed fit, it is a measurement:
+    # both real files record neutral-to-earth voltage as 0.0 or 0.1 V and
+    # nothing else, which says the neutral connection is sound, not that the
+    # data is bad. Reported as its own outcome so the report can say so.
+    moved = float(np.mean(np.abs(dv[steps]) >= _VOLTAGE_RESOLUTION_V / 2))
+    if moved < 0.2:
+        out.update({"identifiable": False, "at_resolution": True,
+                    "moved_share": round(moved, 3), "reason": (
+                        f"Voltage moved by less than the meter's "
+                        f"{_VOLTAGE_RESOLUTION_V} V resolution in "
+                        f"{1 - moved:.0%} of the {n_steps} load steps: the "
+                        "drop across this impedance is below what the meter "
+                        "can report.")})
+        return out
+
+    # A phase voltage falls as its load rises; neutral-to-earth voltage rises
+    # with neutral current. Both are the same measurement with opposite signs.
+    product = dv[steps] * di[steps]
+    consistency = float(np.mean(product > 0 if rises_with_current else product < 0))
+    out["consistency"] = round(consistency, 3)
+    if consistency < _IMPEDANCE_MIN_CONSISTENCY:
+        out.update({"identifiable": False, "reason": (
+            f"Voltage moved against the load in only {consistency:.0%} of the "
+            f"{n_steps} load steps. A series impedance would show it in nearly "
+            "all of them, so what varies this voltage is not this service's "
+            "own current.")})
+        return out
+
+    out["identifiable"] = True
+
+    if pf is not None:
+        cos_phi = pf[valid].abs().to_numpy(float)
+        sin_phi = np.sqrt(np.clip(1.0 - cos_phi ** 2, 0.0, 1.0))
+        d_real = np.diff(i.to_numpy(float) * cos_phi, prepend=np.nan)
+        d_reac = np.diff(i.to_numpy(float) * sin_phi, prepend=np.nan)
+        usable = steps & np.isfinite(d_real) & np.isfinite(d_reac)
+        if usable.sum() >= _IMPEDANCE_MIN_STEPS:
+            collinear = abs(float(np.corrcoef(d_real[usable], d_reac[usable])[0, 1]))
+            design = np.column_stack([d_real[usable], d_reac[usable]])
+            coef, *_ = np.linalg.lstsq(design, dv[usable], rcond=None)
+            r_ohm, x_ohm = -float(coef[0]), -float(coef[1])
+            # A negative reactance is not a service impedance. Where the fit
+            # returns one, the split did not hold up and only the magnitude
+            # below is reported.
+            if (np.isfinite(collinear) and collinear < _IMPEDANCE_COLLINEAR_R
+                    and r_ohm > 0 and x_ohm >= 0):
+                out.update({
+                    "r_ohm": round(r_ohm, 5),
+                    "x_ohm": round(x_ohm, 5),
+                    "z_ohm": round(float(np.hypot(r_ohm, x_ohm)), 5),
+                    "separated": True,
+                    "pf_collinearity": round(collinear, 3),
+                })
+                if float(np.hypot(r_ohm, x_ohm)) * i_max < _VOLTAGE_RESOLUTION_V:
+                    out.update({"identifiable": False, "reason": (
+                        "The fitted impedance accounts for less than the "
+                        f"meter's {_VOLTAGE_RESOLUTION_V} V resolution across "
+                        "the whole load range.")})
+                return out
+            out["pf_collinearity"] = (round(collinear, 3)
+                                      if np.isfinite(collinear) else None)
+
+    # The median of the per-step ratios: robust to the steps where another
+    # customer's load moved at the same moment as this one's.
+    ratios = dv[steps] / di[steps]
+    z_eff = float(np.median(ratios if rises_with_current else -ratios))
+    out.update({"z_ohm": round(z_eff, 5), "separated": False})
+    if z_eff * i_max < _VOLTAGE_RESOLUTION_V:
+        out.update({"identifiable": False, "reason": (
+            f"Across the whole {i_max:.1f} A load range the voltage change "
+            f"attributable to this impedance is {z_eff * i_max:.2f} V, below "
+            f"the meter's {_VOLTAGE_RESOLUTION_V} V reporting resolution. "
+            "Nothing measurable is there to report.")})
+    return out
+
+
+def check_source_impedance(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """Impedance from the source to the meter, per phase, measured and expected.
+
+    The measurement stands on its own: the per-phase comparison and the
+    neutral-to-earth rise are findings without any picked conductor, because
+    both are read against the service's own other phases rather than against a
+    table. The expected value, when the transformer and conductor are known,
+    turns the total into a stated pass or fail.
+    """
+    pf = df["power_factor"] if "power_factor" in df.columns else None
+    phases: Dict[str, dict] = {}
+    for ph in ("a", "b", "c"):
+        v_col, i_col = f"voltage_{ph}", f"current_{ph}"
+        if v_col not in df.columns or i_col not in df.columns:
+            continue
+        fit = _impedance_fit(df[v_col], df[i_col], pf)
+        if fit is not None:
+            phases[ph] = fit
+
+    if not phases:
+        return {"available": False,
+                "reason": ("No phase has both a voltage and a current channel "
+                           "with enough intervals to fit a voltage drop.")}
+
+    measured = {ph: f for ph, f in phases.items()
+                if f.get("identifiable") and f.get("z_ohm") is not None}
+    out: dict = {
+        "available": True,
+        "phases": phases,
+        "power_factor_used": pf is not None,
+    }
+
+    # ── the neutral connection, measured directly ────────────────────────────
+    if "voltage_neutral" in df.columns and "current_neutral" in df.columns:
+        n_fit = _impedance_fit(df["voltage_neutral"], df["current_neutral"],
+                               None, rises_with_current=True)
+        if n_fit:
+            if n_fit.get("identifiable"):
+                r_n = float(n_fit["z_ohm"])
+                i_n_peak = float(df["current_neutral"].max())
+                rise = r_n * i_n_peak
+                n_fit.update({
+                    "r_ohm": round(r_n, 5),
+                    "i_peak_a": round(i_n_peak, 2),
+                    "rise_at_peak_v": round(rise, 2),
+                    "elevated": bool(rise >= _NEUTRAL_RISE_VOLTS and r_n > 0),
+                })
+            out["neutral"] = n_fit
+
+    # ── one phase against the others ─────────────────────────────────────────
+    # Compared like for like: the resistance where the fit separated it, the
+    # effective magnitude where it did not, never a mix of the two.
+    key = ("r_ohm" if all(f.get("separated") for f in measured.values())
+           else "z_ohm")
+    resistances = {ph: f[key] for ph, f in measured.items()
+                   if f.get(key) is not None and f[key] > 0}
+    if len(resistances) >= 2:
+        worst = max(resistances, key=resistances.get)
+        best = min(resistances, key=resistances.get)
+        i_peak = max(float(df[f"current_{ph}"].max()) for ph in resistances)
+        excess_v = (resistances[worst] - resistances[best]) * i_peak
+        ratio = (resistances[worst] / resistances[best]
+                 if resistances[best] > 0 else None)
+        out["asymmetry"] = {
+            "worst_phase": worst.upper(),
+            "best_phase": best.upper(),
+            "ratio": round(ratio, 2) if ratio else None,
+            "excess_v_at_peak": round(excess_v, 2),
+            "flagged": bool(ratio and ratio >= _PHASE_ASYMMETRY_RATIO
+                            and excess_v >= _PHASE_ASYMMETRY_VOLTS),
+        }
+
+    # ── against what the picked service ought to give ────────────────────────
+    expected = expected_service_impedance(thresh)
+    out["expected"] = expected
+    z_values = [f["z_ohm"] for f in measured.values()
+                if f.get("z_ohm") is not None and f["z_ohm"] > 0]
+    if z_values:
+        out["measured_z_ohm"] = round(float(np.median(z_values)), 5)
+    if expected.get("available") and z_values and expected.get("total_ohm"):
+        z_meas = float(np.median(z_values))
+        ratio = z_meas / float(expected["total_ohm"])
+        i_peak = max(float(df[f"current_{ph}"].max()) for ph in measured)
+        out["comparison"] = {
+            "measured_ohm": round(z_meas, 5),
+            "expected_ohm": round(float(expected["total_ohm"]), 5),
+            "ratio": round(ratio, 2),
+            "excess_v_at_peak": round(
+                (z_meas - float(expected["total_ohm"])) * i_peak, 2),
+            "i_peak_a": round(i_peak, 2),
+            "verdict": ("high" if ratio > _IMPEDANCE_HIGH
+                        else "elevated" if ratio > _IMPEDANCE_ELEVATED
+                        else "below_expected" if ratio < 0.5
+                        else "consistent"),
+        }
+
+    out["overall"] = _impedance_overall(out)
+    return out
+
+
+def _impedance_overall(result: dict) -> str:
+    """The headline, worst-first, so a flag cannot hide behind a pass."""
+    comparison = (result.get("comparison") or {}).get("verdict")
+    if comparison == "high" or (result.get("asymmetry") or {}).get("flagged"):
+        return "high_impedance_suspected"
+    if comparison == "elevated" or (result.get("neutral") or {}).get("elevated"):
+        return "elevated"
+    if comparison == "consistent":
+        return "consistent_with_expected"
+    if result.get("measured_z_ohm") is not None:
+        return "measured_only"
+    return "not_measurable"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

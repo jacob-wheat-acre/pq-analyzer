@@ -10,6 +10,7 @@ import pandas as pd
 
 from pq_constants import (
     SEVERITY_LABEL,
+    SEVERITY_ORDER,
     is_single_phase_208,
     ll_factor,
     __version__,
@@ -21,7 +22,9 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
-from pq_analysis import grade_finding, standard_k_rating
+from pq_analysis import (_IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
+                         _MIN_LOADED_AMPS, _VOLTAGE_RESOLUTION_V,
+                         grade_finding, standard_k_rating)
 
 log = logging.getLogger(__name__)
 
@@ -140,6 +143,8 @@ def generate_report(
     neutral_health_result: Optional[dict] = None,
     spectral_shape_result: Optional[dict] = None,
     itic_result: Optional[dict] = None,
+    direction_result: Optional[dict] = None,
+    impedance_result: Optional[dict] = None,
     ll_volt_result: Optional[dict] = None,
     frequency_result: Optional[dict] = None,
     flicker_result: Optional[dict] = None,
@@ -186,11 +191,15 @@ def generate_report(
         "individual_voltage_harmonics": volt_harm_result,
         "neutral_harmonics":            neutral_harm_result,
         "harmonic_sources":             source_harm_result,
+        "harmonic_direction":           direction_result or {"available": False,
+                                                             "note": "not evaluated"},
         "spectral_shape":               spectral_shape_result or {"available": False},
         "harmonic_statistics":          stat_result,
         "events":                       event_result,
         "itic":                         itic_result or {"available": False, "note": "not evaluated"},
         "neutral_health":               neutral_health_result or {"available": False, "reason": "not run"},
+        "service_impedance":            impedance_result or {"available": False,
+                                                             "reason": "not evaluated"},
         "pass_fail": {
             "transformer_loading":    transformer_pass,
             "voltage":                volt_result["total_pct_out_of_bounds"] == 0
@@ -357,11 +366,14 @@ def print_report(report: dict) -> None:
                                    ("plt", "Plt", fl["plt_limit"])):
             if not fl[kind]:
                 continue
-            per_phase = "  ".join(f"{p}={v['max']:.2f}"
-                                  for p, v in sorted(fl[kind].items()))
+            per_phase = "  ".join(
+                f"{p}: med {v['median']:.2f} p95 {v['p95']:.2f} max {v['max']:.2f}"
+                for p, v in sorted(fl[kind].items()))
             worst = max(fl[kind].values(), key=lambda v: v["max"])
             sym = "PASS" if worst["max"] <= limit else "FAIL"
-            print(f"  {label} max by phase: {per_phase}   limit={limit:.2f}  [{sym}]")
+            window = "10 min" if kind == "pst" else "2 h"
+            print(f"  {label} ({window}) by phase — {per_phase}"
+                  f"   limit={limit:.2f}  [{sym}]")
         print(f"  Governing phase: {fl['worst_phase']} "
               f"({fl['worst_ratio_of_limit']:.2f}× its limit)")
 
@@ -498,6 +510,76 @@ def print_report(report: dict) -> None:
             ratio_s = f"{od['z_ratio']:.2f}×" if od["z_ratio"] is not None else "   n/a"
             corr_s  = f"{od['corr']:.2f}"     if od["corr"]    is not None else "   n/a"
             print(f"  H{h:<5}  {od['z_ohm']:>8.4f}  {ratio_s:>8}  {corr_s:>10}  {od['attribution']}")
+
+    # ── Service impedance ─────────────────────────────────────────────────────
+    si = report.get("service_impedance", {})
+    if si.get("available"):
+        print(f"\n{sep}")
+        print(f"  SERVICE IMPEDANCE — {_IMPEDANCE_HEADLINE.get(si.get('overall'), si.get('overall'))}")
+        for ph, fit in sorted(si.get("phases", {}).items()):
+            if fit.get("identifiable"):
+                r = f"{fit['r_ohm']:.4f}" if fit.get("r_ohm") is not None else "   —  "
+                x = f"{fit['x_ohm']:.4f}" if fit.get("x_ohm") is not None else "   —  "
+                print(f"  Phase {ph.upper()}:  R={r} Ω  X={x} Ω  |Z|={fit['z_ohm']:.4f} Ω  "
+                      f"({fit['steps']} load steps, {fit['consistency']:.0%} consistent)")
+            else:
+                print(f"  Phase {ph.upper()}:  not measurable — {fit.get('reason', '')}")
+        asym = si.get("asymmetry") or {}
+        if asym.get("ratio"):
+            mark = "⚠ " if asym["flagged"] else "  "
+            print(f"  {mark}Between phases: {asym['worst_phase']} is "
+                  f"{asym['ratio']:.1f}× {asym['best_phase']} "
+                  f"({asym['excess_v_at_peak']:.1f} V extra at peak load)")
+        neutral = si.get("neutral") or {}
+        if neutral.get("identifiable"):
+            mark = "⚠ " if neutral.get("elevated") else "  "
+            print(f"  {mark}Neutral: R={neutral['r_ohm']:.4f} Ω → "
+                  f"{neutral['rise_at_peak_v']:.1f} V at {neutral['i_peak_a']:.0f} A")
+        elif neutral.get("at_resolution"):
+            print("    Neutral: no rise above the meter's resolution — a sound "
+                  "neutral reads this way")
+        cmp_ = si.get("comparison") or {}
+        if cmp_:
+            mark = "⚠ " if cmp_["verdict"] in ("high", "elevated") else "  "
+            print(f"  {mark}Measured {cmp_['measured_ohm']:.4f} Ω vs expected "
+                  f"{cmp_['expected_ohm']:.4f} Ω = {cmp_['ratio']:.1f}×  "
+                  f"({cmp_['excess_v_at_peak']:+.1f} V at {cmp_['i_peak_a']:.0f} A peak)")
+        elif not (si.get("expected") or {}).get("available"):
+            print("    No expected impedance: pick the service conductor and run "
+                  "length to compare against one.")
+
+    # ── Harmonic source direction ─────────────────────────────────────────────
+    hd = report.get("harmonic_direction", {})
+    if hd.get("available"):
+        iv = hd.get("interval") or {}
+        wf = hd.get("waveform") or {}
+        print(f"\n{sep}")
+        print("  HARMONIC SOURCE DIRECTION (which side of the meter)")
+        print(f"  Over the recording: {_DIRECTION_LABEL.get(iv.get('overall'), '—')}"
+              f"   |   At the captures: {_DIRECTION_LABEL.get(wf.get('overall'), '—')}")
+        if iv.get("available"):
+            print(f"  {'Order':<6}  {'Z_h(Ω)':>8}  {'FromLoad':>9}  {'Backgnd':>8}  "
+                  f"{'r':>6}  Indication")
+            for h, od in sorted((iv.get("orders") or {}).items()):
+                corr_s = f"{od['corr']:.2f}" if od["corr"] is not None else "   n/a"
+                print(f"  H{h:<5}  {od['slope_ohm']:>8.3f}  {od['v_from_load_v']:>9.2f}  "
+                      f"{od['v_background_v']:>8.2f}  {corr_s:>6}  "
+                      f"{_DIRECTION_LABEL.get(od['indication'], od['indication'])}")
+        if wf.get("available"):
+            print(f"  Captures used: {wf['captures_used']} of {wf['captures_total']}"
+                  f"{_direction_exclusions(wf)}")
+            print(f"  {'Order':<6}  {'Readings':>8}  {'OutBound':>9}  {'MedianP(W)':>11}  "
+                  f"{'Angle':>7}  Indication")
+            for h, od in sorted((wf.get("orders") or {}).items()):
+                print(f"  H{h:<5}  {od['samples']:>8}  {od['toward_system']:>9}  "
+                      f"{_signed_watts(od['median_p_w']):>11}  "
+                      f"{od['median_angle_deg']:>6.0f}°  "
+                      f"{_DIRECTION_LABEL.get(od['indication'], od['indication'])}")
+        elif wf.get("note"):
+            print(f"  {wf['note']}")
+        for h, verdict in sorted((hd.get("agreement") or {}).items()):
+            if verdict == "disagree":
+                print(f"  ⚠  H{h}: the two methods disagree — see the report section.")
 
     # ── Spectral shape (broadband vs. resonance classification) ───────────────
     ss = report.get("spectral_shape", {})
@@ -734,7 +816,11 @@ def _integrity_note(dq: dict, fs: dict) -> str:
         reasons = [d.get("reason", "") for d in detail if d.get("reason")]
         if reasons:
             # One reason is worth quoting; a list of them is noise in a table.
-            parts.append(f"Reason reported by the reader: {reasons[0]}"
+            # The reader's reason carries its own structural evidence and ends
+            # in its own full stop, which is what makes this paragraph enough
+            # to diagnose the file without sending the file anywhere.
+            first = reasons[0].rstrip().rstrip(".")
+            parts.append(f"Reason reported by the reader: {first}"
                          + (f" (and {len(reasons) - 1} more)" if len(reasons) > 1 else "")
                          + ".")
 
@@ -774,10 +860,14 @@ def _integrity_note(dq: dict, fs: dict) -> str:
 
 
 def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, substation,
-                          fs, nominal_v, nominal_ll) -> None:
+                          fs, nominal_v, nominal_ll, prepared_by="") -> None:
     rows_data = [
         ("Customer / Site", site_name or stem),
     ]
+    # Who ran the analysis, as a header field rather than a signature: an
+    # internal document still has to say whose work it is.
+    if prepared_by:
+        rows_data.append(("Prepared by", prepared_by))
     if site_address:
         rows_data.append(("Address", site_address))
     if meter_id:
@@ -1267,15 +1357,26 @@ def _phase_label(ph: str) -> str:
     return ph.replace("voltage_", "").replace("current_", "").strip("_").upper() or ph.upper()
 
 
-def _flicker_status(df) -> Optional[dict]:
-    """Return flicker max values and pass/fail, or None when not measured."""
-    if (df is None or "flicker_pst" not in df.columns or "flicker_plt" not in df.columns
-            or not df["flicker_pst"].notna().any() or not df["flicker_plt"].notna().any()):
+def _flicker_status(report: dict) -> Optional[dict]:
+    """Worst-phase flicker severity and pass/fail, or None when not measured.
+
+    Read off the analysis result rather than off phase A's columns. On a real
+    split-phase file phase A reached Pst 1.43 while phase B reached 4.98, so a
+    status taken from phase A alone understated the service by 3.5x and could
+    report a pass with another phase over limit.
+    """
+    fl = report.get("flicker") or {}
+    if not fl.get("available"):
         return None
-    pst_max = float(df["flicker_pst"].max())
-    plt_max = float(df["flicker_plt"].max())
-    return {"pst_max": pst_max, "plt_max": plt_max,
-            "passes": pst_max <= 1.0 and plt_max <= 0.65}
+    return {
+        "pst_max":   fl.get("pst_max"),
+        "plt_max":   fl.get("plt_max"),
+        "pst_limit": fl.get("pst_limit"),
+        "plt_limit": fl.get("plt_limit"),
+        "pst_phase": fl.get("pst_worst_phase"),
+        "plt_phase": fl.get("plt_worst_phase"),
+        "passes":    fl.get("overall_pass"),
+    }
 
 
 def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
@@ -1373,12 +1474,14 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
             f"{ci['pct_exceeding']:.1f}% of the recording "
             f"(maximum {ci['max_imbalance_pct']:.2f}%)."))
 
-    fl = _flicker_status(df)
+    fl = _flicker_status(report)
     if fl and fl["passes"] is False:
         items.append((0,
-            f"Voltage flicker exceeded IEC 61000-3-3 limits "
-            f"(Pst maximum {fl['pst_max']:.2f} against a 1.00 limit; "
-            f"Plt maximum {fl['plt_max']:.2f} against a 0.65 limit)."))
+            "Voltage flicker exceeded IEC 61000-3-3 limits "
+            f"(Pst maximum {fl['pst_max']:.2f} on phase {fl['pst_phase']} "
+            f"against a {fl['pst_limit']:.2f} limit; Plt maximum "
+            f"{fl['plt_max']:.2f} on phase {fl['plt_phase']} against a "
+            f"{fl['plt_limit']:.2f} limit)."))
 
     itic = report.get("itic", {})
     if pf.get("itic_transients") is False and itic.get("worst"):
@@ -1629,6 +1732,56 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
     return _prune_actions(actions)
 
 
+def _flicker_severities(fl: dict, report: dict) -> dict:
+    """Severity for Pst and Plt separately, and the worse of the two overall.
+
+    Graded off the 95th percentile rather than the maximum, with the share of
+    the recording spent over the limit as persistence -- the same way voltage
+    THD is graded, and for the same reason. A single ten-minute Pst of 4.98 is
+    five times the limit, and grading on the maximum called that "severe" on
+    the strength of one interval out of two thousand while ignoring the phase
+    that sat over its Plt limit for a quarter of the recording. The maximum is
+    still what decides pass or fail: compliance is binary, severity is not.
+    """
+    duration_h = (report.get("file_summary") or {}).get("duration_hours") or 0.0
+    notes = []
+    if duration_h and duration_h < 24.0:
+        # Both standards assess the 95th percentile over a week, and no survey
+        # recording runs that long -- so "shorter than a week" cannot be the
+        # trigger, or every flicker finding would be discounted a band forever,
+        # which is a bias rather than a discount. Under a day is different: it
+        # holds only a handful of the two-hour windows Plt is built from, and
+        # a percentile over those is genuinely soft.
+        notes.append(f"{duration_h:.0f}-hour recording holds only "
+                     f"{duration_h / 2:.0f} of the two-hour windows Plt is "
+                     "built from")
+
+    out: dict = {}
+    worst_band = None
+    for kind, key in (("pst", "flicker_pst"), ("plt", "flicker_plt")):
+        phases = fl.get(kind) or {}
+        if not phases:
+            continue
+        limit = fl[f"{kind}_limit"]
+        # The governing phase is the one furthest past the limit at its 95th
+        # percentile, which is the phase the severity should describe.
+        worst_phase = max(phases.values(), key=lambda s: s["p95"])
+        graded = grade_finding(
+            all(s["pass"] for s in phases.values()),
+            measured=worst_phase["p95"], limit=limit,
+            persistence_pct=max(s["pct_exceeding"] for s in phases.values()),
+            confidence_notes=notes)
+        out[key] = graded
+        if (worst_band is None
+                or SEVERITY_ORDER.index(graded["band"])
+                > SEVERITY_ORDER.index(worst_band["band"])):
+            worst_band = graded
+
+    if worst_band is not None:
+        out["flicker"] = worst_band
+    return out
+
+
 def compute_severities(report: dict, thresh: Thresholds) -> dict:
     """Grade every finding once, keyed the same way as ``pass_fail``.
 
@@ -1733,9 +1886,7 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
                               if hs.get("period_days", 7) < 7 else None))
 
     if fl.get("available"):
-        sev["flicker"] = grade_finding(
-            fl.get("overall_pass"), measured=fl.get("pst_max"),
-            limit=fl.get("pst_limit"))
+        sev.update(_flicker_severities(fl, report))
 
     if llv.get("available"):
         worst = max(llv["pairs"].values(), key=lambda p: p["pct_out_of_bounds"])
@@ -1772,7 +1923,7 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
     if thresh.customer_class == "r":
         # Residential services are not subject to the power factor tariff clause
         evaluated.pop("power_factor", None)
-    fl        = _flicker_status(df)
+    fl        = _flicker_status(report)
     # pass_fail already carries a "flicker" entry, so counting fl separately
     # inflated the tally by one against the table.
     n_eval    = len(evaluated) + (0 if "flicker" in evaluated else (1 if fl else 0))
@@ -2077,6 +2228,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
     ivh      = report.get("individual_voltage_harmonics", {})
     nh       = report.get("neutral_harmonics", {})
     sh       = report.get("harmonic_sources", {})
+    hd       = report.get("harmonic_direction", {})
     ss       = report.get("spectral_shape", {})
     hs       = report.get("harmonic_statistics", {})
     dem      = report["demand"]
@@ -2094,7 +2246,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         c_thd.get("available") or thd["voltage"].get("available")
         or ih.get("available") or ivh.get("available") or nh.get("available")
         or sh.get("available") or ss.get("available") or hs.get("available")
-        or spec_img.exists() or has_kfactor
+        or hd.get("available") or spec_img.exists() or has_kfactor
     )
     if not any_harm:
         return   # no harmonic data in this recording — section suppressed
@@ -2395,6 +2547,9 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             f"({elev_str}), per-order spectrum coefficient of variation {ss['flatness_cv']:.2f}."
         )
 
+    # ── Which side of the meter the distortion comes from ─────────────────────
+    _word_harmonic_direction(doc, report, thresh)
+
     # ── IEEE 519-2022 Clause 5 statistical compliance tables ──────────────────
     if hs.get("available"):
         _section_heading(doc, "Statistical Harmonic Evaluation (IEEE 519-2022 Clause 5)", level=2)
@@ -2611,42 +2766,552 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
     doc.add_paragraph()
 
 
-def _word_flicker(doc, report, df) -> Optional[str]:
-    _has_data = _flicker_status(df) is not None
-    if not _has_data:
-        return "Voltage Flicker"
-    if _has_data:
-        _section_heading(doc, "Voltage Flicker (IEC 61000-3-3)", level=2)
-        pst_med = float(df["flicker_pst"].median())
-        pst_max = float(df["flicker_pst"].max())
-        plt_med = float(df["flicker_plt"].median())
-        plt_max = float(df["flicker_plt"].max())
-        pst_pass = pst_max <= 1.0
-        plt_pass = plt_max <= 0.65
-        if pst_pass and plt_pass:
-            _body(doc,
-                f"Short-term flicker severity (Pst) remained below the IEC 61000-3-3 limit of 1.0 "
-                f"throughout the recording (median {pst_med:.2f}, max {pst_max:.2f}). "
-                f"Long-term flicker severity (Plt) remained below the 0.65 limit "
-                f"(median {plt_med:.2f}, max {plt_max:.2f}). "
-                "No objectionable lamp flicker from this service is expected."
-            )
-        else:
-            exceedances = []
-            if not pst_pass:
-                exceedances.append(f"Pst max {pst_max:.2f} exceeds the 1.0 limit")
-            if not plt_pass:
-                exceedances.append(f"Plt max {plt_max:.2f} exceeds the 0.65 limit")
-            _body(doc,
-                f"Flicker severity exceeded IEC 61000-3-3 limits: {'; '.join(exceedances)}. "
-                f"Pst median {pst_med:.2f} (max {pst_max:.2f}, limit 1.00); "
-                f"Plt median {plt_med:.2f} (max {plt_max:.2f}, limit 0.65). "
-                "Flicker complaints are plausible under these conditions. Common causes include "
-                "arc furnaces, large motor starting, welders, or rapidly cycling loads. "
-                "Source investigation (utility vs. customer) requires voltage measurements at "
-                "the service entrance with all customer loads disconnected."
-            )
+#: How the two methods' verdicts are said out loud. The wording names a side
+#: of the meter and stops there: which side a harmonic source sits on is a
+#: measurement, whose equipment it is and what follows from that is the
+#: engineer's call, written under "Engineer's assessment".
+_DIRECTION_LABEL = {
+    "downstream":    "Customer side",
+    "upstream":      "Utility side",
+    "mixed":         "Split — no clear side",
+    "conflicting":   "The two methods disagree",
+    "indeterminate": "Indeterminate",
+    "not_assessed":  "Not assessed",
+}
+
+#: The same verdicts inside a sentence, where a table label reads wrong.
+_DIRECTION_PHRASE = {
+    "downstream":    "the customer side",
+    "upstream":      "the utility side",
+    "mixed":         "no single side across the orders",
+    "conflicting":   "opposite sides",
+    "indeterminate": "no clear side",
+    "not_assessed":  "no assessment — the spectrum was too close to the meter's "
+                     "resolution to read",
+}
+
+
+def _word_harmonic_direction(doc, report, thresh) -> None:
+    """Where the harmonic distortion at the meter appears to originate.
+
+    Two methods are printed side by side rather than merged into one verdict.
+    They answer the same question from different data -- the whole recording
+    versus the captured instants -- and where they disagree that is itself the
+    finding, since a customer source that only appears in triggered captures
+    and a background source that only shows in the trend are different
+    situations with different next steps.
+    """
+    hd = report.get("harmonic_direction") or {}
+    if not hd.get("available") or thresh.customer_class == "r":
+        return
+
+    iv = hd.get("interval") or {}
+    wf = hd.get("waveform") or {}
+
+    _section_heading(doc, "Harmonic Source Direction", level=2)
+    _body(doc,
+        "Harmonic distortion measured at the meter can originate on either "
+        "side of it: from equipment inside the premises drawing distorted "
+        "current, or from the distribution system delivering an already "
+        "distorted voltage. The two readings below answer that question from "
+        "different data and are reported as evidence of direction only — they "
+        "do not assign responsibility for the distortion or the cost of "
+        "correcting it."
+    )
+
+    # ── Method 1: the whole recording, from magnitudes ───────────────────────
+    if iv.get("available"):
+        hdr = doc.add_paragraph()
+        _bold(hdr, "Across the whole recording (harmonic voltage vs. harmonic current)",
+              size_pt=10)
+        _body(doc,
+            "For each order the harmonic voltage at the meter is fitted "
+            "against the harmonic current flowing through it: V_h = Z_h·I_h + "
+            "V_background. The slope is the part of the distortion the "
+            "premises' own current accounts for; the intercept is what remains "
+            "when that current falls away, which is distortion arriving from "
+            "the system. The last column before the indication is the same "
+            "quantity measured rather than extrapolated — the average harmonic "
+            "voltage over the tenth of intervals drawing the least harmonic "
+            "current."
+        )
+        tbl = doc.add_table(rows=1, cols=7)
+        tbl.style = 'Table Grid'
+        _set_col_widths(tbl, [1.3, 2.1, 2.4, 2.4, 2.4, 1.6, 2.8])
+        for cell, text in zip(tbl.rows[0].cells,
+                              ["Order", "Z_h (Ω)", "From load (V)",
+                               "Background (V)", "At quietest 10% (V)",
+                               "r", "Indication"]):
+            _cell_shade(cell, "E8F1FA")
+            cell.paragraphs[0].add_run(text).bold = True
+            cell.paragraphs[0].runs[0].font.size = Pt(9)
+        for h, od in sorted((iv.get("orders") or {}).items()):
+            cells = tbl.add_row().cells
+            quiet = od.get("v_at_quiet_v")
+            corr = od.get("corr")
+            values = [
+                f"H{h}",
+                f"{od['slope_ohm']:.3f}",
+                f"{od['v_from_load_v']:.2f}",
+                f"{od['v_background_v']:.2f}",
+                f"{quiet:.2f}" if quiet is not None else "—",
+                f"{corr:.2f}" if corr is not None else "—",
+                _DIRECTION_LABEL.get(od.get("indication"), od.get("indication", "")),
+            ]
+            for cell, text in zip(cells, values):
+                cell.paragraphs[0].add_run(text).font.size = Pt(9)
+        if iv.get("overall") == "not_assessed":
+            _body(doc, iv.get("note", ""))
+
+    # ── Method 2: the captures, from the sign of harmonic power ──────────────
+    if wf.get("available"):
         doc.add_paragraph()
+        hdr = doc.add_paragraph()
+        _bold(hdr, "At the point-on-wave captures (sign of harmonic power)",
+              size_pt=10)
+        _body(doc,
+            "The captures record voltage and current at the same instants, so "
+            "each harmonic has a phase angle and its power P_h = ½·Re(V_h·I_h*) "
+            "has a direction. Power flowing out of the premises at a harmonic "
+            "order means the source of that order is inside; power flowing in "
+            "means it is upstream. "
+            f"{wf['captures_used']} of {wf['captures_total']} captures were "
+            "usable"
+            + _direction_exclusions(wf)
+            + (f", measured against a fundamental of {wf['fundamental_hz']:.2f} Hz."
+               if wf.get("fundamental_hz") else ".")
+        )
+        if wf.get("polarity_note"):
+            _body(doc, wf["polarity_note"])
+
+        tbl = doc.add_table(rows=1, cols=6)
+        tbl.style = 'Table Grid'
+        _set_col_widths(tbl, [1.3, 2.4, 2.6, 2.6, 2.4, 3.7])
+        for cell, text in zip(tbl.rows[0].cells,
+                              ["Order", "Readings", "Toward system",
+                               "Median P_h (W)", "Median V–I angle", "Indication"]):
+            _cell_shade(cell, "E8F1FA")
+            cell.paragraphs[0].add_run(text).bold = True
+            cell.paragraphs[0].runs[0].font.size = Pt(9)
+        for h, od in sorted((wf.get("orders") or {}).items()):
+            cells = tbl.add_row().cells
+            values = [
+                f"H{h}",
+                f"{od['samples']}",
+                f"{od['toward_system']} of {od['samples']}",
+                _signed_watts(od['median_p_w']),
+                f"{od['median_angle_deg']:.0f}°",
+                _DIRECTION_LABEL.get(od.get("indication"), od.get("indication", "")),
+            ]
+            for cell, text in zip(cells, values):
+                cell.paragraphs[0].add_run(text).font.size = Pt(9)
+    elif wf.get("note"):
+        doc.add_paragraph()
+        hdr = doc.add_paragraph()
+        _bold(hdr, "At the point-on-wave captures (sign of harmonic power)",
+              size_pt=10)
+        _body(doc, wf["note"])
+
+    # ── What the two together support ────────────────────────────────────────
+    doc.add_paragraph()
+    hdr = doc.add_paragraph()
+    _bold(hdr, "Combined reading", size_pt=10)
+    _body(doc, _direction_summary_sentence(hd))
+    _body(doc,
+        "Limitations: the sign of harmonic power identifies the side whose "
+        "harmonic source dominates at the meter and is least decisive when the "
+        "impedances either side are comparable (Xu, Liu & Liu, IEEE "
+        "Transactions on Power Delivery 18(1), 2003); the captures are "
+        "triggered snapshots rather than a continuous record; and the "
+        "regression infers direction from how distortion co-varies with load "
+        "rather than measuring it. Neither method establishes what equipment "
+        "is responsible."
+    )
+    assessment = doc.add_paragraph()
+    _bold(assessment, "Engineer's assessment: ")
+    _normal(assessment, "____________________________________________")
+    doc.add_paragraph()
+
+
+def _signed_watts(p: float) -> str:
+    """Harmonic power with its sign, without printing a negative zero.
+
+    The orders that matter most are often fractions of a watt, and "-0.00"
+    reads as a direction when it is really the absence of one.
+    """
+    if abs(p) < 0.005:
+        return "≈0"
+    return f"{p:+.2f}"
+
+
+def _direction_exclusions(wf: dict) -> str:
+    """Why the unusable captures were unusable, in one clause."""
+    reasons = [
+        (wf.get("excluded_event", 0), "taken during a voltage event"),
+        (wf.get("excluded_light_load", 0), "at too little load to measure"),
+        (wf.get("excluded_short", 0), "too short to resolve the orders"),
+        (wf.get("excluded_no_fundamental", 0), "without a steady fundamental"),
+    ]
+    named = [f"{n} {why}" for n, why in reasons if n]
+    return f" (excluded: {', '.join(named)})" if named else ""
+
+
+def _direction_summary_sentence(hd: dict) -> str:
+    """One sentence on what both methods together do and do not support."""
+    iv_overall = (hd.get("interval") or {}).get("overall")
+    wf_overall = (hd.get("waveform") or {}).get("overall")
+    agreement = hd.get("agreement") or {}
+    agreed = sorted(h for h, v in agreement.items() if v == "agree")
+    disagreed = sorted(h for h, v in agreement.items() if v == "disagree")
+
+    if iv_overall == wf_overall:
+        parts = [
+            "Both readings — the harmonic voltage across the recording and the "
+            "harmonic power at the captures — point to "
+            f"{_DIRECTION_PHRASE.get(iv_overall, 'no clear side')}."
+        ]
+    else:
+        parts = [
+            "Across the recording the harmonic voltage points to "
+            f"{_DIRECTION_PHRASE.get(iv_overall, 'no clear side')}; "
+            "at the captures the harmonic power points to "
+            f"{_DIRECTION_PHRASE.get(wf_overall, 'no clear side')}."
+        ]
+    if agreed:
+        parts.append(
+            "The two methods agree at "
+            + ", ".join(f"H{h}" for h in agreed)
+            + ", which is the strongest statement this recording supports: "
+            "an inference drawn from the whole period and a direct measurement "
+            "at the captured instants reaching the same answer."
+        )
+    if disagreed:
+        parts.append(
+            "They disagree at "
+            + ", ".join(f"H{h}" for h in disagreed)
+            + ". That is not resolved here: the two look at different windows, "
+            "and a source that is present only during the captured instants — "
+            "or only outside them — produces exactly this split. Repeat "
+            "monitoring, or captures triggered on harmonic content rather than "
+            "on voltage events, would separate the two."
+        )
+    if not agreed and not disagreed:
+        parts.append(
+            "Only one method returned a direction, so the reading rests on "
+            "that method's assumptions alone."
+        )
+    return " ".join(parts)
+
+
+_IMPEDANCE_HEADLINE = {
+    "high_impedance_suspected": "High impedance suspected",
+    "elevated":                 "Above what the service accounts for",
+    "consistent_with_expected": "Consistent with the service as built",
+    "measured_only":            "Measured; no expected value to compare against",
+    "not_measurable":           "Not measurable from this recording",
+}
+
+
+def _word_service_impedance(doc, report, thresh) -> Optional[str]:
+    """Series impedance from the source to the meter, measured and expected.
+
+    The section leads with the two readings that need no conductor table --
+    one phase against the others, and the neutral against itself -- because
+    they hold whatever the engineer typed into the picker, and a comparison
+    against a generic conductor constant should never outrank a measurement
+    the service made against itself.
+    """
+    si = report.get("service_impedance") or {}
+    if not si.get("available"):
+        return "Service Impedance"
+
+    _section_heading(doc, "Service Impedance and High-Impedance Screening", level=2)
+    _body(doc,
+        "Voltage that falls when current rises is measuring the impedance "
+        "between the source and the meter. It is fitted here on the steps in "
+        "load rather than on the levels: the whole neighbourhood's load rises "
+        "at the same hours as this customer's, and a fit against the levels "
+        "attributes that shared droop to this service. Only intervals where "
+        "the current stepped are used, so slow feeder movement drops out."
+    )
+
+    # ── per phase ────────────────────────────────────────────────────────────
+    tbl = doc.add_table(rows=1, cols=6)
+    tbl.style = 'Table Grid'
+    _set_col_widths(tbl, [1.6, 2.2, 2.2, 2.2, 2.4, 4.9])
+    for cell, text in zip(tbl.rows[0].cells,
+                          ["Phase", "R (Ω)", "X (Ω)", "|Z| (Ω)",
+                           "Load steps", "Basis"]):
+        _cell_shade(cell, "E8F1FA")
+        cell.paragraphs[0].add_run(text).bold = True
+        cell.paragraphs[0].runs[0].font.size = Pt(9)
+    for ph, fit in sorted(si.get("phases", {}).items()):
+        cells = tbl.add_row().cells
+        if fit.get("identifiable"):
+            basis = (f"{fit['consistency']:.0%} of steps moved the voltage the "
+                     "expected way"
+                     + ("" if fit.get("separated") else
+                        "; power factor too steady to separate R from X"))
+            values = [ph.upper(),
+                      f"{fit['r_ohm']:.4f}" if fit.get("r_ohm") is not None else "—",
+                      f"{fit['x_ohm']:.4f}" if fit.get("x_ohm") is not None else "—",
+                      f"{fit['z_ohm']:.4f}", str(fit.get("steps", "—")), basis]
+        else:
+            values = [ph.upper(), "—", "—", "—", str(fit.get("steps", "—")),
+                      fit.get("reason", "Not measurable")]
+        for cell, text in zip(cells, values):
+            cell.paragraphs[0].add_run(text).font.size = Pt(9)
+
+    # ── one phase against the others ─────────────────────────────────────────
+    asym = si.get("asymmetry") or {}
+    if asym.get("ratio"):
+        para = doc.add_paragraph()
+        _bold(para, "Between phases: ")
+        if asym["flagged"]:
+            _normal(para,
+                f"phase {asym['worst_phase']} measures {asym['ratio']:.1f}× the "
+                f"impedance of phase {asym['best_phase']}, worth "
+                f"{asym['excess_v_at_peak']:.1f} V of extra drop at peak load. "
+                "A single connection — a lug, a splice, a crimp — degrading on "
+                "one phase is what produces this; the conductors and the "
+                "transformer are common to all phases and cannot.",
+                color=_FAIL_CLR)
+        else:
+            _normal(para,
+                f"phase {asym['worst_phase']} measures {asym['ratio']:.1f}× "
+                f"phase {asym['best_phase']} ({asym['excess_v_at_peak']:.1f} V "
+                "at peak load), which is within what unequal loading and "
+                "measurement scatter account for. No single-phase connection "
+                "problem is indicated.")
+
+    # ── the neutral, measured against itself ─────────────────────────────────
+    neutral = si.get("neutral") or {}
+    if neutral:
+        para = doc.add_paragraph()
+        _bold(para, "Neutral connection: ")
+        if neutral.get("identifiable"):
+            text = (f"neutral-to-earth voltage rises with neutral current at "
+                    f"{neutral['r_ohm']:.4f} Ω, which is "
+                    f"{neutral['rise_at_peak_v']:.1f} V at the "
+                    f"{neutral['i_peak_a']:.0f} A peak neutral current.")
+            if neutral.get("elevated"):
+                _normal(para, text + " A sound neutral holds this near zero; "
+                        "this is the signature of resistance in the neutral "
+                        "path — a loose connection, a corroded splice, or a "
+                        "degraded ground.", color=_FAIL_CLR)
+            else:
+                _normal(para, text + " That is low enough to indicate a sound "
+                        "neutral connection.")
+        elif neutral.get("at_resolution"):
+            _normal(para,
+                "neutral-to-earth voltage never moved by as much as the "
+                f"meter's {_VOLTAGE_RESOLUTION_V} V resolution across "
+                f"{neutral.get('steps', 0)} load steps. Any resistance in the "
+                "neutral is below what this recording can resolve, which is "
+                "the reading a sound neutral gives.")
+        else:
+            _normal(para, neutral.get("reason", "Not measurable."))
+
+    # ── measured against expected ────────────────────────────────────────────
+    expected = si.get("expected") or {}
+    comparison = si.get("comparison") or {}
+    doc.add_paragraph()
+    hdr = doc.add_paragraph()
+    _bold(hdr, "Against the service as built", size_pt=10)
+    if not expected.get("available"):
+        _body(doc, expected.get("reason", "No expected impedance was built."))
+    else:
+        parts = []
+        if expected.get("upstream_ohm") is not None:
+            parts.append(f"{expected['upstream_ohm']:.4f} Ω from "
+                         f"{expected.get('upstream_source', 'upstream')}")
+        if expected.get("conductor_z_ohm") is not None:
+            parts.append(
+                f"{expected['conductor_z_ohm']:.4f} Ω from "
+                f"{expected.get('run_length_ft', 0):.0f} ft of "
+                f"{expected.get('conductor_label')} counted "
+                f"{expected.get('conductor_path', '')}")
+        _body(doc, "Expected impedance is " + ", plus ".join(parts)
+              + f" — {expected.get('total_ohm', 0):.4f} Ω in total."
+              + (f" This omits {expected['partial']}, so it is a floor."
+                 if expected.get("partial") else ""))
+        _body(doc,
+            "The conductor constants are generic published values (NEC "
+            "Chapter 9 Table 8 resistance at 75 °C, with a typical reactance "
+            "for the construction), not PSCo Blue Book figures, and the run "
+            "length is as entered. Treat the comparison as an order-of-"
+            "magnitude check, not a tolerance.")
+        if comparison:
+            verdict_text = {
+                "high": (f"The measured {comparison['measured_ohm']:.4f} Ω is "
+                         f"{comparison['ratio']:.1f}× the expected "
+                         f"{comparison['expected_ohm']:.4f} Ω — "
+                         f"{comparison['excess_v_at_peak']:.1f} V of drop at "
+                         f"the {comparison['i_peak_a']:.0f} A peak beyond what "
+                         "the transformer and conductor account for."),
+                "elevated": (f"The measured {comparison['measured_ohm']:.4f} Ω "
+                             f"is {comparison['ratio']:.1f}× the expected "
+                             f"{comparison['expected_ohm']:.4f} Ω, worth "
+                             f"{comparison['excess_v_at_peak']:.1f} V at peak "
+                             "load."),
+                "consistent": (f"The measured {comparison['measured_ohm']:.4f} Ω "
+                               f"sits within the range the expected "
+                               f"{comparison['expected_ohm']:.4f} Ω accounts "
+                               "for."),
+                "below_expected": (
+                    f"The measured {comparison['measured_ohm']:.4f} Ω is below "
+                    f"the expected {comparison['expected_ohm']:.4f} Ω, which "
+                    "usually means the run is shorter or the conductor larger "
+                    "than what was entered, or the source stiffer than the "
+                    "Blue Book figure."),
+            }.get(comparison["verdict"], "")
+            para = doc.add_paragraph()
+            _normal(para, verdict_text,
+                    color=_FAIL_CLR if comparison["verdict"] == "high" else None)
+
+    assessment = doc.add_paragraph()
+    _bold(assessment, "Engineer's assessment: ")
+    _normal(assessment, "____________________________________________")
+    doc.add_paragraph()
+    return None
+
+
+#: IEEE 1453-2015 Table 2 compatibility levels at low voltage. Not what the
+#: pass/fail above is judged against -- that stays IEC 61000-3-3 -- but the
+#: number a reader needs to know exists before treating a Plt of 0.7 as a
+#: failure of the supply system rather than of an equipment emission limit.
+_IEEE1453_LV_PST = 1.0
+_IEEE1453_LV_PLT = 0.8
+
+
+def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
+    """Flicker severity, short-term and long-term, on every phase measured.
+
+    The two are different measurements of the same phenomenon over different
+    windows, and the section says which is which: an engineer reading it
+    should not have to already know why there are two numbers, and the
+    distinction decides what to do about them -- a high Pst with a low Plt is
+    a short burst, the reverse is a load cycling for hours.
+    """
+    fl = report.get("flicker") or {}
+    if not fl.get("available"):
+        return "Voltage Flicker"
+
+    _section_heading(doc, "Voltage Flicker (IEC 61000-3-3)", level=2)
+    _body(doc,
+        "Flicker severity is reported as two numbers because it is measured "
+        "over two windows. Pst, short-term severity, is computed over 10 "
+        "minutes and scaled so that 1.0 is the level at which half of "
+        "observers watching an incandescent lamp find the flicker "
+        "objectionable — it catches motor starts, welders and other short "
+        "bursts. Plt, long-term severity, aggregates twelve consecutive Pst "
+        "values into one figure covering two hours (the cube root of their "
+        "mean cube, so one bad ten minutes still shows), and it catches loads "
+        "that cycle for hours: heat pumps, compressors, arc furnaces. A high "
+        "Pst with a low Plt is a brief disturbance; a Plt near its limit with "
+        "modest Pst values is something running repeatedly."
+    )
+
+    tbl = doc.add_table(rows=1, cols=7)
+    tbl.style = 'Table Grid'
+    _set_col_widths(tbl, [2.6, 1.6, 2.0, 2.0, 2.0, 2.6, 2.7])
+    for cell, text in zip(tbl.rows[0].cells,
+                          ["Measure", "Phase", "Median", "95th pct", "Max",
+                           "% of time over", "Result"]):
+        _cell_shade(cell, "E8F1FA")
+        cell.paragraphs[0].add_run(text).bold = True
+        cell.paragraphs[0].runs[0].font.size = Pt(9)
+
+    for kind, label, limit in (("pst", f"Pst (10 min)", fl["pst_limit"]),
+                               ("plt", f"Plt (2 h)", fl["plt_limit"])):
+        for phase, stats in sorted(fl.get(kind, {}).items()):
+            cells = tbl.add_row().cells
+            values = [f"{label}, limit {limit:.2f}", phase,
+                      f"{stats['median']:.2f}", f"{stats['p95']:.2f}",
+                      f"{stats['max']:.2f}", f"{stats['pct_exceeding']:.1f}%",
+                      "PASS" if stats["pass"] else "FAIL"]
+            for cell, text in zip(cells, values):
+                run = cell.paragraphs[0].add_run(text)
+                run.font.size = Pt(9)
+            if not stats["pass"]:
+                for cell in cells:
+                    _cell_shade(cell, "FFF0F0")
+                cells[-1].paragraphs[0].runs[0].bold = True
+                cells[-1].paragraphs[0].runs[0].font.color.rgb = _FAIL_CLR
+
+    # Severity, separately for each measure. Pass/fail above is decided by the
+    # maximum, which one bad ten-minute window is enough to fail; the band here
+    # is graded at the 95th percentile with the share of time over the limit,
+    # so a single anomaly does not read as a sustained condition.
+    severities = _flicker_severities(fl, report)
+    for kind, label in (("pst", "Pst"), ("plt", "Plt")):
+        graded = severities.get(f"flicker_{kind}")
+        if not graded or graded["band"] == "not_assessed":
+            continue
+        para = doc.add_paragraph()
+        _bold(para, f"{label} severity: ")
+        _normal(para, graded["label"] + (f" — {graded['reason']}"
+                                         if graded["reason"] else ""),
+                color=_sev_color(graded["band"]))
+
+    failures = [(kind, phase, stats)
+                for kind in ("pst", "plt")
+                for phase, stats in sorted(fl.get(kind, {}).items())
+                if not stats["pass"]]
+    if not failures:
+        _body(doc,
+            f"Both measures stayed within their limits on every phase "
+            f"measured ({', '.join(fl.get('phases_read', []))}). No "
+            "objectionable lamp flicker from this service is expected."
+        )
+    else:
+        worst = ", ".join(
+            f"{'Pst' if k == 'pst' else 'Plt'} reached {s['max']:.2f} on phase "
+            f"{p} against a {fl[k + '_limit']:.2f} limit"
+            for k, p, s in failures)
+        _body(doc,
+            f"Flicker severity exceeded IEC 61000-3-3 limits: {worst}. Flicker "
+            "complaints are plausible under these conditions. Common causes "
+            "are arc furnaces, large motor starting, welders and rapidly "
+            "cycling loads. Separating a source inside the premises from one "
+            "on the system requires voltage measurement at the service "
+            "entrance with the customer's load disconnected."
+        )
+        if any(k == "plt" for k, _p, _s in failures) and not any(
+                k == "pst" for k, _p, _s in failures):
+            _body(doc,
+                "Only the two-hour measure is over limit while every "
+                "ten-minute value stays inside it, which is the signature of "
+                "a load that cycles repeatedly rather than one large "
+                "disturbance."
+            )
+
+    # The limits above are equipment emission limits; the numbers a supply
+    # system is held to are different, and a reader comparing against the
+    # wrong one draws the wrong conclusion.
+    _body(doc,
+        f"Limits applied are IEC 61000-3-3, which governs what a piece of "
+        f"equipment may emit: Pst {fl['pst_limit']:.2f} and Plt "
+        f"{fl['plt_limit']:.2f}. The compatibility levels IEEE 1453-2015 sets "
+        f"for a low-voltage supply system are higher — Pst {_IEEE1453_LV_PST:.1f} "
+        f"and Plt {_IEEE1453_LV_PLT:.1f} — so a Plt between "
+        f"{fl['plt_limit']:.2f} and {_IEEE1453_LV_PLT:.1f} is over the "
+        "equipment limit without exceeding what the supply system is expected "
+        "to hold. Both standards assess against the 95th percentile over a "
+        "week; this recording covers "
+        f"{report['file_summary']['duration_hours'] / 24:.1f} day(s), so the "
+        "percentiles above describe the period recorded and not a week."
+    )
+    _embed_plot(doc, outdir, stem, "flicker.png",
+                "Flicker severity over the recording. The bottom panel sorts "
+                "every reading from worst to best against the share of the "
+                "recording at or above it: a curve that falls below the limit "
+                "line close to the left edge was over limit only briefly, "
+                "while one still above it further right was over limit for "
+                "that share of the time. The dotted line marks the 95th "
+                "percentile, where both standards assess and where the "
+                "severity above is graded.")
+    doc.add_paragraph()
     return None
 
 
@@ -2898,7 +3563,10 @@ def _word_measurement_review(doc, report, thresh, df, outdir=None, stem="") -> N
         _word_demand(doc, report, thresh, outdir, stem),
         _word_power_factor(doc, report, thresh, outdir, stem),
         _word_voltage(doc, report, outdir, stem),
-        _word_flicker(doc, report, df),
+        # Directly after the voltage it explains: a service impedance is what
+        # turns the load into the voltage the section above reports.
+        _word_service_impedance(doc, report, thresh),
+        _word_flicker(doc, report, df, outdir, stem),
         _word_imbalance(doc, report, thresh, outdir, stem),
         _word_neutral_health(doc, report, thresh, outdir, stem),
         _word_events(doc, report, outdir, stem),
@@ -3273,8 +3941,81 @@ def _word_appendix(doc, report, thresh, df) -> None:
         entries.append(("Harmonic source attribution",
             "Source attribution is indicative, based on harmonic impedance estimates "
             "and Pearson correlation between per-order voltage and current interval "
-            "series. Definitive source direction requires waveform-level phasor "
-            "measurements at the point of common coupling."))
+            "series. Direction measured from waveform phasors is reported separately "
+            "under Harmonic Source Direction."))
+
+    fl = report.get("flicker", {})
+    if fl.get("available"):
+        entries.append(("Flicker: what Pst and Plt each measure",
+            "Both come from the same IEC 61000-4-15 flickermeter, over different "
+            "windows. Pst is the severity over 10 minutes, normalised so 1.0 is "
+            "the level half of observers watching a 60 W incandescent lamp find "
+            "objectionable. Plt covers two hours and is built from twelve "
+            "consecutive Pst values as the cube root of their mean cube, a "
+            "weighting that keeps one bad ten-minute period visible instead of "
+            "averaging it away. Pst therefore answers whether a disturbance is "
+            "perceptible now, and Plt whether a repeatedly cycling load adds up "
+            "to a nuisance over a working period; they fail independently and "
+            "both are reported per phase. The meter carries each value forward "
+            "across several recording intervals, so the interval count is not "
+            "the number of measurement windows and the percentiles are "
+            "time-weighted. The limits applied, Pst 1.0 and Plt 0.65, are IEC "
+            "61000-3-3 equipment emission limits; IEEE 1453-2015 compatibility "
+            "levels for a low-voltage supply system are Pst 1.0 and Plt 0.8, and "
+            "both standards assess the 95th percentile over a week, which is "
+            "longer than this recording."))
+
+    si = report.get("service_impedance", {})
+    if si.get("available"):
+        expected = si.get("expected") or {}
+        entries.append(("Service impedance — method and limits",
+            "Impedance between the source and the meter is fitted on the steps in "
+            "load, not on the levels: a fit against the levels attributes the "
+            "whole feeder's coincident droop to this one service, which on a "
+            "measured 150 ft residential drop read 0.29 Ω against an expected "
+            "0.04 Ω. Only intervals whose current stepped by at least "
+            f"{_IMPEDANCE_STEP_MIN_A} A (or a twentieth of peak) are used, and a "
+            "fit is reported only where the voltage moved the opposite way in at "
+            f"least {_IMPEDANCE_MIN_CONSISTENCY:.0%} of those steps. R and X "
+            "separate only where the power factor varied enough to make the real "
+            "and reactive parts of the current distinguishable; otherwise the "
+            "effective magnitude is reported alone. Two readings need no expected "
+            "value: one phase against the others, which no common conductor or "
+            "transformer can explain, and neutral-to-earth voltage against "
+            "neutral current."
+            + (" The expected impedance uses generic published conductor "
+               "constants (NEC Chapter 9 Table 8 resistance at 75 °C with a "
+               "typical reactance for the construction), not PSCo Blue Book "
+               "figures, and the run length as entered, so it is an "
+               "order-of-magnitude check rather than a tolerance."
+               if expected.get("generic_conductor_constants") else "")))
+
+    hd = report.get("harmonic_direction", {})
+    if hd.get("available"):
+        wf = hd.get("waveform") or {}
+        entries.append(("Harmonic source direction — method and limits",
+            "Two independent readings. (1) Over the whole recording, each order's "
+            "harmonic voltage is fitted against its harmonic current as V_h = "
+            "Z_h·I_h + V_background; the slope is what the premises' own current "
+            "accounts for and the intercept is what persists without it, checked "
+            "against the measured harmonic voltage over the tenth of intervals "
+            "drawing the least harmonic current. It uses magnitudes only and so "
+            "infers direction from covariance rather than measuring it. (2) At each "
+            "point-on-wave capture, harmonic phasors are projected onto the measured "
+            "fundamental and its multiples, giving P_h = ½·Re(V_h·I_h*), whose sign "
+            "is the direction of harmonic power flow; the sign convention is fixed "
+            "by the fundamental real power, so reversed CTs are detected and "
+            "corrected rather than silently inverting the result. Captures taken "
+            "during a voltage event, below "
+            f"{_MIN_LOADED_AMPS:.0f} A of load, shorter than three cycles, or with "
+            "no steady fundamental are excluded. The power-direction sign identifies "
+            "the side whose harmonic source dominates at the meter and is least "
+            "decisive when the impedances either side are comparable (Xu, Liu & Liu, "
+            "IEEE Transactions on Power Delivery 18(1), 2003), and captures are "
+            "triggered snapshots rather than a continuous record"
+            + (f" — {wf.get('captures_used', 0)} of {wf.get('captures_total', 0)} "
+               "were usable here." if wf else ".")
+            + " Neither method establishes which equipment is responsible."))
 
     ss = report.get("spectral_shape", {})
     if ss.get("available"):
@@ -3401,11 +4142,23 @@ def generate_word_report(
 
     hdr = doc.add_paragraph()
     hdr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    _bold(hdr, "Xcel Energy — Power Quality Analysis Report", color=_XE_BLUE, size_pt=14)
+    _bold(hdr, "Xcel Energy — Internal Engineering Report", color=_XE_BLUE, size_pt=14)
+    sub = doc.add_paragraph()
+    # Said on the document itself, not only in its filename: the two documents
+    # for a service look similar at a glance, and the one that carries assumed
+    # limits, assessment blanks and raw diagnostics must not be handed over by
+    # mistake. The customer document is the one written to be sent.
+    _normal(sub, "Power quality analysis — internal working document. "
+                 "The customer document for this service is issued separately.",
+            color=RGBColor(0x66, 0x66, 0x66), size_pt=9)
     doc.add_paragraph()
 
     _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, substation,
-                          fs, nominal_v, nominal_ll)
+                          fs, nominal_v, nominal_ll,
+                          prepared_by=", ".join(
+                              b for b in (engineer_name,
+                                          engineer_title or "Electric Area Engineer")
+                              if b) if engineer_name else "")
 
     opening = doc.add_paragraph()
     opening.add_run(
@@ -3439,15 +4192,16 @@ def generate_word_report(
     _word_key_findings(doc, key_findings)
     _word_engineering_assessment(doc, report)
     _word_recommended_actions(doc, actions)
-    _word_signoff(doc, engineer_name, engineer_title, engineer_phone, engineer_email,
-                  engineer_contact)
+    # No sign-off block: this document is not addressed to anyone. Who prepared
+    # it is recorded in the header table, and the per-finding "Engineer's
+    # assessment" blanks are where an engineer puts their name to a judgment.
     _word_terms_panel(doc, report)
     _word_appendix(doc, report, thresh, df)
     _word_channel_appendix(doc, report, df)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     outdir.mkdir(parents=True, exist_ok=True)
-    out_path = outdir / f"{stem}_report.docx"
+    out_path = outdir / f"{stem}_internal_engineering_report.docx"
     try:
         doc.save(out_path)
     except PermissionError as exc:
@@ -3455,7 +4209,7 @@ def generate_word_report(
             f"Could not write {out_path.name} -- it's likely still open in Word or another "
             "program. Close that document and run the analysis again."
         ) from exc
-    log.info("Word report saved → %s", out_path)
+    log.info("Internal engineering report saved → %s", out_path)
     return out_path
 
 
@@ -3525,11 +4279,69 @@ def _event_counts(event_result: dict) -> Dict[str, int]:
     return counts
 
 
-#: Service classes that get the plain-language letter, and what to call the site.
-#: The classes above these get the engineering report instead, since a facilities
-#: reader can act on distortion and transformer loading and writing down to them
-#: costs credibility.
-_LETTER_CLASSES = {"r": "your home", "c": "your business"}
+#: Every service class gets its own customer document, and they are not the
+#: same document with the address changed. What varies is the register: a
+#: homeowner needs the physics explained and cannot act on distortion; a plant
+#: engineer at a primary-metered site owns the transformer, is billed under a
+#: different tariff sheet, and is insulted by an explanation of what voltage
+#: is. Writing down to that reader costs credibility, and writing up to a
+#: homeowner costs comprehension, so the depth is a property of the class.
+#:
+#: Fields:
+#:   site            what to call the premises
+#:   reader          who this is written for, in one phrase
+#:   explains_basics whether to say what voltage and current are before using them
+#:   pf_sheet        the tariff sheet that bills power factor, None where it doesn't
+#:   owns_transformer whether the customer owns the service transformer
+#:   fix_agent       who they would call to act on something inside the premises
+_LETTER_REGISTER: Dict[str, dict] = {
+    "r": {
+        "site": "your home",
+        "reader": "a homeowner",
+        "explains_basics": True,
+        "pf_sheet": None,
+        "owns_transformer": False,
+        "fix_agent": "a licensed electrician",
+    },
+    "c": {
+        "site": "your business",
+        "reader": "a small business owner",
+        "explains_basics": True,
+        "pf_sheet": "Sheet R73 (Schedule C)",
+        "owns_transformer": False,
+        "fix_agent": "a licensed electrician",
+    },
+    "sg": {
+        "site": "your facility",
+        "reader": "whoever looks after the electrical system on site",
+        "explains_basics": False,
+        "pf_sheet": "Sheet R73 (Schedule SG)",
+        "owns_transformer": False,
+        "fix_agent": "your electrical contractor or maintenance team",
+    },
+    "pg": {
+        "site": "your facility",
+        "reader": "the engineer responsible for the site's electrical system",
+        "explains_basics": False,
+        "pf_sheet": "Sheet R121 (Schedule PG)",
+        "owns_transformer": True,
+        "fix_agent": "your electrical engineer or contractor",
+    },
+}
+
+#: Service classes that get the plain-language letter, and what to call the
+#: site. Every class does; the depth is what differs, per _LETTER_REGISTER.
+_LETTER_CLASSES = {cls: reg["site"] for cls, reg in _LETTER_REGISTER.items()}
+
+
+def _letter_register(customer_class: str) -> dict:
+    """The register for a class, defaulting to the most explanatory one.
+
+    An unrecognised class gets the fullest explanation rather than the
+    tersest: over-explaining to an engineer wastes their time, while
+    under-explaining to a homeowner loses them entirely.
+    """
+    return _LETTER_REGISTER.get(customer_class, _LETTER_REGISTER["r"])
 
 
 def _discard_stale_letter(path: Path, reason: str) -> None:
@@ -3564,7 +4376,8 @@ def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
     120-volt halves; a three-phase business has a neutral shared by three phases,
     and describing it as two halves would simply be wrong.
     """
-    site = _LETTER_CLASSES.get(thresh.customer_class, "your premises")
+    register = _letter_register(thresh.customer_class)
+    site = register["site"]
     topology = (report.get("file_summary") or {}).get("topology", "")
     if topology == "3-phase":
         neutral_measured = (
@@ -3588,7 +4401,12 @@ def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
         neutral_symptom = _SYMPTOMS["neutral"]
     return {"site": site, "neutral_measured": neutral_measured,
             "neutral_symptom": neutral_symptom,
-            "is_business": thresh.customer_class == "c"}
+            # Everything above residential is billed for power factor and can
+            # trace distortion to its own equipment, so all three commercial
+            # classes get those items -- what differs is the tariff sheet and
+            # how much the wording explains.
+            "is_business": thresh.customer_class != "r",
+            "register": register}
 
 
 def _neutral_indicator_sentence(nh: dict) -> str:
@@ -3802,25 +4620,68 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     # neither appears in a residential letter. A small business is billed for one
     # and can often trace the other to specific equipment.
     if vocab["is_business"]:
+        register = vocab["register"]
         if pfr.get("available") and pfr.get("pct_below_limit", 0) > 0:
-            sched = "SG" if thresh.customer_class == "sg" else "C"
+            sheet = register["pf_sheet"] or "the applicable tariff sheet"
+            # Schedule PG asks for near unity rather than a stated 0.90 floor,
+            # so quoting a 0.90 requirement at a primary customer would be
+            # quoting them the wrong tariff.
+            requirement = ("near unity" if thresh.customer_class == "pg"
+                           else "0.90 or better")
+            explanation = (
+                "Power factor describes how much of the current you draw does "
+                "useful work. At a low power factor you draw more current for "
+                "the same output, which loads your wiring and ours without "
+                "producing anything extra. "
+                if register["explains_basics"] else
+                "Reactive demand raises the current for the same real load, "
+                "loading the service without producing output. ")
             out.append({
                 "headline": "Your power factor is below the level the tariff requires",
                 "measured": (
                     f"Power factor averaged {pfr['mean_pf']:.2f} and fell as low as "
-                    f"{pfr['min_pf']:.2f}. The tariff requires 0.90 or better."),
+                    f"{pfr['min_pf']:.2f}. PSCo Electric Tariff {sheet} requires "
+                    f"{requirement}."),
                 "means": (
-                    "Power factor describes how much of the current you draw does "
-                    "useful work. At a low power factor you draw more current for "
-                    "the same output, which loads your wiring and ours without "
-                    "producing anything extra. Under PSCo Electric Tariff Sheet R73 "
-                    f"(Schedule {sched}) a power factor below 0.90 can attract a "
-                    "billing adjustment, so this one usually pays for itself to fix. "
-                    "The normal remedy is power factor correction capacitors, which "
-                    "an electrical contractor can size and install."),
+                    explanation
+                    + f"Under {sheet} this can attract a billing adjustment, so "
+                    "correcting it usually pays for itself. The normal remedy is "
+                    "power factor correction capacitors, which "
+                    + register["fix_agent"] + " can size and install."),
                 "symptom": (
                     "Nothing you would see or hear. This shows up on the bill "
                     "rather than in how equipment behaves."),
+            })
+
+        # Transformer loading, for the classes whose demand actually drives it.
+        # A homeowner owns no transformer and a small commercial customer
+        # cannot act on one; at SG and PG the loading is a planning number the
+        # site's own growth decides, and at PG they own the transformer.
+        dem = report.get("demand") or {}
+        tx = dem.get("transformer") or {}
+        if thresh.customer_class in ("sg", "pg") and tx.get("overloaded"):
+            owner = ("your transformer" if register["owns_transformer"]
+                     else "the transformer serving your facility")
+            out.append({
+                "headline": f"Demand is running above the rating of {owner}",
+                "measured": (
+                    f"The highest 8-hour average demand was "
+                    f"{tx['peak_8h_kva']:.0f} kVA against a "
+                    f"{tx['nameplate_kva']:.0f} kVA nameplate — "
+                    f"{tx['pct_nameplate']:.0f}% of rating."),
+                "means": (
+                    "Sustained loading above nameplate shortens transformer "
+                    "insulation life and reduces the headroom available for "
+                    "load growth. "
+                    + ("As the transformer owner, planning its replacement or "
+                       "uprating is yours to schedule; we can discuss the "
+                       "loading figures behind this."
+                       if register["owns_transformer"] else
+                       "Tell us before adding significant load, so the service "
+                       "can be reviewed against it.")),
+                "symptom": (
+                    "Voltage that sags at peak production and recovers when "
+                    "large equipment stops. Transformer running hot or noisy."),
             })
 
         # Distortion, stated plainly and without per-order detail: enough to know
@@ -3917,29 +4778,20 @@ def generate_customer_letter(
     engineer_phone: str = "",
     engineer_email: str = "",
 ) -> Optional[Path]:
-    """Write the plain-language customer letter.
+    """Write the customer document for this service class.
 
-    Residential and small commercial (under 50 kW) only. Above that the
-    engineering report is the customer document: a facilities reader can act on
-    distortion and transformer loading, and writing down to them costs
-    credibility. Returns None for the classes that get the report instead.
-
-    The two supported classes differ in vocabulary and in two extra conditions:
-    a small business is billed for power factor and can usually trace waveform
-    distortion to specific equipment, where a homeowner can do neither.
+    Every class gets one, and the engineering report is never the customer
+    document -- that stays internal. What changes between classes is the
+    register: a homeowner is told what voltage is before a voltage is quoted;
+    a primary-metered site is not, is billed under a different tariff sheet,
+    and owns its own transformer. The depth comes from ``_LETTER_REGISTER``
+    and the conditions from ``_customer_conditions``, so a class is added by
+    describing its reader rather than by branching through the prose.
     """
     path = Path(outdir) / f"{stem}_customer_letter.docx"
     if not _DOCX_AVAILABLE:
         log.warning("python-docx not installed — skipping customer letter.")
         _discard_stale_letter(path, "python-docx is not installed")
-        return None
-    if thresh.customer_class not in _LETTER_CLASSES:
-        log.info(
-            "No plain-language letter for service class %r: at that scale the "
-            "engineering report is the customer document, with its terms defined "
-            "in place.", thresh.customer_class)
-        _discard_stale_letter(path, f"service class {thresh.customer_class!r} "
-                                    "gets the engineering report instead")
         return None
 
     # Clear the previous letter before doing the work, not after: if this run
@@ -3984,14 +4836,23 @@ def generate_customer_letter(
     doc.add_paragraph()
 
     # ── Why you received this ─────────────────────────────────────────────
+    register = vocab["register"]
     _section_heading(doc, "Why you received this", level=1)
-    _body(doc,
-        f"You contacted us about the electricity supply at {vocab['site']}. We "
-        "fitted a "
-        "recording meter at your service for the period shown above. It measured "
-        "the voltage and current many times a second and stored a summary every "
-        "few minutes. This letter explains what those measurements show, in plain "
-        "terms.")
+    if register["explains_basics"]:
+        _body(doc,
+            f"You contacted us about the electricity supply at {vocab['site']}. "
+            "We fitted a recording meter at your service for the period shown "
+            "above. It measured the voltage and current many times a second and "
+            "stored a summary every few minutes. This letter explains what those "
+            "measurements show, in plain terms.")
+    else:
+        # No explanation of what a meter does: this reader specifies them.
+        _body(doc,
+            f"A power quality recorder was installed at the service to "
+            f"{vocab['site']} for the period shown above, logging voltage, "
+            "current, distortion and disturbance events at interval resolution. "
+            "This letter sets out what the recording shows, what each figure is "
+            "measured against, and what follows from it.")
 
     # ── What we recorded ──────────────────────────────────────────────────
     # The whole recording on one page, before any finding is described. A
@@ -4006,7 +4867,10 @@ def generate_customer_letter(
             f"{vocab['site']}; the lower half is the current, which is how much "
             "electricity was being used at the time. You do not need to read "
             "anything into the detail — it is here so you can see the whole "
-            "period the findings below are drawn from.")
+            "period the findings below are drawn from."
+            if register["explains_basics"] else
+            "Voltage and current across the whole recording, so the findings "
+            "below can be read against the conditions they came from.")
         _embed_plot(doc, outdir, stem, "overview.png",
                     caption="Voltage and current recorded at your service.")
         doc.add_paragraph()
@@ -4084,8 +4948,11 @@ def generate_customer_letter(
         "end of this letter. Where the results point to something on our equipment, "
         f"we follow it up. Where they point to wiring or equipment inside "
         f"{vocab['site']}, "
-        "a licensed electrician is the right person to look at it. The engineer's "
-        "notes below say which applies in your case.")
+        + register["fix_agent"] + " is the right party to look at it. The "
+        "engineer's notes below say which applies in your case."
+        + ("" if not register["owns_transformer"] else
+           " The service transformer at this site is yours, so anything found "
+           "on it falls to you to schedule."))
 
     note = doc.add_paragraph()
     _bold(note, "Engineer's notes for this service:", size_pt=10)

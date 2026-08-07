@@ -974,6 +974,103 @@ def plot_pf_load(
     _save(fig, outdir, stem, "pf_load.png")
 
 
+def plot_flicker(
+    df: pd.DataFrame,
+    flicker_result: dict,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Short- and long-term flicker severity over time, and how long each lasted.
+
+    Three panels because the two timelines alone cannot answer the question a
+    reader actually has. A Pst trace with one spike at 5.0 and a trace that
+    sits over the limit all week look similarly alarming at a glance, and they
+    are not the same finding. The third panel sorts every reading from worst
+    to best against the share of the recording at or above it, so the width of
+    the exceedance is visible: a curve that crosses the limit line near the
+    left edge is an anomaly, one that crosses far to the right is a condition.
+    The 95th-percentile mark is drawn on it because that is the point both
+    IEC 61000-3-3 and IEEE 1453 actually assess, and the severity band in the
+    report is graded there rather than at the maximum.
+    """
+    if not flicker_result.get("available"):
+        return
+
+    panels = [(kind, label, flicker_result[f"{kind}_limit"])
+              for kind, label in (("pst", "Pst — short-term (10 min)"),
+                                  ("plt", "Plt — long-term (2 h)"))
+              if flicker_result.get(kind)]
+    if not panels:
+        return
+
+    fig, axes = plt.subplots(len(panels) + 1, 1,
+                             figsize=(14, 3.6 * (len(panels) + 1)))
+    axes = np.atleast_1d(axes)
+
+    for ax, (kind, label, limit) in zip(axes, panels):
+        for phase, stats in sorted(flicker_result[kind].items()):
+            col = stats["column"]
+            if col not in df.columns:
+                continue
+            series = df[col].dropna()
+            ax.plot(series.index, series, lw=0.9,
+                    color=_PHASE_CLR.get(phase.lower(), "gray"),
+                    label=f"{phase}  (95th pct {stats['p95']:.2f}, "
+                          f"max {stats['max']:.2f})")
+            over = series[series > limit]
+            if not over.empty:
+                ax.scatter(over.index, over, s=9, color="#CC0000",
+                           zorder=3, edgecolors="none")
+        ax.axhline(limit, color="red", ls="--", lw=1.0,
+                   label=f"IEC 61000-3-3 limit ({limit:.2f})")
+        if kind == "plt":
+            # The level the supply system is held to, which is not the same
+            # number as the equipment emission limit above.
+            ax.axhline(0.8, color="#888888", ls=":", lw=1.0,
+                       label="IEEE 1453 LV compatibility level (0.80)")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        _fmt_time_axis(ax, df.index)
+
+    # ── how much of the recording each level occupied ────────────────────────
+    ax = axes[-1]
+    for kind, label, limit in panels:
+        for phase, stats in sorted(flicker_result[kind].items()):
+            col = stats["column"]
+            if col not in df.columns:
+                continue
+            values = np.sort(df[col].dropna().to_numpy(float))[::-1]
+            if not len(values):
+                continue
+            share = np.arange(1, len(values) + 1) / len(values) * 100.0
+            ax.plot(share, values, lw=1.2,
+                    ls="-" if kind == "pst" else "--",
+                    color=_PHASE_CLR.get(phase.lower(), "gray"),
+                    label=f"{kind.title()} {phase}")
+        # Two limit lines share this panel, so each is named at the right edge
+        # rather than leaving the reader to infer which is which.
+        ax.axhline(limit, color="red", ls="--", lw=0.8, alpha=0.7)
+        ax.annotate(f"{kind.title()} limit {limit:.2f}", xy=(100, limit),
+                    xytext=(-4, 3), textcoords="offset points",
+                    ha="right", va="bottom", fontsize=8, color="#CC0000")
+
+    ax.axvline(5.0, color="#333333", ls=":", lw=1.0)
+    ax.annotate("95th percentile\n(what the standards assess)", xy=(5.0, ax.get_ylim()[1]),
+                xytext=(8.0, ax.get_ylim()[1] * 0.92), fontsize=8, color="#333333")
+    ax.set_xlabel("Share of the recording at or above this severity (%)")
+    ax.set_ylabel("Flicker severity")
+    ax.set_title("How long each level lasted — narrow at the left is an anomaly, "
+                 "wide to the right is a condition")
+    ax.set_xlim(0, 100)
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    _save(fig, outdir, stem, "flicker.png")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # POINT-ON-WAVE CAPTURE SNAPSHOT
 # ─────────────────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.22.0"
+__version__ = "0.29.1"
 
 
 @dataclass
@@ -32,6 +32,11 @@ class Thresholds:
     # phase is simply missing from the export.
     service_type: Optional[str] = None    # e.g. "1ph-padmount", "3ph-padmount"
     topology: str = "auto"                # "auto" | "3ph-wye" | "split-phase"
+    # The run between the transformer and the meter, picked at the start. Both
+    # are needed before a measured impedance can be compared with an expected
+    # one; without them the measurement still stands on its own.
+    conductor_key: Optional[str] = None   # key into _CONDUCTOR_TABLE
+    run_length_ft: Optional[float] = None # transformer → meter, one way
     # Spectral-shape ("broadband vs. resonance") classifier -- heuristic starting
     # points, not yet empirically validated across many sites. See check_spectral_shape().
     spectral_elevation_ratio: float = 0.4  # mean VTHD / thd_voltage_limit above this = "elevated"
@@ -682,6 +687,68 @@ _BLUE_BOOK_IMPEDANCE: Dict[str, List[Tuple[int, int, float, float]]] = {
     ],
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVICE CONDUCTOR IMPEDANCE
+#
+# GENERIC PUBLISHED VALUES, NOT PSCo BLUE BOOK VALUES. Resistance is NEC
+# Chapter 9 Table 8 (stranded, uncoated, 75 °C); reactance is a typical value
+# for the construction, since Table 9's conduit figures do not describe a
+# triplex drop. Every expected-impedance figure the report prints from this
+# table is labelled as generic, so nobody reads the comparison as tighter than
+# it is.
+#
+# To replace a row with a Blue Book figure, edit the two numbers here: they are
+# ohms per 1000 ft per conductor at 75 °C and 60 Hz, and nothing else in the
+# code carries conductor constants.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: key → (label, R Ω/1000 ft, X Ω/1000 ft)
+_CONDUCTOR_TABLE: Dict[str, Tuple[str, float, float]] = {
+    # Overhead triplex/quadruplex aluminum — the usual residential drop.
+    "al-2-triplex":    ("#2 AL triplex (overhead drop)",        0.319, 0.035),
+    "al-1-0-triplex":  ("1/0 AL triplex (overhead drop)",       0.201, 0.035),
+    "al-2-0-triplex":  ("2/0 AL triplex (overhead drop)",       0.159, 0.035),
+    "al-4-0-triplex":  ("4/0 AL triplex (overhead drop)",       0.100, 0.035),
+    # Underground residential distribution — direct-buried aluminum.
+    "al-2-urd":        ("#2 AL URD (underground service)",      0.319, 0.030),
+    "al-1-0-urd":      ("1/0 AL URD (underground service)",     0.201, 0.030),
+    "al-4-0-urd":      ("4/0 AL URD (underground service)",     0.100, 0.030),
+    "al-350-urd":      ("350 kcmil AL URD (underground)",       0.0611, 0.030),
+    # Copper, for older services.
+    "cu-4":            ("#4 CU service conductor",              0.308, 0.050),
+    "cu-2":            ("#2 CU service conductor",              0.194, 0.050),
+    "cu-1-0":          ("1/0 CU service conductor",             0.122, 0.050),
+}
+
+
+def conductor_options() -> List[Tuple[str, str]]:
+    """(key, label) pairs for the picker, in table order."""
+    return [(key, label) for key, (label, _r, _x) in _CONDUCTOR_TABLE.items()]
+
+
+def conductor_impedance(key: str, length_ft: float,
+                        return_path: bool = True) -> Optional[Tuple[float, float]]:
+    """(R, X) in ohms for *length_ft* of this conductor, as the load sees it.
+
+    A line-to-neutral load's current goes out on a phase conductor and back on
+    the neutral, so the impedance in its voltage drop is both conductors, not
+    one. ``return_path=False`` gives the one-way value, which is what a
+    balanced three-phase load sees because its neutral carries almost nothing.
+    """
+    row = _CONDUCTOR_TABLE.get(key)
+    if row is None or not length_ft or length_ft <= 0:
+        return None
+    _label, r_per_kft, x_per_kft = row
+    conductors = 2.0 if return_path else 1.0
+    scale = conductors * length_ft / 1000.0
+    return r_per_kft * scale, x_per_kft * scale
+
+
+def conductor_label(key: Optional[str]) -> Optional[str]:
+    row = _CONDUCTOR_TABLE.get(key or "")
+    return row[0] if row else None
+
+
 # Service type → human label for report display
 _SERVICE_TYPE_LABEL: Dict[str, str] = {
     "1ph-overhead":      "Single-phase overhead",
@@ -817,6 +884,98 @@ def _lookup_isc(service_type: str, kva: float, nominal_v: float) -> Optional[Tup
         return isc, note
 
     return None
+
+
+def expected_service_impedance(thresh: "Thresholds") -> dict:
+    """What the impedance from the source to the meter ought to be.
+
+    Built from what the engineer already picks at the start, in two parts:
+
+    * everything upstream of the service conductors. Where the Blue Book ISC
+      is known it is the honest number for this, because a fault current at
+      the transformer terminals already contains the primary system and the
+      transformer together: Z = V_LN / ISC. Without it, the transformer's own
+      impedance range is used and the total is a floor rather than an
+      estimate, since the primary system is then missing from it.
+    * the service conductors, from the picked type and run length.
+
+    Returns the parts as well as the total: an engineer comparing a measured
+    figure against this needs to see which term dominates it.
+    """
+    v_ln = thresh.nominal_voltage
+    single_phase = (thresh.topology == "split-phase"
+                    or (thresh.service_type or "").startswith("1ph"))
+    out: dict = {
+        "available": False,
+        "single_phase": single_phase,
+        "conductor_label": conductor_label(thresh.conductor_key),
+        "run_length_ft": thresh.run_length_ft,
+        "generic_conductor_constants": True,
+    }
+
+    # ── upstream of the service conductors ───────────────────────────────────
+    z_upstream: Optional[float] = None
+    z_transformer: Optional[Tuple[float, float]] = None
+    if thresh.transformer_kva and thresh.service_type:
+        pct = _impedance_range(thresh.service_type, thresh.transformer_kva)
+        if pct:
+            # V²/S on the base the meter sees: for a 120/240 service the L-N
+            # path is through half the winding, which is what V_LN²/S gives.
+            s_phase = thresh.transformer_kva * 1000.0 / (1.0 if single_phase else 3.0)
+            z_transformer = tuple(p / 100.0 * v_ln ** 2 / s_phase for p in pct)
+            out["transformer_pct"] = pct
+            out["transformer_ohm_range"] = z_transformer
+
+    if thresh.isc_amps:
+        z_upstream = v_ln / float(thresh.isc_amps)
+        out["upstream_ohm"] = z_upstream
+        out["upstream_source"] = (
+            f"V_LN / ISC ({thresh.isc_amps:,.0f} A) — the primary system and "
+            "the transformer together, as the Blue Book fault current has them"
+        )
+    elif z_transformer:
+        z_upstream = sum(z_transformer) / 2.0
+        out["upstream_ohm"] = z_upstream
+        out["upstream_source"] = (
+            "the transformer impedance range alone; no ISC was resolved, so "
+            "the primary system is not included and the total below is a floor"
+        )
+        out["upstream_is_floor"] = True
+
+    # ── the service conductors ───────────────────────────────────────────────
+    conductor = conductor_impedance(thresh.conductor_key or "",
+                                    thresh.run_length_ft or 0.0,
+                                    return_path=single_phase)
+    if conductor:
+        r_c, x_c = conductor
+        out["conductor_r_ohm"] = r_c
+        out["conductor_x_ohm"] = x_c
+        out["conductor_z_ohm"] = float(_np.hypot(r_c, x_c))
+        out["conductor_path"] = (
+            "phase and neutral, since a line-to-neutral load's current returns "
+            "on the neutral" if single_phase else
+            "one way, since a balanced three-phase load's neutral carries "
+            "almost nothing"
+        )
+
+    if z_upstream is None and conductor is None:
+        out["reason"] = (
+            "No expected impedance: it needs the transformer kVA or the "
+            "short-circuit current, and the service conductor type and run "
+            "length."
+        )
+        return out
+
+    out["available"] = True
+    out["total_ohm"] = (z_upstream or 0.0) + (out.get("conductor_z_ohm") or 0.0)
+    missing = []
+    if z_upstream is None:
+        missing.append("the transformer and primary system")
+    if conductor is None:
+        missing.append("the service conductors")
+    if missing:
+        out["partial"] = " and ".join(missing)
+    return out
 
 
 def _impedance_range(service_type: str, kva: float) -> Optional[Tuple[float, float]]:

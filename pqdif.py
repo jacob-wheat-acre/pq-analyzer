@@ -572,6 +572,30 @@ def _parse_collection(body: bytes, offset: int) -> List[Element]:
     return out
 
 
+def _plausible_collection(body: bytes) -> bool:
+    """Could these bytes be a record body that was never compressed?
+
+    Checked before treating a body that will not inflate as plain elements:
+    a count and element table whose every link and size stays inside the body
+    is far too consistent to arise from compressed or damaged bytes, so it is
+    a safe signal that the writer simply did not compress this record.
+    """
+    if len(body) < 4 + _ELEMENT_SIZE:
+        return False
+    count = struct.unpack_from("<I", body, 0)[0]
+    if count == 0 or 4 + count * _ELEMENT_SIZE > len(body):
+        return False
+    for i in range(count):
+        base = 4 + i * _ELEMENT_SIZE
+        etype = body[base + 16]
+        link, size = struct.unpack_from("<II", body, base + 20)
+        if etype not in (ELEMENT_COLLECTION, ELEMENT_SCALAR, ELEMENT_VECTOR):
+            return False
+        if link + size > len(body):
+            return False
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Records
 # ─────────────────────────────────────────────────────────────────────────────
@@ -591,53 +615,169 @@ class Record:
     #: the file was cut short -- an interrupted export or copy, not a format
     #: the reader fails to understand.
     missing_bytes: int = 0
+    #: Bytes from the start of this body to wherever the next record begins
+    #: (or to end of file for the last record). The linked list, not the size
+    #: field, is the authority on where a record physically ends, so this is
+    #: what a size field that under-declares its own body is measured against.
+    span_body: bytes = b""
+    #: Whether a record header really does begin where this one links to.
+    #: Distinguishes damage confined to one body from a broken record chain.
+    next_header_intact: Optional[bool] = None
 
     def body(self, compressed: bool) -> Element:
         """Root collection of this record's body, decompressing if needed.
 
         The container record is never compressed, even under record-level
         compression (clause 6.2).
-
-        A truncated file leaves the final record's body short, which zlib
-        reports as an incomplete stream.  Whatever did decompress is still
-        usable -- the elements that were fully written parse normally -- so a
-        partial inflate is attempted before giving up, and the shortfall is
-        named in the error either way.
         """
         data = self.raw_body
         if compressed and self.tag != TAG_CONTAINER:
-            try:
-                data = zlib.decompress(data)
-            except zlib.error as exc:
-                salvaged = self._partial_inflate()
-                shortfall = (
-                    f"; the header declares a {self.body_size}-byte body but "
-                    f"{self.missing_bytes} bytes are missing from the end of the "
-                    "file, so the file itself is truncated"
-                    if self.missing_bytes else ""
-                )
-                if salvaged is None:
-                    raise PQDIFError(
-                        f"record at {self.position} ({self.tag}) declared "
-                        f"record-level zlib compression but did not decompress: "
-                        f"{exc}{shortfall}"
-                    ) from exc
-                log.warning(
-                    "record at %d (%s) is incomplete (%s)%s; recovered %d bytes "
-                    "and reading what was fully written",
-                    self.position, self.tag, exc, shortfall, len(salvaged),
-                )
-                data = salvaged
+            data = self._inflated()
         return Element(self.tag, ELEMENT_COLLECTION, 0, False, 0, len(data), data)
 
-    def _partial_inflate(self) -> Optional[bytes]:
-        """Inflate as much of a truncated body as zlib can produce."""
-        decompressor = zlib.decompressobj()
+    def _inflated(self) -> bytes:
+        """The body inflated, with the recoverable failures recovered.
+
+        Four things go wrong in the field, and only one of them means the
+        measurements are actually gone:
+
+        * the file was cut short, leaving the last body incomplete -- whatever
+          did inflate is still usable, since the elements that were fully
+          written parse normally;
+        * the size field under-declares the compressed length, so the slice it
+          describes ends mid-stream while every byte is present in the file --
+          re-inflate bounded by the next record instead;
+        * the record was written uncompressed inside a compressed file -- read
+          it as it stands;
+        * the stream is damaged -- inflate whatever prefix zlib will give.
+
+        Only when none of those yields anything does the record fail, and it
+        fails carrying the evidence for why: these files are customer data
+        that often cannot be sent anywhere for a second opinion, so the message
+        has to be enough to diagnose the file in its absence.
+        """
         try:
-            out = decompressor.decompress(self.raw_body)
-        except zlib.error:
-            return None
-        return out or None
+            return zlib.decompress(self.raw_body)
+        except zlib.error as exc:
+            first_error = exc
+
+        # The size field under-declares the body: the rest of the stream is
+        # sitting in the file, between here and the next record header.
+        if len(self.span_body) > len(self.raw_body):
+            try:
+                data = zlib.decompress(self.span_body)
+            except zlib.error:
+                pass
+            else:
+                log.warning(
+                    "record at %d (%s) declares a %d-byte body but its "
+                    "compressed stream runs %d bytes, to the next record "
+                    "header; inflated the full stream (%d bytes)",
+                    self.position, self.tag, self.body_size,
+                    len(self.span_body), len(data),
+                )
+                return data
+
+        # A record written uncompressed inside a compressed file.
+        for candidate in (self.raw_body, self.span_body):
+            if _plausible_collection(candidate):
+                log.warning(
+                    "record at %d (%s) does not inflate (%s) but parses as an "
+                    "uncompressed collection; reading it as written",
+                    self.position, self.tag, first_error,
+                )
+                return candidate
+
+        salvaged = self._partial_inflate()
+        if salvaged is not None:
+            log.warning(
+                "record at %d (%s) is incomplete (%s)%s; recovered %d bytes "
+                "and reading what was fully written",
+                self.position, self.tag, first_error,
+                f"; {self.missing_bytes} bytes are missing from the end of the "
+                "file" if self.missing_bytes else "",
+                len(salvaged),
+            )
+            return salvaged
+
+        raise PQDIFError(
+            f"record at {self.position} ({self.tag}) declared record-level "
+            f"zlib compression but did not decompress: {first_error}. "
+            + self._failure_evidence()
+        ) from first_error
+
+    def _partial_inflate(self) -> Optional[bytes]:
+        """Inflate as much of a damaged body as zlib can produce.
+
+        Tried against the full span as well as the declared slice: when the
+        size field is the thing that is wrong, the declared slice is the
+        shorter of the two and gives up sooner.
+        """
+        best: Optional[bytes] = None
+        for candidate in (self.raw_body, self.span_body):
+            for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+                try:
+                    out = zlib.decompressobj(wbits).decompress(candidate)
+                except zlib.error:
+                    continue
+                if out and (best is None or len(out) > len(best)):
+                    best = out
+        return best
+
+    def _failure_evidence(self) -> str:
+        """Why this record could not be read, in terms a file's owner can see.
+
+        Written to be pasted back on its own: whoever holds the file may not
+        be able to share it, so the message states the measurements that
+        separate a damaged file (re-export it) from a file this reader is
+        reading wrongly (fix the reader). Everything named here is structural
+        -- sizes, offsets and the compression header -- and none of it carries
+        measurements or customer identity.
+        """
+        head = self.raw_body[:8]
+        zlib_header = (
+            "absent" if len(head) < 2
+            else "valid" if head[0] & 0x0F == 8 and (head[0] << 8 | head[1]) % 31 == 0
+            else "not a zlib header"
+        )
+        chain = (
+            "unknown" if self.next_header_intact is None
+            else f"intact at {self.next_position}" if self.next_header_intact
+            else f"NOT a record header at {self.next_position}"
+        )
+        salvage = self._partial_inflate()
+
+        if self.missing_bytes:
+            verdict = (
+                f"The file is {self.missing_bytes} bytes shorter than this "
+                "record's header declares, so the file itself was cut short -- "
+                "an export or copy that ended early. Re-export it."
+            )
+        elif zlib_header == "valid":
+            verdict = (
+                "Every byte the header declares is present, and the body does "
+                "begin with a valid zlib header, but no complete deflate block "
+                "follows it. The compressed stream is damaged in place rather "
+                "than missing from the end of the file."
+            )
+        else:
+            verdict = (
+                "Every byte the header declares is present, but the body does "
+                "not begin with a zlib stream at all, so either this record "
+                "was not compressed in a form this reader knows or its first "
+                "bytes were overwritten."
+            )
+
+        return (
+            verdict + " Evidence: declared_body=" + str(self.body_size)
+            + f" present={len(self.raw_body)}"
+            + f" to_next_record={len(self.span_body)}"
+            + f" next_header={chain}"
+            + f" zlib_header={zlib_header}"
+            + f" first_bytes={head.hex(' ') or 'none'}"
+            + f" partial_inflate={len(salvage) if salvage else 0}"
+            + f" parses_uncompressed={'yes' if _plausible_collection(self.raw_body) else 'no'}."
+        )
 
 
 def _walk_records(data: bytes) -> List[Record]:
@@ -669,12 +809,24 @@ def _walk_records(data: bytes) -> List[Record]:
                 "interrupted.",
                 tag, pos, body_size, body_end, len(data), missing,
             )
+        # Where the record physically ends, as the linked list has it. A size
+        # field that disagrees with this is a writer bug the reader can work
+        # around; the link is what the rest of the file is built on.
+        span_end = next_pos if 0 < next_pos <= len(data) else len(data)
+        next_header_intact = None
+        if next_pos and next_pos + 16 <= len(data):
+            next_header_intact = (
+                uuid.UUID(bytes_le=data[next_pos:next_pos + 16]) == RECORD_SIGNATURE
+            )
+
         records.append(Record(
             position=pos, signature=signature, tag=tag,
             header_size=header_size, body_size=body_size,
             next_position=next_pos, checksum=checksum,
             raw_body=data[body_start:body_end],
             missing_bytes=missing,
+            span_body=data[body_start:max(span_end, body_start)],
+            next_header_intact=next_header_intact,
         ))
         if next_pos == 0:
             break
