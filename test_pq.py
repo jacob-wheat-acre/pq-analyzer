@@ -3223,6 +3223,46 @@ class TestLoadSignatureMixtures:
         assert all(t["n"] == _MIX_TRIALS for _, _, t in rows)
 
 
+class TestFamilyLevelRecommendations:
+    """Advice must be written for the family, since the member is not reported.
+
+    Inside a family the member advice contradicted itself -- "verify existing
+    input reactors are in service" against "add reactors", "verify the
+    phase-shifting transformer" against "no action required" -- and which one
+    printed turned on a member score gap the finding calls meaningless.
+    """
+
+    def test_every_family_has_a_recommendation(self):
+        from pq_constants import LOAD_FAMILY_LABEL, LOAD_FAMILY_RECOMMENDATION
+        assert set(LOAD_FAMILY_RECOMMENDATION) == set(LOAD_FAMILY_LABEL)
+
+    def test_the_finding_carries_the_family_advice_not_the_members(self):
+        from pq_constants import LOAD_FAMILY_RECOMMENDATION, _LOAD_SIGNATURES
+        f = _sig_run(np.array([2, 23, 9, 1, 5, 4], dtype=float), cls="sg")[0]
+        assert f["recommendation"] == LOAD_FAMILY_RECOMMENDATION["six_pulse"]
+        nearest = next(s for s in _LOAD_SIGNATURES
+                       if s["id"] == f["evidence"]["signature_id"])
+        assert f["recommendation"] != nearest["recommendation"]
+
+    def test_no_family_advice_assigns_responsibility(self):
+        # The tool states evidence; the engineer assigns responsibility.
+        from pq_constants import LOAD_FAMILY_RECOMMENDATION
+        for fam, text in LOAD_FAMILY_RECOMMENDATION.items():
+            low = text.lower()
+            assert "responsibility" not in low, fam
+            assert "xcel energy will" not in low, fam
+
+    def test_triplen_neutral_advice_names_the_geometry_it_needs(self):
+        # These families reach residential services, where the legs are
+        # collinear and triplens subtract in the neutral instead of adding.
+        from pq_constants import LOAD_FAMILY_RECOMMENDATION
+        for fam in ("single_phase_switchmode", "mixed_single_phase",
+                    "mixed_three_phase"):
+            text = LOAD_FAMILY_RECOMMENDATION[fam]
+            if "neutral" in text.lower():
+                assert "four-wire" in text, fam
+
+
 class TestLoadSignaturesRespectCustomerClass:
     """Load-type matching must not offer equipment the service cannot have.
 
@@ -3971,7 +4011,27 @@ class TestChannelAppendix:
         heads = [p.text for p in doc.paragraphs if p.text.startswith("Appendix")]
         assert heads == ["Appendix A: Terms Used in This Report",
                          "Appendix B: Standards, Methods, and Limitations",
-                         "Appendix C: Channels Read From the Meter File"]
+                         "Appendix C: Channels Read From the Meter File",
+                         "Appendix D: Load Signature Matching (Experimental)"]
+
+    def test_the_experimental_appendix_is_last(self, doc):
+        # Load-signature matching is the weakest analysis in the report and is
+        # not part of the compliance assessment, so it sits at the very bottom.
+        heads = [p.text for p in doc.paragraphs if p.text.startswith("Appendix")]
+        assert heads[-1].startswith("Appendix D")
+
+    def test_signature_findings_are_out_of_the_assessment(self, doc):
+        # They used to sit among the measured findings, which gave a hypothesis
+        # the standing of a measurement.
+        texts = [p.text for p in doc.paragraphs]
+        assess = texts.index(
+            "Engineering Assessment: Likely Causes and Contributing Conditions")
+        appendix_d = next(i for i, t in enumerate(texts)
+                          if t.startswith("Appendix D"))
+        for i, t in enumerate(texts):
+            if "load family" in t.lower() or "load signature" in t.lower():
+                assert not (assess < i < appendix_d), \
+                    f"signature text inside the assessment: {t[:70]!r}"
 
     def test_the_glossary_is_reachable_from_the_body(self, doc):
         # The definitions moved to the back, so the body has to say where they

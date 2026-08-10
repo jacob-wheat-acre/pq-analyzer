@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.32.0"
+__version__ = "0.33.0"
 
 
 @dataclass
@@ -124,6 +124,123 @@ LOAD_FAMILY_LABEL = {
     "near_linear":            "Near-linear or inverter-interfaced load",
 }
 
+#: Candidate actions, written per *family* rather than per entry.
+#:
+#: The finding names the family and refuses to name the member, so attaching one
+#: member's advice would smuggle the member claim back in through the body --
+#: and inside a family that advice contradicts itself.  "six_pulse" held one
+#: entry saying "verify existing input reactors are in service" and another
+#: saying "add reactors"; "multipulse" held "verify the phase-shifting
+#: transformer" against "no action required".  Which one printed turned on a
+#: member score gap the same finding calls meaningless.
+#:
+#: Each entry is therefore verification-first: it says how to tell the members
+#: apart on site, and what follows from each answer.  Where the advice depends
+#: on triplens accumulating in the neutral it says so, because these families
+#: reach residential services where the legs are collinear and triplens
+#: subtract instead -- see `service_geometry` in pq_analysis.
+LOAD_FAMILY_RECOMMENDATION = {
+    "six_pulse": (
+        "Identify the 6-pulse rectifier loads at this service — variable "
+        "frequency drives, double-conversion UPS units and DC fast chargers "
+        "all present this way — and establish whether input reactors or DC bus "
+        "chokes are fitted and in service. H11 and H13 elevated relative to H5 "
+        "indicates reactors absent or bypassed; with 3–5% impedance reactors "
+        "fitted, H11/H13 typically fall to around a fifth of H5. Where "
+        "reactors are missing, adding them reduces H5/H7 by 30–50% and extends "
+        "input diode life. Where they are already in service and TDD remains "
+        "above the limit, 12-pulse, 18-pulse or active front-end equipment, or "
+        "a harmonic filter, are the next steps. Current DC fast chargers "
+        "commonly use 12-pulse or active PFC front ends — confirm against "
+        "equipment specifications rather than assuming a 6-pulse one."
+    ),
+    "multipulse": (
+        "Multi-pulse and active-front-end equipment is already a harmonic "
+        "mitigation measure, so this family is not usually the thing to "
+        "change. If TDD remains above the limit, confirm which is installed "
+        "and check it is working as designed: on a 12-pulse drive, verify the "
+        "phase-shifting transformer is balanced between the two rectifier "
+        "bridges, since imbalance between bridges reintroduces the 5th and 7th "
+        "the topology exists to cancel. On an 18-pulse or active front-end "
+        "unit there is normally nothing to correct, and other loads at this "
+        "service are the more likely contributors. An active harmonic filter "
+        "is the remaining option after that."
+    ),
+    "single_phase_switchmode": (
+        "Survey the single-phase electronic loads at this service — computers "
+        "and servers, electronic ballasts and LED drivers share this "
+        "signature. The action depends on which dominates. Magnetic-ballast "
+        "fluorescent fixtures are worth retrofitting to electronic ballasts or "
+        "LED. Budget LED drivers without active power factor correction are "
+        "worth addressing on procurement: specify PF > 0.90 and THD < 20%, and "
+        "note IEC 61000-3-2 Class C applies to lighting. Where the load is "
+        "concentrated computing equipment the equipment itself is not usually "
+        "what changes — verify instead that the neutral conductor is rated for "
+        "the harmonic current it carries, since on a three-phase four-wire "
+        "system triplens from these loads add in the neutral rather than "
+        "cancelling, and consider a K-rated or isolation transformer."
+    ),
+    "mixed_single_phase": (
+        "Establish which single-phase electronic load is present: a Level 2 "
+        "charger's on-board rectifier and an inverter-driven heat pump or "
+        "mini-split produce a similar signature, and both are cyclic. Neither "
+        "normally justifies mitigation at a single residence. Where several "
+        "units share one transformer the aggregate matters more than any one "
+        "of them — check the transformer's total loading, and on a three-phase "
+        "four-wire secondary whether H3 is accumulating in the neutral. For "
+        "clustered or fleet charging, managed charging and transformer sizing "
+        "are the levers, and three-phase DC fast chargers with active PFC "
+        "front ends are preferable to co-located single-phase units."
+    ),
+    "arcing": (
+        "Arc loads are intermittent by nature and the response scales with "
+        "size. For welding, scheduling operations to avoid coincident peaks is "
+        "usually the first step, with a series reactor or active power filter "
+        "for large or continuous loads. For furnace-scale arc loads a "
+        "dedicated harmonic study and dynamic compensation — a static VAR "
+        "compensator or STATCOM — are normally required rather than optional. "
+        "Either way, read the flicker measurement alongside this: arc loads "
+        "act on voltage flicker at least as much as on harmonics, and Pst "
+        "above 1.0 warrants coordination with Xcel Energy before mitigation is "
+        "specified. Arc furnace installations are subject to pre-approval "
+        "under tariff."
+    ),
+    "near_linear": (
+        "Neither load in this family is normally a significant distortion "
+        "source and mitigation is rarely warranted. Establish which is present "
+        "before acting. Distortion that follows the solar day points to an "
+        "interconnected PV inverter — confirm the interconnection, review the "
+        "inverter's IEEE 1547 test report, and check the firmware is current, "
+        "since harmonic and anti-islanding behaviour are commonly improved in "
+        "later revisions. Distortion that tracks cooling or heating demand "
+        "points to compressor load instead, where the usual complaint is "
+        "starting voltage dip rather than harmonics, addressed by service "
+        "conductor size, transformer sizing or a soft start rather than by "
+        "filters."
+    ),
+    # Single-entry families: the family and the member coincide, so these carry
+    # the member's advice. The attribution sentence that used to close the
+    # saturation entry ("may be a shared or utility responsibility") is gone --
+    # the tool states evidence and the engineer assigns responsibility.
+    "triplen_saturation": (
+        "Check the supply voltage level. Sustained voltage above +5% of "
+        "nominal drives transformer saturation and the harmonic injection that "
+        "follows from it, so the voltage measurement rather than the harmonic "
+        "one is where this is resolved. The relevant evidence is whether the "
+        "over-voltage is present at no load."
+    ),
+    "mixed_three_phase": (
+        "Two sources are indicated and both are worth addressing. For the "
+        "three-phase rectifier component, establish whether input reactors are "
+        "fitted and in service, and consider multi-pulse or active front-end "
+        "equipment if TDD remains above the limit. For the single-phase "
+        "component — computers, LED lighting — verify neutral conductor sizing "
+        "against the harmonic current it carries, noting that triplens add in "
+        "the neutral on a three-phase four-wire system. A K-rated transformer "
+        "is worth considering where the measured K-factor exceeds 4."
+    ),
+}
+
 # Thresholds below were set from a measured null distribution, not chosen by
 # eye.  Scoring 20,000 randomly generated decaying spectra (the shape real
 # harmonic spectra take) against this library gave a median top score of 0.87,
@@ -204,9 +321,9 @@ _LOAD_SIGNATURES: List[Dict] = [
         "spectrum": [1, 3, 2, 1, 14, 11],
         "variability": "low",
         "cause": (
-            "H5 and H7 near-cancellation with H11/H13 dominant is the definitive signature "
-            "of 12-pulse converter loads — typically large VFDs (>100 hp) using dual 6-pulse "
-            "converters fed by a 30° phase-shifting transformer."
+            "H5 and H7 near-cancellation with H11/H13 dominant is the characteristic "
+            "signature of 12-pulse converter loads — typically large VFDs (>100 hp) using "
+            "dual 6-pulse converters fed by a 30° phase-shifting transformer."
         ),
         "recommendation": (
             "12-pulse drives are already a harmonic mitigation measure. If TDD remains high, "

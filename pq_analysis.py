@@ -16,6 +16,7 @@ from pq_constants import (
     SEVERITY_SIGNIFICANT_MARGIN,
     SEVERITY_SIGNIFICANT_PERSISTENCE,
     LOAD_FAMILY_LABEL,
+    LOAD_FAMILY_RECOMMENDATION,
     SEVERITY_WATCH_FRACTION,
     SEVERITY_WATCH_FRACTION_FLOOR,
     is_single_phase_208,
@@ -3399,6 +3400,8 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
         return [{
             "category":       "harmonics",
             "severity":       "info",
+            # Routed to the report's last appendix, not the assessment.
+            "experimental":   True,
             "title":          "No recognised load signature",
             # Informational: there is nothing here to act on, so this
             # must not become a line item in Recommended Actions.
@@ -3453,6 +3456,8 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
         return [{
             "category":       "harmonics",
             "severity":       "info",
+            # Routed to the report's last appendix, not the assessment.
+            "experimental":   True,
             "title":          "No recognised load signature",
             # Informational: there is nothing here to act on, so this
             # must not become a line item in Recommended Actions.
@@ -3529,6 +3534,7 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
     findings.append({
         "category":       "harmonics",
         "severity":       "info",
+        "experimental":   True,
         "title":          title,
         "finding":        (
             f"Spectral similarity {top_score:.0%}, separated from the next load "
@@ -3543,7 +3549,11 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
             "equipment present. Treat it as a hypothesis to confirm on site, "
             "not as a finding in its own right."
         ),
-        "recommendation": top_sig["recommendation"],
+        # Family-level, not the nearest entry's: the finding declines to
+        # name the member, and member advice contradicts itself inside a
+        # family. See LOAD_FAMILY_RECOMMENDATION.
+        "recommendation": LOAD_FAMILY_RECOMMENDATION.get(
+            top_family, top_sig["recommendation"]),
         "confidence":     conf,
         "evidence":       {
             "similarity":        round(top_score, 3),

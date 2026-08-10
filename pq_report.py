@@ -3683,8 +3683,129 @@ def _word_measurement_review(doc, report, thresh, df, outdir=None, stem="") -> N
         doc.add_paragraph()
 
 
+_FINDING_CONF_RANK = {"high": 0, "medium": 1, "low": 2}
+_FINDING_SEV_RANK  = {"critical": 0, "warning": 1, "info": 2}
+_FINDING_SEV_LABEL = {"critical": "Critical", "warning": "Warning",
+                      "info": "Observation"}
+
+
+def _word_finding(doc, finding: dict, show_recommendation: bool = False) -> None:
+    """Render one assessment finding. Shared by the assessment and Appendix D
+    so an experimental finding is laid out the same way, only somewhere else.
+
+    The assessment section does not print recommendations -- those are gathered
+    into Recommended Actions. Appendix D does, because its findings are
+    informational and never reach that list, so their advice would otherwise be
+    dropped entirely.
+    """
+    sev  = finding["severity"]
+    conf = finding.get("confidence", "")
+    p = doc.add_paragraph()
+    _bold(p, f"{_FINDING_SEV_LABEL.get(sev, sev).upper()}: {finding['title']}",
+          color=(_FAIL_CLR if sev == "critical" else
+                 RGBColor(0xCC, 0x66, 0x00) if sev == "warning" else _XE_BLUE),
+          size_pt=10)
+    tag = p.add_run(f"  [{conf.capitalize()} confidence]")
+    tag.font.size = Pt(9)
+    tag.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+
+    body_p = doc.add_paragraph()
+    body_p.paragraph_format.left_indent = Cm(0.5)
+    run_f = body_p.add_run("Finding:  ")
+    run_f.bold = True
+    run_f.font.size = Pt(10)
+    body_p.add_run(finding["finding"]).font.size = Pt(10)
+
+    body_p2 = doc.add_paragraph()
+    body_p2.paragraph_format.left_indent = Cm(0.5)
+    run_c = body_p2.add_run("Likely cause:  ")
+    run_c.bold = True
+    run_c.font.size = Pt(10)
+    body_p2.add_run(finding["cause"]).font.size = Pt(10)
+
+    if finding.get("origin_evidence"):
+        body_p3 = doc.add_paragraph()
+        body_p3.paragraph_format.left_indent = Cm(0.5)
+        run_e = body_p3.add_run("Evidence bearing on origin:  ")
+        run_e.bold = True
+        run_e.font.size = Pt(10)
+        body_p3.add_run(finding["origin_evidence"]).font.size = Pt(10)
+
+    if show_recommendation and finding.get("recommendation"):
+        body_p4 = doc.add_paragraph()
+        body_p4.paragraph_format.left_indent = Cm(0.5)
+        run_r = body_p4.add_run("Candidate action:  ")
+        run_r.bold = True
+        run_r.font.size = Pt(10)
+        body_p4.add_run(finding["recommendation"]).font.size = Pt(10)
+
+    # The tool states evidence; attribution is the reviewing engineer's to
+    # write, so the document carries an explicit place for it rather than
+    # pre-empting it.
+    assess = doc.add_paragraph()
+    assess.paragraph_format.left_indent = Cm(0.5)
+    run_a = assess.add_run("Engineer's assessment:  ")
+    run_a.bold = True
+    run_a.font.size = Pt(10)
+    blank = assess.add_run("_" * 78)
+    blank.font.size = Pt(10)
+    blank.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+
+    doc.add_paragraph()
+
+
+def _word_load_signature_appendix(doc, report) -> None:
+    """Appendix D: load-signature matching, held apart as experimental.
+
+    This is the only analysis in the report that tries to say what equipment is
+    behind the meter, and it is the weakest. Measured against synthetic
+    mixtures of library loads it named a load that was not present in a third
+    to a half of the cases where it named one at all, which is why the finding
+    reports a load *family* and not a device. It sits last, under its own
+    heading, so it is read as a hypothesis to check on site rather than as one
+    of the measured findings.
+    """
+    sigs = [f for f in report.get("root_causes", []) if f.get("experimental")]
+    if not sigs:
+        return
+
+    _section_heading(doc, "Appendix D: Load Signature Matching (Experimental)",
+                     level=1)
+    _body(doc,
+        "Everything in this appendix is experimental and is not part of the "
+        "compliance assessment. It compares the measured harmonic spectrum "
+        "against a library of reference load types and reports the closest "
+        "family — the converter topology the shape is consistent with — where "
+        "one is close enough to name.")
+    _body(doc,
+        "What it can and cannot establish: a meter at the service entrance "
+        "measures the sum of everything behind it, so a spectrum that sits "
+        "nearest one reference entry is not evidence that entry is what draws "
+        "the current. A blend of two loads can land nearer a third entry that "
+        "neither resembles. Tested against synthetic mixtures of two or three "
+        "library loads on one service, matching to a specific device named a "
+        "load that was not present in roughly a third to a half of the cases "
+        "where it named one, so no device is named here — only the family, and "
+        "only above a similarity floor set from a measured null distribution. "
+        "Treat anything below as a hypothesis to confirm on site.")
+    _body(doc,
+        "The reliable way to attribute distortion to a particular load is a "
+        "recording taken while that load is switched on and off, which "
+        "separates its contribution directly rather than inferring it from "
+        "spectral shape.")
+    doc.add_paragraph()
+
+    for finding in sorted(sigs, key=lambda f: _FINDING_CONF_RANK.get(
+            f.get("confidence", "low"), 3)):
+        _word_finding(doc, finding, show_recommendation=True)
+
+
 def _word_engineering_assessment(doc, report) -> None:
-    rca = report.get("root_causes", [])
+    # Experimental findings are held back for Appendix D. Load-signature
+    # matching is the only one: it names a load *family* from spectral shape,
+    # which is a hypothesis to check on site rather than a likely cause, and
+    # mixing it in here gave it the standing of the measured findings.
+    rca = [f for f in report.get("root_causes", []) if not f.get("experimental")]
     if not rca:
         return
 
@@ -3697,61 +3818,12 @@ def _word_engineering_assessment(doc, report) -> None:
         "reviewing engineer. "
         "Supporting measurements are presented in the sections that follow.")
 
-    _conf_rank = {"high": 0, "medium": 1, "low": 2}
-    _sev_rank  = {"critical": 0, "warning": 1, "info": 2}
-    _sev_label = {"critical": "Critical", "warning": "Warning", "info": "Observation"}
     ordered = sorted(rca, key=lambda f: (
-        _sev_rank.get(f.get("severity"), 9),
-        _conf_rank.get(f.get("confidence", "low"), 3),
+        _FINDING_SEV_RANK.get(f.get("severity"), 9),
+        _FINDING_CONF_RANK.get(f.get("confidence", "low"), 3),
     ))
     for finding in ordered:
-        sev  = finding["severity"]
-        conf = finding.get("confidence", "")
-        p = doc.add_paragraph()
-        _bold(p, f"{_sev_label.get(sev, sev).upper()}: {finding['title']}",
-              color=(_FAIL_CLR if sev == "critical" else
-                     RGBColor(0xCC, 0x66, 0x00) if sev == "warning" else _XE_BLUE),
-              size_pt=10)
-        tag_txt = f"[{conf.capitalize()} confidence]"
-        tag = p.add_run(f"  {tag_txt}")
-        tag.font.size = Pt(9)
-        tag.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-
-        body_p = doc.add_paragraph()
-        body_p.paragraph_format.left_indent = Cm(0.5)
-        run_f = body_p.add_run("Finding:  ")
-        run_f.bold = True
-        run_f.font.size = Pt(10)
-        body_p.add_run(finding["finding"]).font.size = Pt(10)
-
-        body_p2 = doc.add_paragraph()
-        body_p2.paragraph_format.left_indent = Cm(0.5)
-        run_c = body_p2.add_run("Likely cause:  ")
-        run_c.bold = True
-        run_c.font.size = Pt(10)
-        body_p2.add_run(finding["cause"]).font.size = Pt(10)
-
-        if finding.get("origin_evidence"):
-            body_p3 = doc.add_paragraph()
-            body_p3.paragraph_format.left_indent = Cm(0.5)
-            run_e = body_p3.add_run("Evidence bearing on origin:  ")
-            run_e.bold = True
-            run_e.font.size = Pt(10)
-            body_p3.add_run(finding["origin_evidence"]).font.size = Pt(10)
-
-        # The tool states evidence; attribution is the reviewing engineer's to
-        # write, so the document carries an explicit place for it rather than
-        # pre-empting it.
-        assess = doc.add_paragraph()
-        assess.paragraph_format.left_indent = Cm(0.5)
-        run_a = assess.add_run("Engineer's assessment:  ")
-        run_a.bold = True
-        run_a.font.size = Pt(10)
-        blank = assess.add_run("_" * 78)
-        blank.font.size = Pt(10)
-        blank.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-
-        doc.add_paragraph()
+        _word_finding(doc, finding)
 
 
 def _word_recommended_actions(doc, actions: List[dict]) -> None:
@@ -4296,6 +4368,9 @@ def generate_word_report(
     _word_terms_panel(doc, report)
     _word_appendix(doc, report, thresh, df)
     _word_channel_appendix(doc, report, df)
+    # Last in the document, deliberately: experimental, and not part of the
+    # compliance assessment.
+    _word_load_signature_appendix(doc, report)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     outdir.mkdir(parents=True, exist_ok=True)
