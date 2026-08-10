@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.29.1"
+__version__ = "0.32.0"
 
 
 @dataclass
@@ -140,8 +140,12 @@ SIGNATURE_ABSOLUTE_FLOOR = 0.90
 #: Within-family gaps are meaningless -- those entries are the same topology.
 SIGNATURE_FAMILY_SEPARATION = 0.05
 
-#: Gap to the next entry inside the winning family, below which the family is
-#: reported instead of the individual load type.
+#: Gap to the next entry inside the winning family, below which those entries
+#: are described as indistinguishable.  This no longer gates anything: the
+#: family is now always what gets reported, because naming the individual entry
+#: was measured naming a load that was not present 45% of the time on secondary
+#: and 32% on primary service (test_pq.py::TestLoadSignatureMixtures).  It only
+#: selects how the finding words the omission.
 SIGNATURE_MEMBER_SEPARATION = 0.05
 
 

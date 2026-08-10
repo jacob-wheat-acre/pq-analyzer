@@ -395,7 +395,12 @@ class TestNeutralHarmonics:
     @pytest.fixture(scope="class")
     @classmethod
     def thresh(cls):
-        return Thresholds(nominal_voltage=120.0)
+        # Three-phase wye data: the neutral triplens accumulate at ~2.8x phase
+        # H3, which only happens on a 120-degree system. Only phase A's
+        # channels are present, so channel presence alone would read this as a
+        # single-phase service -- the engineer's topology pick is what settles
+        # it, which is the precedence `service_geometry` documents.
+        return Thresholds(nominal_voltage=120.0, topology="3ph-wye")
 
     def test_available_when_neutral_cols_present(self, df_with_neutral, thresh):
         result = check_neutral_harmonics(df_with_neutral, thresh)
@@ -2114,6 +2119,254 @@ class TestTwoLegServiceRigor:
         assert r["available"] and r["topology"] == "1ph-208"
 
 
+class TestServiceGeometryGating:
+    """Three-phase criteria must not be applied to a two-leg service.
+
+    The discriminator is the angle between the legs, not how many there are.
+    A 120/240 service is collinear, so the neutral carries a difference and odd
+    harmonics -- triplens included -- subtract in it. Two legs of a 120/208 wye
+    are 120 degrees apart, so the neutral carries a sum and triplens add. Both
+    have two legs; only one of them accumulates.
+    """
+
+    def _legs(self, ia=20.0, ib=12.0, n=120, neutral=None, h3n=None):
+        import pandas as pd
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        d = {"current_a": np.full(n, ia), "current_b": np.full(n, ib),
+             "voltage_a": np.full(n, 121.0), "voltage_b": np.full(n, 119.0),
+             "h3_current_a": np.full(n, 2.0), "h3_current_b": np.full(n, 2.0)}
+        if neutral is not None:
+            d["current_neutral"] = np.full(n, neutral)
+        if h3n is not None:
+            d["h3_current_neutral"] = np.full(n, h3n)
+            d["h5_current_neutral"] = np.full(n, 0.2)
+        return pd.DataFrame(d, index=idx)
+
+    def _three_phase(self, n=120):
+        import pandas as pd
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame(
+            {"current_a": np.full(n, 20.0), "current_b": np.full(n, 12.0),
+             "current_c": np.full(n, 16.0)}, index=idx)
+
+    # ── the resolver ─────────────────────────────────────────────────────────
+
+    def test_two_legs_default_to_split_phase(self):
+        from pq_analysis import service_geometry
+        assert service_geometry(Thresholds(), self._legs().columns) == "split-phase"
+
+    def test_service_type_marks_a_208_network_service(self):
+        from pq_analysis import service_geometry
+        g = service_geometry(Thresholds(service_type="1ph-208"),
+                             self._legs().columns)
+        assert g == "two-leg-208"
+
+    def test_a_third_phase_reads_as_three_phase(self):
+        from pq_analysis import service_geometry
+        assert service_geometry(
+            Thresholds(), self._three_phase().columns) == "three-phase"
+
+    def test_the_engineers_pick_beats_channel_presence(self):
+        # A three-phase export that dropped phase C still has three phases.
+        from pq_analysis import service_geometry
+        g = service_geometry(Thresholds(topology="3ph-wye"), self._legs().columns)
+        assert g == "three-phase"
+
+    def test_only_120_degree_systems_accumulate_triplens(self):
+        from pq_analysis import accumulates_triplens
+        assert accumulates_triplens("three-phase") is True
+        assert accumulates_triplens("two-leg-208") is True
+        assert accumulates_triplens("split-phase") is False
+        assert accumulates_triplens("single-phase") is False
+
+    # ── current imbalance ────────────────────────────────────────────────────
+
+    def test_no_limit_is_applied_to_leg_current_difference(self):
+        # There is no PSCo number and no standard one, so none is invented.
+        from pq_analysis import check_current_imbalance
+        r = check_current_imbalance(self._legs(), Thresholds())
+        assert r["available"] is True
+        assert r["limit_pct"] is None
+        assert r["pct_exceeding"] == 0.0
+        assert len(r["violation_timestamps"]) == 0
+
+    def test_the_leg_difference_says_it_is_not_a_violation(self):
+        from pq_analysis import check_current_imbalance
+        r = check_current_imbalance(self._legs(), Thresholds())
+        assert r["metric"] == "leg_difference"
+        assert "measurement, not a violation" in r["note"]
+
+    def test_a_208_service_says_the_third_phase_is_unmeasured(self):
+        from pq_analysis import check_current_imbalance
+        r = check_current_imbalance(self._legs(),
+                                    Thresholds(service_type="1ph-208"))
+        assert r["limit_pct"] is None
+        assert "third phase is not measured" in r["note"]
+
+    def test_three_phase_still_gets_the_ten_percent_limit(self):
+        from pq_analysis import check_current_imbalance
+        r = check_current_imbalance(self._three_phase(), Thresholds())
+        assert r["limit_pct"] == 10.0
+        assert r["metric"] == "nema_style"
+        assert r["note"] is None
+        # 20/12/16 averages 16, max deviation 4 -> 25%, over the limit.
+        assert r["mean_imbalance_pct"] == pytest.approx(25.0, abs=0.1)
+        assert r["pct_exceeding"] == 100.0
+
+    # ── neutral harmonics ────────────────────────────────────────────────────
+
+    def test_split_phase_withholds_the_accumulation_factor(self):
+        from pq_analysis import check_neutral_harmonics
+        r = check_neutral_harmonics(self._legs(h3n=5.0), Thresholds())
+        assert r["available"] is True
+        assert r["triplens_accumulate"] is False
+        assert r["accumulation_factor"] is None
+        assert r["triplen_dominant"] is False
+        assert "subtract in the neutral" in r["accumulation_note"]
+
+    def test_split_phase_still_measures_neutral_harmonic_current(self):
+        # Neutral heating is real whatever the geometry; only the
+        # zero-sequence interpretation is withheld.
+        from pq_analysis import check_neutral_harmonics
+        r = check_neutral_harmonics(self._legs(h3n=5.0), Thresholds())
+        assert r["orders"][3]["mean_a"] == pytest.approx(5.0, abs=0.01)
+
+    def test_a_208_service_does_accumulate(self):
+        from pq_analysis import check_neutral_harmonics
+        r = check_neutral_harmonics(self._legs(h3n=5.0),
+                                    Thresholds(service_type="1ph-208"))
+        assert r["triplens_accumulate"] is True
+        assert r["accumulation_factor"] == pytest.approx(2.5, abs=0.01)
+        assert r["accumulation_note"] is None
+
+
+class TestSharedTransformerIsNotMeasured:
+    """One meter cannot show what a shared transformer is carrying.
+
+    A residential pole or pad transformer feeds several houses. This service's
+    demand is therefore a *lower bound* on the transformer's load, and the
+    inference is one-sided: above nameplate proves an overload whoever else is
+    connected, but below nameplate proves nothing. The negative case must be
+    "not determinable", never a pass -- it used to print "The transformer
+    loading is within acceptable limits" about equipment never measured.
+    """
+
+    def _df(self, kva, n=200):
+        import pandas as pd
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame({"power_real": np.full(n, kva * 1000.0),
+                             "power_reactive": np.zeros(n)}, index=idx)
+
+    def _tx(self, cls, nameplate, kva=10.0):
+        from pq_analysis import check_demand
+        r = check_demand(self._df(kva),
+                         Thresholds(customer_class=cls,
+                                    transformer_kva=nameplate))
+        return r["transformer"]
+
+    def test_which_classes_own_their_transformer(self):
+        from pq_analysis import has_dedicated_transformer
+        assert has_dedicated_transformer("pg") is True
+        assert has_dedicated_transformer("sg") is True
+        assert has_dedicated_transformer("r") is False
+        assert has_dedicated_transformer("c") is False
+
+    def test_a_house_under_nameplate_is_not_determinable(self):
+        tx = self._tx("r", nameplate=25.0, kva=10.0)
+        assert tx["overloaded"] is None
+        assert tx["dedicated"] is False
+        assert "cannot be determined" in tx["note"]
+
+    def test_a_house_over_nameplate_still_proves_an_overload(self):
+        # One-sided: a lower bound above the nameplate is conclusive.
+        tx = self._tx("r", nameplate=5.0, kva=10.0)
+        assert tx["overloaded"] is True
+
+    def test_small_commercial_shares_too(self):
+        assert self._tx("c", nameplate=50.0, kva=10.0)["overloaded"] is None
+
+    def test_a_dedicated_service_still_passes_and_fails(self):
+        assert self._tx("sg", nameplate=500.0, kva=10.0)["overloaded"] is False
+        assert self._tx("sg", nameplate=5.0, kva=10.0)["overloaded"] is True
+        assert self._tx("pg", nameplate=500.0, kva=10.0)["note"] is None
+
+    def test_not_determinable_is_not_graded(self):
+        from pq_analysis import grade_finding
+        tx = self._tx("r", nameplate=25.0, kva=10.0)
+        passes = None if tx["overloaded"] is None else not tx["overloaded"]
+        assert grade_finding(passes, measured=tx["peak_8h_kva"],
+                             limit=tx["nameplate_kva"])["band"] == "not_assessed"
+
+    def test_no_all_clear_reaches_a_residential_report(self):
+        import subprocess, sys, os, glob
+        pytest.importorskip("docx")
+        from docx import Document
+        root = os.path.dirname(os.path.abspath(__file__))
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(
+                [sys.executable, os.path.join(root, "pq_analyzer.py"),
+                 os.path.join(root, "test_data", "test_residential.pqd"),
+                 "--customer-class", "r", "--nominal", "120",
+                 "--transformer-kva", "25", "--report", "--no-plots",
+                 "--outdir", d], check=True, capture_output=True)
+            path = [p for p in glob.glob(os.path.join(d, "*.docx"))
+                    if "internal" in p][0]
+            text = " ".join(p.text for p in Document(path).paragraphs)
+        assert "within acceptable limits" not in text
+        assert "contribution to its loading and not that loading" in text
+        assert "cannot be determined from a recording at one meter" in text
+        # The K-factor section reached the same conclusion by a second route,
+        # asserting thermal margin from this service's share of the nameplate.
+        assert "retains substantial thermal margin" not in text
+        assert "not the transformer's thermal margin" in text
+
+
+class TestResidentialRunSaysNoViolation:
+    """End to end on a house: what reaches the page, not just the dicts."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def out(cls, tmp_path_factory):
+        import subprocess, sys, os
+        root = os.path.dirname(os.path.abspath(__file__))
+        d = tmp_path_factory.mktemp("residential")
+        p = subprocess.run(
+            [sys.executable, os.path.join(root, "pq_analyzer.py"),
+             os.path.join(root, "test_data", "test_residential.pqd"),
+             "--customer-class", "r", "--nominal", "120",
+             "--no-plots", "--outdir", str(d)],
+            check=True, capture_output=True, text=True)
+        return p.stdout
+
+    def test_the_leg_difference_is_reported_without_a_verdict(self, out):
+        assert "MEASUREMENT — no limit" in out
+        assert "measurement, not a violation" in out
+
+    def test_no_ten_percent_current_imbalance_failure(self, out):
+        block = out.split("CURRENT IMBALANCE")[1].split("─" * 10)[0]
+        assert "FAIL" not in block
+        assert "Limit=" not in block
+
+    def test_no_triplen_accumulation_language_on_a_house(self, out):
+        assert "Accumulation factor:" not in out
+        assert "4-wire wye" not in out
+        assert "subtract in the neutral" in out
+
+    def test_the_imbalance_findings_do_not_contradict_each_other(self, out):
+        # These two fired together before: one saying both voltage and current
+        # were elevated, the other saying current was low, same recording.
+        assert not ("Current imbalance — investigate supply voltage" in out
+                    and "balanced load current" in out)
+
+    def test_nothing_commits_xcel_to_an_action(self, out):
+        assert "Xcel Energy will" not in out
+
+    def test_a_house_is_not_told_to_rebalance_three_phases(self, out):
+        assert "across phases" not in out
+        assert "A, B, C phases" not in out
+
+
 @pytest.fixture
 def gui_app():
     """A real window, skipped where no display can be opened."""
@@ -2616,11 +2869,22 @@ class TestRecommendedActionsAreProportionate:
         joined = " ".join(a["recommendation"] for a in self._actions(rep, "sg"))
         assert "detailed harmonic study" in joined.lower()
 
-    def test_residential_imbalance_advice_is_split_phase(self):
-        rep = self._report(current_imbalance=False)
+    def test_a_two_leg_service_raises_no_imbalance_action(self):
+        # A house reports its leg difference as a measurement with no limit, so
+        # pass_fail carries None and nothing here fires. This test used to
+        # assert split-phase wording on the action itself; there is no longer a
+        # path that produces it, because leg imbalance is not a violation and
+        # must not raise a High-priority item. The equivalent advice now hangs
+        # off the measured neutral current instead.
+        rep = self._report(current_imbalance=None)
         res = " ".join(a["recommendation"] for a in self._actions(rep, "r")).lower()
-        assert "120 v legs" in res or "two 120" in res
         assert "across phases" not in res
+        assert "imbalance" not in res
+
+    def test_three_phase_imbalance_still_raises_an_action(self):
+        rep = self._report(current_imbalance=False)
+        res = " ".join(a["recommendation"] for a in self._actions(rep, "sg")).lower()
+        assert "across phases" in res
 
     def test_duplicate_intents_collapse_to_one_action(self):
         from pq_report import _build_structured_actions
@@ -2666,6 +2930,29 @@ class TestRecommendedActionsAreProportionate:
         assert A._MIN_ACTIONABLE_KVAR > 0
 
 
+#: Harmonic orders carried in the load-signature library, in vector order.
+_SIG_ORDERS = [3, 5, 7, 9, 11, 13]
+
+
+def _sig_frame(spec, cv=0.1, n=150, seed=0):
+    """Interval frame carrying `spec` as harmonic amps on a 100 A service."""
+    import pandas as pd
+    idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+    rng = np.random.default_rng(seed)
+    d = {"current_a": np.full(n, 100.0)}
+    for h, v in zip(_SIG_ORDERS, spec):
+        d[f"h{h}_current_a"] = np.clip(
+            rng.normal(v, max(v * cv, 1e-4), n), 1e-4, None)
+    return pd.DataFrame(d, index=idx)
+
+
+def _sig_run(spec, cv=0.1, cls="sg", seed=0):
+    """Score `spec` through the matcher as a service of class `cls`."""
+    from pq_analysis import _detect_harmonic_signature
+    return _detect_harmonic_signature(_sig_frame(spec, cv, seed=seed),
+                                      100.0, None, customer_class=cls)
+
+
 class TestLoadSignatureFloor:
     """A spectrum matching nothing must be reported as matching nothing.
 
@@ -2676,19 +2963,10 @@ class TestLoadSignatureFloor:
     """
 
     def _frame(self, spec, cv=0.1, n=150, seed=0):
-        import pandas as pd
-        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
-        rng = np.random.default_rng(seed)
-        d = {"current_a": np.full(n, 100.0)}
-        for h, v in zip([3, 5, 7, 9, 11, 13], spec):
-            d[f"h{h}_current_a"] = np.clip(
-                rng.normal(v, max(v * cv, 1e-4), n), 1e-4, None)
-        return pd.DataFrame(d, index=idx)
+        return _sig_frame(spec, cv, n, seed)
 
     def _run(self, spec, cv=0.1, cls="sg", seed=0):
-        from pq_analysis import _detect_harmonic_signature
-        return _detect_harmonic_signature(self._frame(spec, cv, seed=seed),
-                                          100.0, None, customer_class=cls)
+        return _sig_run(spec, cv, cls, seed)
 
     def test_an_unmatched_spectrum_is_named_as_unmatched(self):
         out = self._run([0.4, 0.3, 0.5, 0.2, 0.4, 0.3], cv=0.8, cls="r")
@@ -2747,6 +3025,204 @@ class TestLoadSignatureFloor:
             assert s["family"] in LOAD_FAMILY_LABEL, s["family"]
 
 
+#: Trials per (class, arm) cell in the mixture sweep.  Large enough that a rate
+#: is readable to a couple of points, small enough to stay in the unit suite.
+_MIX_TRIALS = 300
+
+#: A draw is called "blended" when no single load owns more than this share of
+#: the fundamental.  Above it the service is essentially one device plus trim,
+#: and naming that device is the right answer rather than a failure.
+_MIX_BLENDED_MAX_SHARE = 0.60
+
+#: Not every library entry describes a single device.  `mixed_vfd_smps` is a
+#: blend by construction -- "6-pulse VFDs + single-phase nonlinear loads" -- so
+#: naming it on a draw whose loads all come from the families it describes is a
+#: correct answer, not a misidentification.  Without this carve-out the sweep
+#: scores that entry as wrong every time it is right, which on the `sg` class
+#: inflates the misidentification rate from 37% to 67%.
+_MIX_COMPOSITE_ENTRIES = {
+    "mixed_vfd_smps": {"six_pulse", "single_phase_switchmode"},
+}
+
+
+def _mix_defensible(signature_id, parent_families):
+    """True when a non-parent match is a composite entry that describes the draw."""
+    covered = _MIX_COMPOSITE_ENTRIES.get(signature_id)
+    return covered is not None and parent_families <= covered
+
+
+def _mixture_spectrum(rng, candidates, phase_random):
+    """One synthetic service: 2-3 library loads sharing a 100 A fundamental.
+
+    Each library vector is a percentage of *its own* fundamental, so a load
+    drawing share ``w`` of a 100 A service contributes ``w * spec`` amps at each
+    order.  The mixture spectrum is therefore the share-weighted sum, in amps.
+
+    ``phase_random`` selects between the two bounding cases described in
+    TestLoadSignatureMixtures: aligned magnitudes, or uniform random phase.
+    """
+    k = int(rng.integers(2, 4))
+    picks = rng.choice(len(candidates), size=k, replace=False)
+    parents = [candidates[i] for i in picks]
+    shares = rng.dirichlet(np.ones(k))
+
+    contrib = np.array([np.asarray(p["spectrum"], dtype=float) * w
+                        for p, w in zip(parents, shares)])
+    if phase_random:
+        theta = rng.uniform(0, 2 * np.pi, size=contrib.shape)
+        spec = np.abs((contrib * np.exp(1j * theta)).sum(axis=0))
+    else:
+        spec = contrib.sum(axis=0)
+    return parents, shares, np.clip(spec, 1e-4, None)
+
+
+def _mixture_sweep(cls, phase_random, trials=_MIX_TRIALS, seed=20260807):
+    """Score `trials` synthetic mixtures and tally what the matcher said."""
+    from pq_constants import _LOAD_SIGNATURES
+    candidates = [s for s in _LOAD_SIGNATURES if cls in s["classes"]]
+    rng = np.random.default_rng(seed)
+    tally = {"n": 0, "rejected": 0, "named": 0, "named_member": 0,
+             "member_not_parent": 0, "family_not_parent": 0, "high_conf": 0,
+             "composite_ok": 0, "blended_n": 0, "blended_named_member": 0,
+             "blended_member_not_parent": 0}
+
+    for i in range(trials):
+        parents, shares, spec = _mixture_spectrum(rng, candidates, phase_random)
+        out = _sig_run(spec, cv=0.1, cls=cls, seed=i)
+        assert out, "the matcher returned no finding at all"
+        f, ev = out[0], out[0]["evidence"]
+        blended = float(max(shares)) < _MIX_BLENDED_MAX_SHARE
+        parent_ids = {p["id"] for p in parents}
+        parent_families = {p["family"] for p in parents}
+
+        tally["n"] += 1
+        tally["blended_n"] += blended
+        if f["title"] == "No recognised load signature":
+            tally["rejected"] += 1
+            continue
+
+        defensible = _mix_defensible(ev["signature_id"], parent_families)
+        tally["named"] += 1
+        tally["composite_ok"] += defensible
+        if ev["family"] not in parent_families and not defensible:
+            tally["family_not_parent"] += 1
+        if ev["family_separation"] >= 0.15:      # what the code calls "high"
+            tally["high_conf"] += 1
+        if ev["resolved_to_member"]:
+            tally["named_member"] += 1
+            tally["blended_named_member"] += blended
+            if ev["signature_id"] not in parent_ids and not defensible:
+                tally["member_not_parent"] += 1
+                tally["blended_member_not_parent"] += blended
+    return tally
+
+
+def _mixture_report(rows):
+    """Render sweep tallies as a table.  Visible under `pytest -s`."""
+    def pct(num, den):
+        return "     -" if not den else f"{num / den:6.1%}"
+
+    lines = [
+        "",
+        "  Load-signature behaviour on multi-load services",
+        "  (share-weighted mixtures of 2-3 library loads; 'parent' = a load"
+        "  actually present in the draw)",
+        "",
+        f"  {'class':>6} {'arm':>10} {'n':>5} {'rejected':>9} {'named':>7}"
+        f" {'->member':>9} {'not parent':>11} {'wrong fam':>10} {'high conf':>10}",
+    ]
+    for cls, arm, t in rows:
+        lines.append(
+            f"  {cls:>6} {arm:>10} {t['n']:>5} {pct(t['rejected'], t['n']):>9}"
+            f" {pct(t['named'], t['n']):>7} {pct(t['named_member'], t['n']):>9}"
+            f" {pct(t['member_not_parent'], t['named_member']):>11}"
+            f" {pct(t['family_not_parent'], t['named']):>10}"
+            f" {pct(t['high_conf'], t['named']):>10}"
+        )
+    lines += ["",
+              "  'not parent' and 'wrong fam' are shares of the matches actually"
+              " named,",
+              "  not of all trials -- they answer \"when it names something, how"
+              " often is",
+              "  that something not even present?\"  Both credit the composite"
+              " library entry",
+              "  (see _MIX_COMPOSITE_ENTRIES) when it correctly describes the"
+              " blend.", ""]
+    print("\n".join(lines))
+
+
+class TestLoadSignatureMixtures:
+    """Can the matcher name a device when the service carries more than one?
+
+    Every entry in the library is a single device at rated load.  A meter at the
+    service entrance sees the sum of everything behind it, and the guards in
+    `_detect_harmonic_signature` -- the 0.90 floor, family separation, member
+    separation -- all measure distance to library points.  None of them asks
+    whether a *blend* of library entries explains the same point, so a mixture
+    can in principle clear every gate and be reported as one resolved device.
+
+    This class measures how often that happens.  It sets no thresholds and
+    asserts no rate: the rates it prints are the deliverable, and what to do
+    about them is a separate decision.
+
+    Measured over 300 draws per cell (`pytest test_pq.py -k Mixture -s`), the
+    guards hold on small services and fail on large ones.  Residential and small
+    commercial mixtures are rejected 96% and 80% of the time, and `c` never
+    resolves to a single device at all.  On `sg` and `pg` -- the classes where a
+    service most plausibly carries several nonlinear loads, and where this
+    finding is most likely to be acted on -- the matcher names something for 47%
+    and 69% of mixtures, resolves roughly half of those to one specific device,
+    and of those single-device names 45% (`sg`) and 32% (`pg`) name a load that
+    is not in the draw.  A quarter of `sg` matches name the wrong *family*.
+    Random phase moves every rate by less than the gap between classes, so the
+    result does not depend on where between the two arms reality sits.
+
+    What this does not say: these are mixtures of library entries, which is a
+    friendlier population than real services carrying loads the library has no
+    entry for.  The rates are a floor on the error, not an estimate of it.
+
+    Two arms bound the physics.  Harmonic currents from several loads add as
+    phasors, and the library stores magnitudes only:
+
+      * `aligned`     -- magnitudes added directly.  No cancellation, which is
+                         the most favourable case for recognising a parent.
+      * `randomphase` -- uniform random phase per load per order.  Maximum
+                         cancellation, the least favourable case.
+
+    Neither is a model of a real site; real services fall between them, closer
+    to `aligned` when the mixed loads share a topology.  A conclusion that holds
+    in both arms does not depend on where between them reality sits.
+    """
+
+    def test_a_single_library_load_is_still_recognised(self):
+        # Harness control.  If a pure library spectrum fed through the mixture
+        # path stopped matching, every rate below would be measuring a broken
+        # harness rather than the matcher.
+        from pq_constants import _LOAD_SIGNATURES
+        vfd = next(s for s in _LOAD_SIGNATURES if s["id"] == "vfd_6pulse_reactor")
+        out = _sig_run(np.asarray(vfd["spectrum"], dtype=float), cls="sg")
+        assert out[0]["title"] != "No recognised load signature"
+        assert out[0]["evidence"]["family"] == "six_pulse"
+
+    def test_every_mixture_is_accounted_for(self):
+        # Each trial must land in exactly one bucket, or the rates do not add up.
+        t = _mixture_sweep("sg", phase_random=False, trials=40)
+        assert t["n"] == 40
+        assert t["rejected"] + t["named"] == t["n"]
+        assert t["named_member"] <= t["named"]
+        assert t["member_not_parent"] <= t["named_member"]
+
+    def test_mixture_rates(self):
+        # The measurement.  Run with `pytest test_pq.py -k Mixture -s` to read
+        # the table; the assertions here only confirm the sweep ran.
+        rows = []
+        for cls in ("r", "c", "sg", "pg"):
+            for arm, phase_random in (("aligned", False), ("randomphase", True)):
+                rows.append((cls, arm, _mixture_sweep(cls, phase_random)))
+        _mixture_report(rows)
+        assert all(t["n"] == _MIX_TRIALS for _, _, t in rows)
+
+
 class TestLoadSignaturesRespectCustomerClass:
     """Load-type matching must not offer equipment the service cannot have.
 
@@ -2772,6 +3248,15 @@ class TestLoadSignaturesRespectCustomerClass:
             self._welder_shaped_frame(), 100.0, None,
             customer_class=customer_class)]
 
+    def _texts(self, customer_class):
+        # Title plus body.  The equipment considered is named in the body now
+        # that the title reports only the family.
+        from pq_analysis import _detect_harmonic_signature
+        return [f"{f['title']} {f.get('finding', '')}"
+                for f in _detect_harmonic_signature(
+                    self._welder_shaped_frame(), 100.0, None,
+                    customer_class=customer_class)]
+
     def test_a_residential_service_is_never_offered_industrial_equipment(self):
         joined = " ".join(self._titles("r")).lower()
         for banned in ("arc welder", "arc furnace", "12-pulse", "18-pulse",
@@ -2779,7 +3264,7 @@ class TestLoadSignaturesRespectCustomerClass:
             assert banned not in joined, f"{banned!r} offered to a house"
 
     def test_a_residential_service_gets_residential_candidates(self):
-        joined = " ".join(self._titles("r")).lower()
+        joined = " ".join(self._texts("r")).lower()
         assert any(k in joined for k in
                    ("pv inverter", "ev charger", "heat pump", "air conditioning"))
 
@@ -2811,13 +3296,37 @@ class TestLoadSignaturesRespectCustomerClass:
         assert f[0]["title"].startswith("Possible load family")
         assert "Arcing load" in f[0]["title"]
         assert f[0]["evidence"]["resolved_to_member"] is False
-        assert "not resolvable from the spectrum" in f[0]["finding"]
+        assert "individual load type is not reported" in f[0]["finding"]
         assert f[0]["confidence"] != "high"
 
     def test_the_finding_does_not_claim_to_identify_equipment(self):
+        # No path names a single piece of equipment any more.  A mixture of two
+        # loads lands nearest an entry containing neither often enough that the
+        # member-level claim was not supportable -- see TestLoadSignatureMixtures.
         f_titles = self._titles("r")
         assert f_titles and not any(t.startswith("Best match") for t in f_titles)
-        assert f_titles[0].startswith("Possible load type")
+        assert f_titles[0].startswith("Possible load family")
+        assert not any(t.startswith("Possible load type") for t in f_titles)
+
+    def test_a_family_with_one_entry_still_does_not_claim_the_equipment(self):
+        # mixed_three_phase has a single entry applicable to primary service, so
+        # the family label and that entry coincide. The finding has to say so
+        # rather than reading as an identification by omission.
+        from pq_analysis import _detect_harmonic_signature
+        f = _detect_harmonic_signature(
+            _sig_frame(np.array([15, 20, 8, 2, 4, 3], dtype=float)),
+            100.0, None, customer_class="pg")[0]
+        assert f["title"].startswith("Possible load family")
+        assert "one reference entry" in f["finding"]
+        assert "not an identification of the equipment present" in f["finding"]
+        assert f["evidence"]["resolved_to_member"] is False
+
+    def test_no_match_is_ever_reported_at_high_confidence(self):
+        from pq_analysis import _detect_harmonic_signature
+        for cls in ("r", "c", "sg", "pg"):
+            for f in _detect_harmonic_signature(self._welder_shaped_frame(),
+                                                100.0, None, customer_class=cls):
+                assert f["confidence"] != "high", cls
 
 
 class TestComplianceTableGrouping:

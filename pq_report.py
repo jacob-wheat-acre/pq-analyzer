@@ -155,7 +155,11 @@ def generate_report(
 
     transformer_pass: Optional[bool] = None
     if "transformer" in demand_result:
-        transformer_pass = not demand_result["transformer"]["overloaded"]
+        # None means the transformer is shared and this service's demand did
+        # not on its own exceed the nameplate: not determinable, which is not
+        # a pass. `not None` would have been True and read as an all-clear.
+        _over = demand_result["transformer"]["overloaded"]
+        transformer_pass = None if _over is None else not _over
 
     report = {
         "file_summary": {
@@ -227,8 +231,13 @@ def generate_report(
                                       if pf_result["available"] else None,
             "voltage_imbalance":      volt_imb_result["pct_exceeding"] == 0
                                       if volt_imb_result["available"] else None,
+            # No limit means not evaluated, which is None -- not a pass. On a
+            # two-leg service the leg difference is reported as a measurement
+            # and nothing here is being tested against a threshold.
             "current_imbalance":      curr_imb_result["pct_exceeding"] == 0
-                                      if curr_imb_result["available"] else None,
+                                      if (curr_imb_result["available"]
+                                          and curr_imb_result.get("limit_pct") is not None)
+                                      else None,
             "harmonic_statistics":    stat_result.get("overall_pass")
                                       if stat_result.get("available") else None,
             "neutral_health":         (
@@ -279,9 +288,21 @@ def print_report(report: dict) -> None:
             print(f"  Peak current (interval max): {pc['max_a']:.0f} A worst  [{ph_str}]")
         if "transformer" in dem:
             tx = dem["transformer"]
-            sym = "FAIL — OVERLOADED" if tx["overloaded"] else "PASS"
+            if tx["overloaded"] is True:
+                sym = "FAIL — OVERLOADED"
+            elif tx["overloaded"] is False:
+                sym = "PASS"
+            else:
+                sym = "NOT DETERMINABLE — shared transformer"
             print(f"  Transformer: {tx['nameplate_kva']:.0f} kVA nameplate  "
                   f"8-hr peak={tx['peak_8h_kva']:.1f} kVA ({tx['pct_nameplate']:.1f}%)  [{sym}]")
+            if tx["overloaded"] is None and tx.get("note"):
+                print(f"  {tx['note']}")
+            elif tx["overloaded"] is True and not tx.get("dedicated"):
+                # Determined, and determined from this service alone. The
+                # shared-transformer caveat cuts the other way here.
+                print("  This service alone exceeds the nameplate; other "
+                      "customers on this transformer add to that.")
         else:
             print("  (Pass --transformer-kva to check transformer loading)")
 
@@ -441,6 +462,14 @@ def print_report(report: dict) -> None:
     ci = report["current_imbalance"]
     if not ci["available"]:
         print(f"  {ci['error']}")
+    elif ci.get("limit_pct") is None:
+        # Two legs: reported, not tested. Printing PASS here would imply a
+        # threshold was cleared when none was applied.
+        print(f"  {ci.get('metric_label', 'Leg current difference')}: "
+              f"Max={ci['max_imbalance_pct']:.2f}%  "
+              f"Mean={ci['mean_imbalance_pct']:.2f}%  [MEASUREMENT — no limit]")
+        if ci.get("note"):
+            print(f"  {ci['note']}")
     else:
         sym = "PASS" if ci["pct_exceeding"] == 0 else "FAIL"
         print(f"  Max={ci['max_imbalance_pct']:.2f}%  Mean={ci['mean_imbalance_pct']:.2f}%  "
@@ -484,8 +513,14 @@ def print_report(report: dict) -> None:
         print("  NEUTRAL HARMONICS (informational)")
         t_pct = nh.get("triplen_pct", 0.0)
         acc   = nh.get("accumulation_factor")
-        acc_s = f"{acc:.1f}×" if acc is not None else "n/a"
-        print(f"  Triplen content: {t_pct:.0f}%  |  Accumulation factor: {acc_s}")
+        if nh.get("accumulation_note"):
+            # Split-phase: the factor is not withheld for lack of data, it does
+            # not apply. Saying "n/a" would read as a gap in the recording.
+            print(f"  Triplen content: {t_pct:.0f}% of neutral harmonic current")
+            print(f"  {nh['accumulation_note']}")
+        else:
+            acc_s = f"{acc:.1f}×" if acc is not None else "n/a"
+            print(f"  Triplen content: {t_pct:.0f}%  |  Accumulation factor: {acc_s}")
         for h, od in sorted(nh["orders"].items()):
             tag = " [triplen]" if od["is_triplen"] else "          "
             print(f"  H{h:<3}{tag}  mean={od['mean_a']:.3f} A  max={od['max_a']:.3f} A")
@@ -998,12 +1033,21 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         r.font.size = Pt(9)
         r.font.color.rgb = _XE_BLUE
 
-    # Demand / transformer loading
+    # Demand / transformer loading. On a shared transformer the row states
+    # what was measured -- this service's contribution -- rather than claiming
+    # the transformer was inside its nameplate, which one meter cannot show.
     if "transformer" in dem:
         tx   = dem["transformer"]
         meas = f"{tx['peak_8h_kva']:.0f} kVA 8-hr peak  /  {tx['nameplate_kva']:.0f} kVA nameplate  ({tx['pct_nameplate']:.0f}%)"
-        add_row("Steady-state demand ≤ transformer nameplate (8-hr peak)", meas,
-                not tx["overloaded"], sev.get("demand"), group="power")
+        if tx["overloaded"] is None:
+            add_row("This service's demand against transformer nameplate "
+                    "(8-hr peak; shared transformer, total loading not measured)",
+                    meas + "  |  this service only — other customers on this "
+                           "transformer were not measured",
+                    None, group="power")
+        else:
+            add_row("Steady-state demand ≤ transformer nameplate (8-hr peak)", meas,
+                    not tx["overloaded"], sev.get("demand"), group="power")
     else:
         add_row("Steady-state demand ≤ transformer nameplate (8-hr peak)", "No nameplate provided", None, group="power")
 
@@ -1217,12 +1261,19 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     else:
         add_row("Voltage imbalance < 3% (ANSI C84.1 / NEMA MG1)", "No data", None, group="voltage")
 
-    # Current imbalance
+    # Current imbalance — a limit on three-phase service, a reported
+    # measurement on two legs, where no PSCo or standard limit exists.
     if thresh.customer_class in ("sg", "pg"):
         ci_label = "Current imbalance < 10%  (PSCo Tariff Sheet R121 ≤ 15% for C&I)"
     else:
         ci_label = "Current imbalance < 10% (NEMA MG1)"
-    if ci["available"]:
+    if ci["available"] and ci.get("limit_pct") is None:
+        add_row("Leg current difference (reported, no limit applies)",
+                f"Max {ci['max_imbalance_pct']:.2f}%  /  "
+                f"Mean {ci['mean_imbalance_pct']:.2f}%  |  measurement, not a "
+                f"violation — no limit is set for a two-leg service",
+                None, group="current")
+    elif ci["available"]:
         meas = f"Max {ci['max_imbalance_pct']:.2f}%  /  Mean {ci['mean_imbalance_pct']:.2f}%  (limit {ci['limit_pct']:.1f}%)"
         add_row(ci_label, meas, pf["current_imbalance"],
                 sev.get("current_imbalance"), group="current")
@@ -1699,20 +1750,20 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
                             "orders that exceed their limits.",
                 "priority": "High"})
 
+    # Three-phase only. A two-leg service reports its leg difference as a
+    # measurement with no limit, so `pf["current_imbalance"]` is None there and
+    # this never fires -- leg imbalance is not a violation and must not raise a
+    # High-priority action. The equivalent advice for a house is attached to
+    # the "Elevated neutral current" finding, which keys off the measured
+    # neutral current rather than off the imbalance itself.
     if (pf["current_imbalance"] is False
             and not any(k in covered for k in ("imbalance", "balance"))):
-        if residential:
-            rec = ("Have the split-phase load balanced between the two 120 V legs "
-                   "at the panel. Large single-phase additions — EV charging, "
-                   "a heat pump, a workshop circuit — are the usual cause of a "
-                   "service drifting out of balance.")
-        else:
-            rec = ("Redistribute single-phase loads across phases. Investigate "
-                   "whether triplen harmonics are contributing to elevated "
-                   "neutral current.")
-        actions.append({"recommendation": rec,
-                        "purpose":  "Reduce current imbalance and neutral current.",
-                        "priority": "High"})
+        actions.append({
+            "recommendation": ("Redistribute single-phase loads across phases. "
+                               "Investigate whether triplen harmonics are "
+                               "contributing to elevated neutral current."),
+            "purpose":  "Reduce current imbalance and neutral current.",
+            "priority": "High"})
 
     if pf.get("transformer_loading") is False and "transformer upgrade" not in covered:
         actions.append({
@@ -1859,9 +1910,11 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
 
     if "transformer" in dem:
         tx = dem["transformer"]
+        # None passes straight through to grade_finding, which returns
+        # "not_assessed" -- there is nothing to grade on a shared transformer.
         sev["demand"] = grade_finding(
-            not tx["overloaded"], measured=tx["peak_8h_kva"],
-            limit=tx["nameplate_kva"])
+            None if tx["overloaded"] is None else not tx["overloaded"],
+            measured=tx["peak_8h_kva"], limit=tx["nameplate_kva"])
 
     if ih.get("available"):
         sev["individual_harmonics"] = grade_finding(
@@ -2080,19 +2133,43 @@ def _word_demand(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
         )
         if "transformer" in dem:
             tx = dem["transformer"]
-            if tx["overloaded"]:
+            if tx["overloaded"] is True:
+                # True is sound whether or not the transformer is shared: this
+                # service's demand alone is a lower bound on its load, so
+                # exceeding nameplate proves an overload regardless of who else
+                # is connected.
+                shared_note = ("" if tx.get("dedicated") else
+                               " This service alone accounts for that, and the "
+                               "transformer serves other customers who were not "
+                               "measured, so the total is at least this much.")
                 _body(doc,
                     f"The transformer is overloaded. The nameplate is {tx['nameplate_kva']:.0f} kVA; "
                     f"the 8-hour rolling peak demand was {tx['peak_8h_kva']:.1f} kVA "
-                    f"({tx['pct_nameplate']:.0f}% of nameplate). "
+                    f"({tx['pct_nameplate']:.0f}% of nameplate).{shared_note} "
                     "Transformers can be loaded above nameplate on an 8-hour basis but not continuously. "
                     "A transformer upgrade should be evaluated."
                 )
-            else:
+            elif tx["overloaded"] is False:
                 _body(doc,
                     f"The transformer loading is within acceptable limits. "
                     f"The 8-hour peak was {tx['peak_8h_kva']:.1f} kVA "
                     f"({tx['pct_nameplate']:.0f}% of the {tx['nameplate_kva']:.0f} kVA nameplate)."
+                )
+            else:
+                # Shared transformer, this service below nameplate on its own.
+                # Nothing here supports a statement about the transformer, and
+                # this paragraph used to make one: "within acceptable limits",
+                # about equipment whose load was never measured.
+                _body(doc,
+                    f"This service's 8-hour peak demand was {tx['peak_8h_kva']:.1f} kVA "
+                    f"against a {tx['nameplate_kva']:.0f} kVA transformer "
+                    f"({tx['pct_nameplate']:.0f}% of nameplate). The transformer "
+                    "serves other customers whose load was not measured, so this "
+                    "figure is this service's contribution to its loading and not "
+                    "that loading. Whether the transformer is adequately sized "
+                    "cannot be determined from a recording at one meter; it would "
+                    "need transformer-level load data or a coincident recording "
+                    "across the services it feeds."
                 )
     _embed_plot(doc, outdir, stem, "demand_profile.png",
                 "Demand pattern over the recording period.")
@@ -2438,9 +2515,12 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             doc.add_paragraph(
                 f"In a single-phase 3-wire (split-phase) service, the neutral carries the difference "
                 f"current between L1 and L2, not the sum of zero-sequence currents from three phases. "
-                f"Neutral harmonic content here reflects load imbalance between legs rather than "
-                f"triplen accumulation. Triplen content: {t_pct:.0f}% of total neutral harmonic current. "
-                f"Accumulation factor (H3-neutral ÷ mean H3-phase): {acc_str}."
+                f"The two legs are 180 degrees apart, so odd harmonics — triplens included — subtract "
+                f"in the neutral as the fundamental does, rather than adding as they would on a "
+                f"120-degree system. No accumulation factor is reported for this service: the "
+                f"quantity is defined over three phases and does not apply here. Neutral harmonic "
+                f"content reflects imbalance between the legs. Triplen content: {t_pct:.0f}% of total "
+                f"neutral harmonic current."
             )
         else:
             doc.add_paragraph(
@@ -2735,7 +2815,25 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             # actually loaded. Stating otherwise recommended replacing a unit
             # sitting at 27% of nameplate, in a report that had already called
             # its loading acceptable two sections earlier.
-            if pct_tx > 70:
+            if not tx.get("dedicated"):
+                # pct_nameplate is this service's contribution, not the
+                # transformer's loading, so it cannot decide either branch
+                # below. The "> 70" test would read a house at 30% as lightly
+                # loaded on a transformer that may sit at 95%, and the else
+                # branch would then assert thermal margin nobody measured.
+                _body(doc,
+                    f"This service contributes {pct_tx:.0f}% of the "
+                    f"{tx['nameplate_kva']:.0f} kVA nameplate at its 8-hour "
+                    f"peak, and draws a K-factor of {kf_med:.1f}. Harmonic "
+                    "heating scales with load current, so whether this "
+                    "K-factor is thermally significant depends on the "
+                    "transformer's total loading — which includes other "
+                    "customers on the same transformer and was not measured "
+                    "here. This recording establishes the harmonic character "
+                    "of this service's load, not the transformer's thermal "
+                    "margin."
+                )
+            elif pct_tx > 70:
                 _body(doc,
                     f"With the transformer loaded to {pct_tx:.0f}% of its "
                     f"{tx['nameplate_kva']:.0f} kVA nameplate and a K-factor of "

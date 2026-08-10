@@ -160,6 +160,68 @@ def _require(df: pd.DataFrame, *cols: str) -> bool:
     return True
 
 
+#: Service geometries this tool distinguishes.  The discriminator is the angle
+#: between the legs, not how many there are, because that angle is what decides
+#: whether the neutral sees a difference or a sum and whether triplen harmonics
+#: cancel or accumulate:
+#:
+#:   "split-phase"  120/240 from a center tap.  Two legs 180 deg apart, so the
+#:                  neutral carries |I1 - I2|.  For any odd harmonic h the leg
+#:                  displacement is h*180 deg, which is 180 deg again, so odd
+#:                  harmonics -- triplens included -- subtract in the neutral
+#:                  exactly as the fundamental does.  There is no negative
+#:                  sequence and no three-phase motor to derate.
+#:   "two-leg-208"  Two legs of a 120/208 wye, 120 deg apart.  The neutral
+#:                  carries a vector sum, and triplens are in phase (3*120 deg
+#:                  = 360 deg) so they accumulate.  Only two of the three
+#:                  phases are measured.
+#:   "three-phase"  Full 3-phase wye.  NEMA MG1 unbalance and triplen
+#:                  accumulation up to 3x both apply as written.
+#:   "single-phase" One leg only; nothing to compare against.
+SERVICE_GEOMETRIES = ("split-phase", "two-leg-208", "three-phase", "single-phase")
+
+
+def service_geometry(thresh: Thresholds, columns) -> str:
+    """Resolve which service geometry the checks should reason about.
+
+    The engineer's picks win over channel presence, which cannot tell a
+    120/240 service from two legs of a 120/208 one and cannot tell a genuinely
+    single-phase service from a three-phase export that dropped a phase --
+    see the note on `Thresholds.service_type`.  `check_neutral_health` resolved
+    this inline before it was shared; this is the same precedence.
+    """
+    if is_single_phase_208(thresh.service_type):
+        return "two-leg-208"
+    if thresh.topology == "split-phase":
+        return "split-phase"
+    if thresh.topology == "3ph-wye":
+        return "three-phase"
+    cols = set(columns)
+    if "current_c" in cols or "voltage_c" in cols:
+        return "three-phase"
+    if "current_b" in cols or "voltage_b" in cols:
+        return "split-phase"
+    return "single-phase"
+
+
+def accumulates_triplens(geometry: str) -> bool:
+    """True where triplen harmonics add in the neutral rather than subtract."""
+    return geometry in ("two-leg-208", "three-phase")
+
+
+#: Service classes that normally have the service transformer to themselves.
+#: At PG the customer owns it outright; at SG a >50 kW service is built with a
+#: dedicated pad.  Residential and small commercial share one transformer with
+#: several neighbours, so a recording at one meter sees one contributor to its
+#: load and not the load itself.
+_DEDICATED_TRANSFORMER_CLASSES = frozenset({"sg", "pg"})
+
+
+def has_dedicated_transformer(customer_class: Optional[str]) -> bool:
+    """True when this service's demand is the whole of its transformer's load."""
+    return (customer_class or "") in _DEDICATED_TRANSFORMER_CLASSES
+
+
 #: Meter K-factor columns by phase label.  Phase A keeps the historical name.
 KFACTOR_COLS = {"A": "kfactor_meter", "B": "kfactor_current_b",
                 "C": "kfactor_current_c", "N": "kfactor_current_neutral"}
@@ -1043,14 +1105,24 @@ _PLT_LIMIT = 0.65   # IEC 61000-3-3 long-term flicker severity limit
 
 
 def check_neutral_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
-    """Neutral harmonic analysis — zero-sequence triplen accumulation diagnostic.
+    """Neutral harmonic analysis.
 
-    In a 4-wire wye system, H3/H9/H15 (zero-sequence triplens) from single-phase
-    nonlinear loads add arithmetically in the neutral rather than canceling.
-    This function quantifies:
-      - Per-order neutral harmonic current (Amps, mean and max)
-      - Triplen vs non-triplen split
-      - Accumulation factor: H3_neutral / mean(H3_a, H3_b, H3_c)
+    Per-order neutral harmonic current (Amps, mean and max) is measured on any
+    service that reports a neutral channel -- neutral heating is real whatever
+    the geometry.
+
+    The *accumulation* diagnostic is not.  Triplens add in the neutral because
+    3 x 120 deg = 360 deg puts them in phase, which is a property of a 120 deg
+    system.  On a 120/240 split-phase service the legs are 180 deg apart, and
+    h x 180 deg is 180 deg again for every odd h, so triplens subtract in the
+    neutral exactly as the fundamental does.  There is nothing to accumulate,
+    and the factor's own scale (0 cancels / 1 one phase dominates / 3 full
+    accumulation) is defined over three phases.  So on split-phase the
+    accumulation factor and the zero-sequence reading are withheld rather than
+    computed over two legs and interpreted against a three-phase scale.
+
+    Where it does apply -- 120/208 two-leg and full three-phase --
+      Accumulation factor: H3_neutral / mean(H3_a, H3_b, H3_c)
           ≈ 0     → H3 cancels (balanced 3-phase, near-zero neutral H3)
           ≈ 1     → one phase dominates
           ≈ 3     → equal H3 from all three phases accumulates fully
@@ -1061,8 +1133,19 @@ def check_neutral_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
     if not avail:
         return {"available": False, "note": "No neutral harmonic channels in dataset"}
 
+    geometry = service_geometry(thresh, df.columns)
+    triplens_accumulate = accumulates_triplens(geometry)
+
     result: dict = {
         "available": True,
+        "geometry":             geometry,
+        "triplens_accumulate":  triplens_accumulate,
+        "accumulation_note":    None if triplens_accumulate else (
+            "Triplen accumulation is not evaluated on a 120/240 split-phase "
+            "service. The two legs are 180 degrees apart, so odd harmonics -- "
+            "triplens included -- subtract in the neutral as the fundamental "
+            "does, rather than adding as they would on a 120-degree system. "
+            "The neutral harmonic currents below are still measured."),
         "orders":               {},
         "triplen_sum_mean_a":   0.0,
         "nontriplen_sum_mean_a": 0.0,
@@ -1099,11 +1182,14 @@ def check_neutral_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
     result["triplen_sum_mean_a"]    = round(t_mean, 3)
     result["nontriplen_sum_mean_a"] = round(nt_mean, 3)
     result["triplen_pct"]           = round(t_mean / total * 100, 1) if total > 0 else 0.0
-    result["triplen_dominant"]      = total > 0 and t_mean / total > 0.5
+    # "Dominant" drives the zero-sequence narrative downstream, so it only
+    # means anything where triplens can accumulate in the first place.
+    result["triplen_dominant"]      = (triplens_accumulate and total > 0
+                                       and t_mean / total > 0.5)
 
     h3_n_col    = "h3_current_neutral"
     h3_ph_cols  = [f"h3_current_{p}" for p in "abc" if f"h3_current_{p}" in df.columns]
-    if h3_n_col in df.columns and h3_ph_cols:
+    if triplens_accumulate and h3_n_col in df.columns and h3_ph_cols:
         h3_n_mean  = float(df[h3_n_col].dropna().mean())
         h3_ph_mean = float(df[h3_ph_cols].mean(axis=1).mean())
         if h3_ph_mean > 0.01:
@@ -2132,12 +2218,23 @@ def check_voltage_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
 
 
 def check_current_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
-    """Current imbalance check per PSC procedure (limit: 10 %).
+    """Current imbalance: a limit on three-phase service, a measurement on two legs.
 
-    Imbalance = max phase deviation from 3-phase average / average × 100 %.
-    Also reports neutral current statistics if the channel is present —
-    high neutral current indicates either load imbalance or triplen harmonics.
+    Three-phase: imbalance = max phase deviation from the average / average,
+    against the 10% PSC procedure limit.
+
+    Two legs: the same arithmetic reduces to |I1 - I2| / (I1 + I2), so the 10%
+    limit would mean the legs differ by 20% of their average -- which is
+    ordinary on a service where loads are assigned to legs by breaker position.
+    There is no PSCo limit on split-phase leg imbalance and no standard one, so
+    none is applied: the figure is reported as a measurement, and the verdict
+    is left to the things that do have limits -- per-leg ANSI C84.1 voltage and
+    `check_neutral_health`. Leg imbalance is what *causes* those; reporting it
+    as a violation in its own right would be inventing a threshold.
+
+    Also reports neutral current statistics if the channel is present.
     """
+    geometry = service_geometry(thresh, df.columns)
     i_cols = [c for c in ["current_a", "current_b", "current_c"] if c in df.columns]
     if len(i_cols) < 2:
         return {
@@ -2161,12 +2258,47 @@ def check_current_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
     # Skip rows where average current is negligible (avoids divide-near-zero noise)
     imbalance = np.where(avg > 1.0, dev / avg * 100, np.nan)
     imb_series = pd.Series(imbalance, index=idf.index)
-    exceed = imb_series > thresh.current_imbalance_limit
+
+    two_leg = len(i_cols) < 3 or geometry in ("split-phase", "two-leg-208")
+    if two_leg:
+        limit = None
+        exceed = pd.Series(False, index=idf.index)
+        metric, metric_label = "leg_difference", "Leg current difference"
+        basis = ("Difference between the legs as a percentage of their average "
+                 "-- for two legs this is |I1 - I2| / (I1 + I2).")
+        if geometry == "two-leg-208":
+            note = ("This service takes two legs of a three-phase 120/208 "
+                    "transformer, so the third phase is not measured and "
+                    "three-phase imbalance at the transformer cannot be "
+                    "determined from this recording. No limit is applied to "
+                    "the difference between the two legs served; the figure "
+                    "is a measurement, not a violation.")
+        else:
+            note = ("No limit is applied. Unequal loading of the two legs is "
+                    "normal on a 120/240 service -- loads are assigned to legs "
+                    "by breaker position and change through the day -- and "
+                    "neither PSCo procedure nor any standard sets a limit on "
+                    "it. This figure is a measurement, not a violation. What "
+                    "it bears on is neutral current and the difference between "
+                    "the two leg voltages, which are evaluated against ANSI "
+                    "C84.1 and reported under neutral health.")
+    else:
+        limit = thresh.current_imbalance_limit
+        exceed = imb_series > limit
+        metric, metric_label = "nema_style", "Current imbalance"
+        basis = ("Max phase deviation from the three-phase average, over that "
+                 "average, per PSC procedure.")
+        note = None
 
     result: dict = {
         "available":            True,
         "error":                None,
-        "limit_pct":            thresh.current_imbalance_limit,
+        "geometry":             geometry,
+        "limit_pct":            limit,
+        "metric":               metric,
+        "metric_label":         metric_label,
+        "basis":                basis,
+        "note":                 note,
         "max_imbalance_pct":    float(np.nanmax(imbalance)),
         "mean_imbalance_pct":   float(np.nanmean(imbalance)),
         "pct_exceeding":        float(exceed.mean() * 100),
@@ -2237,11 +2369,34 @@ def check_demand(df: pd.DataFrame, thresh: Thresholds) -> dict:
 
         if thresh.transformer_kva is not None:
             pct = peak_8h_kva / thresh.transformer_kva * 100
+            dedicated = has_dedicated_transformer(thresh.customer_class)
+            # `peak_8h_kva` is this service's demand. Where the transformer is
+            # shared -- a residential pole or pad transformer feeds several
+            # houses -- that demand is a *lower bound* on the transformer's
+            # load, because the neighbours were not measured. The inference is
+            # one-sided: above nameplate proves an overload whoever else is on
+            # it, but below nameplate proves nothing at all. So the negative
+            # case is None (not determinable) rather than False, and nothing
+            # downstream may turn it into an all-clear.
+            if pct > 100:
+                overloaded = True
+            elif dedicated:
+                overloaded = False
+            else:
+                overloaded = None
             result["transformer"] = {
                 "nameplate_kva": thresh.transformer_kva,
                 "peak_8h_kva":   round(peak_8h_kva, 1),
                 "pct_nameplate": round(pct, 1),
-                "overloaded":    pct > 100,
+                "dedicated":     dedicated,
+                "overloaded":    overloaded,
+                "note": None if dedicated else (
+                    "This transformer serves other customers whose load was "
+                    "not measured. The figure below is this service's own "
+                    "demand against the nameplate — its contribution to the "
+                    "transformer's load, not that load. Total transformer "
+                    "loading cannot be determined from a recording at one "
+                    "meter."),
             }
 
     if "power_real" in df.columns:
@@ -3335,29 +3490,41 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
             },
         }]
 
-    # ── Resolved to a family; can it be resolved to one member? ──────────────
+    # ── The family is as far as a single-point measurement goes ─────────────
+    # Naming the individual entry was measured against synthetic mixtures of
+    # two or three library loads sharing one service: on secondary service it
+    # named a load that was not present 45% of the time, on primary 32%.  See
+    # test_pq.py::TestLoadSignatureMixtures.  The meter sees the sum of
+    # everything behind it, so a spectrum sitting nearest one entry is not
+    # evidence that entry is drawing the current -- a blend of two loads lands
+    # near a third entry that neither parent resembles.  Only the family, which
+    # is a statement about converter topology, survives that.  Confidence is
+    # capped at medium for the same reason: nothing measured here supports a
+    # high-confidence equipment claim.
     same_family = [(sc, sg) for sc, sg in scored
                    if sg.get("family") == top_family]
     member_sep = (same_family[0][0] - same_family[1][0]
                   if len(same_family) > 1 else 1.0)
-    resolved_member = member_sep >= SIGNATURE_MEMBER_SEPARATION
 
-    if resolved_member:
-        title = f"Possible load type: {top_sig['title']}"
-        detail = ""
-        conf = "high" if family_sep >= 0.15 else "medium"
+    title = (f"Possible load family: "
+             f"{LOAD_FAMILY_LABEL.get(top_family, top_family)}")
+    if len(same_family) == 1:
+        detail = (f" This family has one reference entry "
+                  f"(\"{top_sig['title']}\") for this class of service, so the "
+                  f"family and that entry coincide here. It remains a match on "
+                  f"spectral shape, not an identification of the equipment "
+                  f"present.")
     else:
-        # Name the family.  The specific entry is not distinguishable, and
-        # picking one would be arbitrary.
-        title = (f"Possible load family: "
-                 f"{LOAD_FAMILY_LABEL.get(top_family, top_family)}")
         peers = ", ".join(f'"{sg["title"]}"' for _, sg in same_family[:3])
-        detail = (f" The individual load type is not resolvable from the "
-                  f"spectrum -- {peers} share this topology and score within "
-                  f"{member_sep * 100:.1f} points of each other -- so the "
-                  f"family is reported rather than a specific piece of "
-                  f"equipment.")
-        conf = "medium" if family_sep >= 0.15 else "low"
+        near = ("scoring within "
+                f"{member_sep * 100:.1f} points of each other"
+                if member_sep < SIGNATURE_MEMBER_SEPARATION
+                else "and a service carrying more than one load routinely "
+                     "scores nearest an entry it does not contain")
+        detail = (f" The individual load type is not reported -- {peers} share "
+                  f"this topology, {near} -- so the family is reported rather "
+                  f"than a specific piece of equipment.")
+    conf = "medium" if family_sep >= 0.15 else "low"
 
     findings.append({
         "category":       "harmonics",
@@ -3380,11 +3547,11 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
         "confidence":     conf,
         "evidence":       {
             "similarity":        round(top_score, 3),
-            "signature_id":      top_sig["id"],
+            "signature_id":      top_sig["id"],   # nearest entry, not reported
             "family":            top_family,
             "family_separation": round(family_sep, 3),
             "member_separation": round(member_sep, 3),
-            "resolved_to_member": resolved_member,
+            "resolved_to_member": False,
             "rank":              1,
             "h5_h7_ratio":       round(h5_h7, 2),
             "h3_h5_ratio":       round(h3_h5, 2),
@@ -3485,6 +3652,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
 
     i_cols = [c for c in ["current_a", "current_b", "current_c"] if c in df.columns]
     il_amps = float(df[i_cols].max(axis=1).max()) if i_cols else 0.0
+    geometry = service_geometry(thresh, df.columns)
 
     # ── Harmonic signature detection ──────────────────────────────────────────
     if il_amps > 0 and any(f"h5_current_{p}" in df.columns for p in "abc"):
@@ -3589,6 +3757,25 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                         "Verify neutral conductor sizing. Consider a K-rated transformer. "
                         "Identify single-phase nonlinear loads (SMPS, LED drivers, EV chargers)."
                     )
+            elif geometry == "split-phase":
+                # A house has no A/B/C phases to redistribute across, and the
+                # neutral here carries the difference between two legs rather
+                # than a three-phase residual.
+                cause_text = (
+                    f"Neutral current ({in_pct:.1f}% of phase average) is the "
+                    f"difference between the two 120 V legs (leg difference "
+                    f"mean {ci_mean:.1f}%). On a 120/240 service the legs are "
+                    "180 degrees apart, so the neutral carries whatever the "
+                    "legs do not share. Unequal loading of the legs is the "
+                    "ordinary cause and is not a fault in itself."
+                )
+                rec_text = (
+                    "Confirm the neutral is sound before reading this as load "
+                    "distribution — the neutral health assessment bears on "
+                    "that. Where the neutral is intact, moving 120 V loads "
+                    "between the two legs at the panel reduces both the "
+                    "neutral current and the voltage difference between legs."
+                )
             else:
                 cause_text = (
                     f"Neutral current ({in_pct:.1f}% of phase average) is primarily driven by "
@@ -3620,6 +3807,11 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                                    f"above for measured amps)."),
                 "cause":          cause_text,
                 "origin_evidence": (
+                    "Neutral current is the difference between the two legs, "
+                    "so it follows from how load is split between them and "
+                    "from the harmonic content each leg draws, downstream of "
+                    "the meter."
+                    if geometry == "split-phase" else
                     "Neutral current is the sum of the phase currents, so it "
                     "follows from how load is distributed across the legs and "
                     "from triplen harmonic content downstream of the meter."
@@ -3792,37 +3984,68 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 ),
                 "recommendation": ("Measure voltage imbalance with all customer loads "
                                    "disconnected to isolate the utility contribution. "
-                                   "If voltage imbalance exceeds 1% at no-load, Xcel Energy "
-                                   "will investigate the distribution system."),
+                                   "Voltage imbalance still above 1% at no-load would "
+                                   "point upstream of the meter and warrant a "
+                                   "distribution review."),
                 "confidence":     "medium",
                 "evidence":       {"current_imb_mean_pct": round(ci_mean, 2),
                                    "voltage_imb_mean_pct": round(vi_mean, 2)},
             })
 
     # ── Voltage imbalance, with the discriminating evidence ──────────────────
-    if pf_flags.get("voltage_imbalance") is False:
+    # Only reached when current imbalance did *not* fail. This finding's title
+    # and origin evidence both assert that load current is balanced, and they
+    # used to assert it without checking: on the residential fixture it fired
+    # alongside "Current imbalance -- investigate supply voltage", one saying
+    # both were elevated and the other saying current was low, about the same
+    # recording.
+    if (pf_flags.get("voltage_imbalance") is False
+            and pf_flags.get("current_imbalance") is not False):
         vi_max = volt_imb.get("max_imbalance_pct", 0)
+        if geometry in ("split-phase", "two-leg-208"):
+            # Two legs, so there is no third phase to lose a fuse on and no
+            # delta to open. The leg difference is a voltage divider across the
+            # neutral impedance.
+            title = "Leg voltage difference with balanced leg currents"
+            cause = ("On a two-leg service a sustained difference between the "
+                     "leg voltages comes from unequal loading acting across the "
+                     "impedance of the shared neutral path, or from added "
+                     "resistance in that path. With the leg currents balanced, "
+                     "the neutral path itself is the more likely of the two.")
+            origin = ("The legs differ in voltage while drawing comparable "
+                      "current. Unequal loading would show in the currents, so "
+                      "this pattern points to the shared neutral or supply "
+                      "rather than to how load is split between the legs.")
+            rec = ("Read this together with the neutral health assessment. "
+                   "Inspect the neutral path from the transformer through the "
+                   "service drop and meter socket to the panel, and measure "
+                   "neutral-to-ground voltage under load.")
+        else:
+            title = "Voltage imbalance with balanced load current"
+            cause = ("Steady-state voltage imbalance exceeding 3% is typically caused "
+                     "by unbalanced distribution transformer loading, asymmetric "
+                     "line impedances, a blown capacitor fuse on one phase, "
+                     "or an open delta transformer configuration.")
+            origin = ("Voltage imbalance is present while current imbalance is low, "
+                      "which is the pattern expected of an asymmetry upstream of "
+                      "the meter rather than of load distribution.")
+            rec = ("Confirming the origin requires measurement with all customer "
+                   "loads disconnected. Feeder capacitor bank fuses and "
+                   "transformer loading on adjacent services are worth checking.")
         findings.append({
             "category":       "voltage",
             "severity":       "warning",
-            "title":          "Voltage imbalance with balanced load current",
-            "finding":        (f"Voltage imbalance max {vi_max:.2f}%, "
+            "title":          title,
+            "finding":        (f"{volt_imb.get('metric_label', 'Voltage imbalance')} "
+                               f"max {vi_max:.2f}%, "
                                f"mean {volt_imb.get('mean_imbalance_pct', 0):.2f}% "
-                               f"(limit 3%)."),
-            "cause":          ("Steady-state voltage imbalance exceeding 3% is typically caused "
-                               "by unbalanced distribution transformer loading, asymmetric "
-                               "line impedances, a blown capacitor fuse on one phase, "
-                               "or an open delta transformer configuration."),
-            "origin_evidence": (
-                "Voltage imbalance is present while current imbalance is low, "
-                "which is the pattern expected of an asymmetry upstream of "
-                "the meter rather than of load distribution."
-            ),
-            "recommendation": ("Confirming the origin requires measurement with all customer "
-                               "loads disconnected. Feeder capacitor bank fuses and "
-                               "transformer loading on adjacent services are worth checking."),
+                               f"(limit {volt_imb.get('limit_pct', 3.0):.0f}%)."),
+            "cause":          cause,
+            "origin_evidence": origin,
+            "recommendation": rec,
             "confidence":     "high",
-            "evidence":       {"voltage_imb_max_pct":  round(vi_max, 2)},
+            "evidence":       {"voltage_imb_max_pct":  round(vi_max, 2),
+                               "geometry":             geometry},
         })
 
     # ── Voltage — low at high load (secondary drop) ───────────────────────────
