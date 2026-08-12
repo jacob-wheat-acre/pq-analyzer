@@ -28,6 +28,8 @@ import zlib
 
 import pqdif
 from pq_constants import (
+    SEVERITY_LABEL,
+    strip_marks,
     SEVERITY_ORDER,
     Thresholds,
     _h519_limit,
@@ -1736,14 +1738,14 @@ class TestFlickerSeverity:
         fl, sev = self._sev(quiet)
         assert fl["overall_pass"] is False          # compliance stays binary
         assert sev["flicker"]["band"] == "minor"    # severity does not
-        assert "0.2% of the recording" in sev["flicker"]["reason"]
+        assert "0.2% of the recording" in strip_marks(sev["flicker"]["reason"])
 
     def test_a_sustained_exceedance_is_significant(self):
         # Over the limit for a third of the recording, never dramatically.
         values = [1.2] * 170 + [0.3] * 330
         fl, sev = self._sev(values)
         assert sev["flicker"]["band"] in ("significant", "severe")
-        assert "34.0% of the recording" in sev["flicker"]["reason"]
+        assert "34.0% of the recording" in strip_marks(sev["flicker"]["reason"])
 
     def test_severity_is_graded_for_each_measure_separately(self):
         # Pst quiet with one spike, Plt over limit most of the time: the two
@@ -2551,6 +2553,52 @@ class TestBothDocumentsOpen:
         assert app.errors and "customer document" in app.errors[0]
         # The one that did get written still opens.
         assert app._open_btn.state == "normal"
+
+
+class TestABrokenInstallSaysWhatBroke:
+    """A failed engine import must not surface as a NameError on a file.
+
+    Everything the GUI needs from pq_analyzer comes in through one try/except,
+    so one failed import leaves every one of those names undefined. The run
+    then died at whichever name it reached first -- "NameError: name
+    'Thresholds' is not defined" -- which names a symptom four hundred lines
+    from the cause, on a machine whose .pqd file cannot be sent to us.
+    """
+
+    def test_the_run_stops_with_the_import_traceback(self, monkeypatch):
+        import run
+        monkeypatch.setattr(run, "_BOOK_AVAILABLE", False)
+        monkeypatch.setattr(run, "_IMPORT_TRACEBACK",
+                            "ModuleNotFoundError: No module named 'docx'")
+        with pytest.raises(RuntimeError) as excinfo:
+            run.PQApp._do_analysis(object(), {"filepath": "/tmp/site.pqd"})
+        message = str(excinfo.value)
+        assert "No module named 'docx'" in message          # the actual cause
+        assert "install problem" in message                 # not this file
+        assert "site.pqd" in message
+        assert "Thresholds" not in message
+
+    def test_the_message_says_which_version_it_is(self, monkeypatch):
+        # "They may have an older version though" is the first question asked
+        # of any report from the field, and the tool could not answer it.
+        import run
+        from pq_constants import __version__
+        monkeypatch.setattr(run, "_BOOK_AVAILABLE", False)
+        monkeypatch.setattr(run, "_IMPORT_TRACEBACK", "boom")
+        with pytest.raises(RuntimeError) as excinfo:
+            run.PQApp._do_analysis(object(), {"filepath": "/tmp/site.pqd"})
+        assert __version__ in str(excinfo.value)
+        assert run._ENGINE_VERSION == __version__
+
+    def test_a_working_install_is_not_blocked(self, monkeypatch):
+        # The guard must not be what stops a healthy run: it passes through to
+        # the analysis, which then fails on the missing file instead.
+        import run
+        monkeypatch.setattr(run, "_BOOK_AVAILABLE", True)
+        with pytest.raises(Exception) as excinfo:
+            run.PQApp._do_analysis(object(), {"filepath": "/tmp/nope.pqd",
+                                              "nominal": 120.0})
+        assert "install problem" not in str(excinfo.value)
 
 
 class TestSinglePhase208Service:
@@ -3494,6 +3542,49 @@ class TestComplianceRowsQuoteMeasurements:
         assert r["worst_limit_pct"] < 2.0
 
 
+def _sample_documents(outdir):
+    """Both documents, for a residential and a large-commercial recording.
+
+    Styling has to hold across classes: the two documents route different
+    sections, and a colour added to a commercial-only table is exactly the kind
+    of drift a residential-only check would miss.
+    """
+    import pq_analysis as An
+    from pq_report import (generate_report, generate_word_report,
+                           generate_customer_letter)
+    outdir = Path(outdir)
+    paths = []
+    for pqd, cls, nominal in [("test_data/test_residential.pqd", "r", 120.0),
+                              ("test_data/test_commercial_large.pqd", "c", 277.0)]:
+        source = Path(pqd)
+        if not source.exists():
+            continue
+        ds = extract_dataset(ProntoAdapter(source), ChannelMapper())
+        th = Thresholds(nominal_voltage=nominal, customer_class=cls)
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        stem = source.stem
+        paths.append(generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", engineer_contact="", outdir=outdir, stem=stem))
+        paths.append(generate_customer_letter(
+            rep, th, "1 Test St", "Eng", outdir, stem))
+    assert paths, "no sample recordings available to style-check"
+    return [Path(p) for p in paths if p is not None]
+
+
 class TestSeverityGrading:
     """Severity is a second axis beside compliance, not a replacement for it.
 
@@ -3545,7 +3636,8 @@ class TestSeverityGrading:
         from pq_analysis import grade_finding
         g = grade_finding(True, measured=7.2, limit=8.0)
         assert g["band"] == "watch"
-        assert "90% of it" in g["reason"]
+        assert "90% of it" in strip_marks(g["reason"])
+
 
     def test_a_healthy_power_factor_is_not_flagged_as_watch(self):
         from pq_analysis import grade_finding
@@ -3565,6 +3657,190 @@ class TestSeverityGrading:
     def test_an_unassessed_check_has_no_severity(self):
         from pq_analysis import grade_finding
         assert grade_finding(None)["band"] == "not_assessed"
+
+
+class TestOneSeverityScale:
+    """Colour and wording are a system, and systems drift.
+
+    Three analyses grew their own severity words and their own reds before
+    there was a shared scale, so the same seriousness printed three ways. These
+    tests hold the rendering to one scale: one vocabulary, one ramp, alarm off
+    brand red, and every colour readable.
+    """
+
+    @staticmethod
+    def _contrast(hex_a, hex_b="FFFFFF"):
+        def lum(h):
+            ch = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+            f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+            return 0.2126 * f(ch[0]) + 0.7152 * f(ch[1]) + 0.0722 * f(ch[2])
+        hi, lo = sorted((lum(hex_a), lum(hex_b)), reverse=True)
+        return (hi + 0.05) / (lo + 0.05)
+
+    def test_every_severity_colour_is_readable_on_white(self):
+        from pq_report import _SEVERITY_STYLE
+        for band, (rgb, _) in _SEVERITY_STYLE.items():
+            ratio = self._contrast("%02X%02X%02X" % rgb)
+            assert ratio >= 4.5, f"{band} is {ratio:.2f}:1, below WCAG AA"
+
+    def test_alarm_is_not_the_brand_red(self):
+        from pq_report import _SEVERITY_STYLE, _XE_RED
+        severe = "%02X%02X%02X" % _SEVERITY_STYLE["severe"][0]
+        assert severe != str(_XE_RED)
+        # Far enough apart to survive a printer, not just a monitor.
+        dist = sum((int(severe[i:i + 2], 16) - int(str(_XE_RED)[i:i + 2], 16)) ** 2
+                   for i in (0, 2, 4)) ** 0.5
+        assert dist > 60, f"severe sits {dist:.0f} from brand red"
+
+    def test_the_older_scales_render_through_the_shared_one(self):
+        # Neutral integrity, assessment findings and action priorities each
+        # keep their own keys in the analysis layer; none of them may put a
+        # word or a colour on the page that the shared scale does not own.
+        from pq_report import _sev_band, _sev_color, _sev_label, _SEVERITY_STYLE
+        for legacy, band in [("critical", "severe"), ("warning", "significant"),
+                             ("caution", "minor"), ("normal", "compliant"),
+                             ("info", "watch"), ("High", "severe"),
+                             ("Medium", "significant"), ("Low", "watch")]:
+            assert _sev_band(legacy) == band
+            assert _sev_color(legacy) == _sev_color(band)
+            assert _sev_label(legacy) == SEVERITY_LABEL[band]
+        assert _sev_band("nonsense-band") == "not_assessed"
+        assert set(_SEVERITY_STYLE) == set(SEVERITY_LABEL)
+
+    def test_the_documents_paint_only_from_the_palette(self, tmp_path):
+        # The regression that started this: a fourth red, added locally, that
+        # no one could see was a fourth red.
+        import docx
+        allowed = {"%02X%02X%02X" % rgb for rgb, _ in
+                   __import__("pq_report")._SEVERITY_STYLE.values()}
+        allowed |= {"DA1020",                       # brand: headings, titles
+                    "FFFFFF",                       # text on the header band
+                    "333333", "555555", "666666", "6B6B6B", "808080"}  # neutrals
+        for path in _sample_documents(tmp_path):
+            d = docx.Document(str(path))
+            paras = list(d.paragraphs) + [
+                p for t in d.tables for row in t.rows
+                for c in row.cells for p in c.paragraphs]
+            for p in paras:
+                for r in p.runs:
+                    if r.font.color is not None and r.font.color.rgb is not None:
+                        assert str(r.font.color.rgb) in allowed, (
+                            f"{path.name}: unpalette colour "
+                            f"{r.font.color.rgb} on {r.text[:40]!r}")
+
+    def test_both_documents_are_set_in_the_house_font(self, tmp_path):
+        import docx
+        for path in _sample_documents(tmp_path):
+            d = docx.Document(str(path))
+            normal = d.styles["Normal"]
+            assert normal.font.name == "Arial"
+            assert normal.font.size.pt == 10
+
+
+class TestMeasuredValuesAreMarkedInProse:
+    """A reader must be able to tell a reading from a limit at a glance.
+
+    Prose puts both in one sentence -- "the measured 0.0226 Ω sits within the
+    range the expected 0.0249 Ω accounts for" -- and the second figure is a
+    calculation from the Blue Book, not something the meter saw. Measured
+    values are marked where they are written and render bold.
+    """
+
+    def test_a_marked_value_renders_bold_and_keeps_its_unit(self):
+        import docx
+        from pq_report import _DocxDocument, _apply_base_style, _body, _m
+        d = _DocxDocument()
+        _apply_base_style(d)
+        _body(d, f"The measured {_m(0.0226, '.4f', ' Ω')} sits inside the "
+                 f"expected {0.0249:.4f} Ω.")
+        runs = d.paragraphs[0].runs
+        bold = [r.text for r in runs if r.bold]
+        plain = "".join(r.text for r in runs if not r.bold)
+        assert bold == ["0.0226 Ω"]
+        assert "0.0249 Ω" in plain
+        assert "".join(r.text for r in runs) == (
+            "The measured 0.0226 Ω sits inside the expected 0.0249 Ω.")
+
+    def test_the_markers_never_reach_the_page(self, tmp_path):
+        # The sentinels are private-use characters; if a prose path ever
+        # bypasses the splitter they would print as boxes in a customer's copy.
+        import docx
+        from pq_report import _MEASURED_OPEN, _MEASURED_CLOSE
+        for path in _sample_documents(tmp_path):
+            xml = docx.Document(str(path)).element.xml
+            assert _MEASURED_OPEN not in xml, f"{path.name} leaked an open marker"
+            assert _MEASURED_CLOSE not in xml, f"{path.name} leaked a close marker"
+
+    def test_no_other_output_carries_the_markers(self, tmp_path, capsys):
+        # The analysis layer writes findings, and those strings go to the
+        # console and the CSVs as well as to Word. Only Word can render a mark.
+        import pq_analysis as An
+        from pq_report import (MEASURED_OPEN, MEASURED_CLOSE, generate_report,
+                               print_report, export_results)
+        ds = extract_dataset(ProntoAdapter(Path("test_data/test_residential.pqd")),
+                             ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        df = ds.df
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), An.detect_events(ds, th), th,
+            neutral_health_result=An.check_neutral_health(ds, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+
+        print_report(rep)
+        printed = capsys.readouterr().out
+        assert MEASURED_OPEN not in printed and MEASURED_CLOSE not in printed
+
+        export_results(ds, rep, tmp_path, "leak")
+        for csv in tmp_path.glob("*.csv"):
+            text = csv.read_text(errors="replace")
+            assert MEASURED_OPEN not in text, f"{csv.name} leaked a marker"
+            assert MEASURED_CLOSE not in text, f"{csv.name} leaked a marker"
+
+    def test_what_is_marked_is_a_number_and_not_a_label(self, tmp_path):
+        import re
+        import docx
+        for path in _sample_documents(tmp_path):
+            d = docx.Document(str(path))
+            for p in d.paragraphs:
+                if not p.style.name.startswith(("Normal", "Body", "List")):
+                    continue
+                if p.text.startswith("Figures in "):
+                    continue            # the key, which bolds the word "bold"
+                # Lead-in labels ("Finding:") are bold by their own right; a
+                # marked span is the rest, and every one must start in a digit.
+                for run in p.runs:
+                    text = run.text.strip()
+                    if not run.bold or not text or text.endswith(":"):
+                        continue
+                    if re.match(r'^[A-Z][A-Za-z]', text):
+                        continue        # severity headline, e.g. "SEVERE: ..."
+                    assert re.match(r'^[<>~+±-]?[\d.,]', text), (
+                        f"{path.name}: bold span is not a measurement: {text!r}")
+
+    def test_limits_and_ratings_stay_plain(self, tmp_path):
+        # The distinction is only worth drawing if the other side holds: a
+        # nameplate rating and a standard's limit must never come out bold.
+        import docx
+        for path in _sample_documents(tmp_path):
+            d = docx.Document(str(path))
+            for p in d.paragraphs:
+                text = p.text
+                if "nameplate" not in text and "Range A" not in text:
+                    continue
+                for run in p.runs:
+                    if not run.bold:
+                        continue
+                    following = text.split(run.text, 1)[-1][:12]
+                    assert not following.startswith((" kVA nameplate",
+                                                     " V) for the entire")), (
+                        f"{path.name}: a rating or limit rendered as measured: "
+                        f"{run.text!r}")
 
 
 class TestVoltageTHDIsJudgedStatistically:

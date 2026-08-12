@@ -9,8 +9,12 @@ import numpy as np
 import pandas as pd
 
 from pq_constants import (
+    MEASURED_CLOSE,
+    MEASURED_OPEN,
     SEVERITY_LABEL,
     SEVERITY_ORDER,
+    measured as _m,
+    strip_marks,
     is_single_phase_208,
     ll_factor,
     __version__,
@@ -43,13 +47,34 @@ try:
 except ImportError:
     _DOCX_AVAILABLE = False
 
-# Xcel Energy brand colours
-_XE_BLUE   = RGBColor(0x00, 0x4B, 0x87) if _DOCX_AVAILABLE else None
-_XE_LBLUE  = RGBColor(0x00, 0x9D, 0xD9) if _DOCX_AVAILABLE else None
-_XE_ORANGE = RGBColor(0xE8, 0x77, 0x22) if _DOCX_AVAILABLE else None
+# ── Colour system ────────────────────────────────────────────────────────────
+# One colour, one job. Xcel red is the brand: headings, titles and table header
+# bands, and nothing else. Severity owns the green-amber-orange-maroon ramp,
+# blue means "nothing is wrong yet", grey means "no reading to grade". Alarm was
+# moved off #CC0000 to deep maroon because it sat six percent from brand red --
+# on paper a heading and a severe finding printed as the same colour.
+#
+# Every text colour here clears 4.5:1 on white (WCAG AA for body text); the
+# shades are backgrounds only and are never the sole carrier of a verdict, which
+# always also has its own word.
+_XE_RED    = RGBColor(0xDA, 0x10, 0x20) if _DOCX_AVAILABLE else None
+# Compliance verdicts in prose and in the pass/fail column. These are the
+# "compliant" and "severe" bands of _SEVERITY_STYLE below, named for the job
+# they do here so a reader of either name lands on the same two colours.
 _PASS_CLR  = RGBColor(0x1F, 0x7A, 0x1F) if _DOCX_AVAILABLE else None
-_FAIL_CLR  = RGBColor(0xCC, 0x00, 0x00) if _DOCX_AVAILABLE else None
+_FAIL_CLR  = RGBColor(0x8C, 0x1D, 0x1D) if _DOCX_AVAILABLE else None
 _GRAY_CLR  = RGBColor(0xF2, 0xF2, 0xF2) if _DOCX_AVAILABLE else None
+
+#: Structural fills. Grey, so that a tinted cell anywhere in either document
+#: means a severity band and never decoration.
+_CHROME_HDR   = "DA1020"    # header band, white text on brand red
+_CHROME_BAND  = "E4E4E4"    # group divider inside a table
+_CHROME_LABEL = "EFEFEF"    # label column of a two-column table
+
+#: Body font. Arial at 10 pt is what this group writes in, so a report that
+#: gets pasted into other correspondence matches it without restyling.
+_BASE_FONT = "Arial"
+_BASE_PT   = 10
 
 
 def _cell_shade(cell, hex_color: str) -> None:
@@ -63,27 +88,94 @@ def _cell_shade(cell, hex_color: str) -> None:
     tcPr.append(shd)
 
 
+def _write_in_field(doc, label: str, *, lines: int = 1, indent_cm: float = 0.0,
+                    width_cm: float = 16.0, label_size_pt: int = 10):
+    """A box the engineer types into, rather than a rule they would write on.
+
+    Both documents are normally filled in and sent as files, not printed, and a
+    row of underscores is the wrong shape for that: typing on it inserts ahead
+    of the rule instead of sitting on it, so the line walks off the margin. A
+    single-cell table takes a click anywhere inside it, grows down as the notes
+    get longer, and still reads as a place to write on a printed copy.
+    """
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Cm(indent_cm)
+    p.paragraph_format.space_after = Pt(2)
+    _bold(p, label, size_pt=label_size_pt)
+
+    box = doc.add_table(rows=1, cols=1)
+    _set_col_widths(box, [width_cm])
+    cell = box.rows[0].cells[0]
+    _cell_shade(cell, "FCFCFD")
+
+    # A light outline, not the report's table rule: this is a field to fill,
+    # and it should not read as another data table.
+    borders = OxmlElement('w:tblBorders')
+    for edge in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+        el = OxmlElement(f'w:{edge}')
+        el.set(qn('w:val'), 'single')
+        el.set(qn('w:sz'), '4')
+        el.set(qn('w:color'), 'BFBFBF')
+        borders.append(el)
+    tblPr = box._tbl.tblPr
+    tblPr.append(borders)
+    if indent_cm:
+        ind = OxmlElement('w:tblInd')
+        ind.set(qn('w:w'), str(int(indent_cm * 567)))   # twips
+        ind.set(qn('w:type'), 'dxa')
+        tblPr.append(ind)
+
+    # "At least", so the box is visibly a space to write in when empty and
+    # still expands to hold however much is typed into it.
+    trPr = box.rows[0]._tr.get_or_add_trPr()
+    height = OxmlElement('w:trHeight')
+    height.set(qn('w:val'), str(int(lines * 0.55 * 567)))
+    height.set(qn('w:hRule'), 'atLeast')
+    trPr.append(height)
+    return cell
+
+
 def _set_col_widths(table, widths_cm):
     for row in table.rows:
         for cell, w in zip(row.cells, widths_cm):
             cell.width = Cm(w)
 
 
-def _bold(para, text: str, color=None, size_pt: int = 11):
-    run = para.add_run(text)
-    run.bold = True
-    run.font.size = Pt(size_pt)
-    if color:
-        run.font.color.rgb = color
-    return run
+# ── Measured values in prose ─────────────────────────────────────────────────
+# Marked values (see pq_constants.measured) render bold here; every other
+# output strips the markers instead.
+_MEASURED_OPEN  = MEASURED_OPEN
+_MEASURED_CLOSE = MEASURED_CLOSE
+_MEASURED_RE = re.compile(f"{_MEASURED_OPEN}(.*?){_MEASURED_CLOSE}", re.S)
 
 
-def _normal(para, text: str, color=None, size_pt: int = 11):
-    run = para.add_run(text)
-    run.font.size = Pt(size_pt)
-    if color:
-        run.font.color.rgb = color
-    return run
+def _emit_text(para, text: str, *, bold: bool = False, color=None,
+               size_pt: Optional[float] = _BASE_PT):
+    """Add ``text`` to a paragraph, breaking measured values into bold runs."""
+    def _add(chunk: str, measured: bool):
+        if not chunk:
+            return
+        run = para.add_run(chunk)
+        run.bold = bold or measured
+        if size_pt is not None:
+            run.font.size = Pt(size_pt)
+        if color:
+            run.font.color.rgb = color
+
+    pos = 0
+    for match in _MEASURED_RE.finditer(text):
+        _add(text[pos:match.start()], False)
+        _add(match.group(1), True)
+        pos = match.end()
+    _add(text[pos:], False)
+
+
+def _bold(para, text: str, color=None, size_pt: int = _BASE_PT):
+    _emit_text(para, text, bold=True, color=color, size_pt=size_pt)
+
+
+def _normal(para, text: str, color=None, size_pt: int = _BASE_PT):
+    _emit_text(para, text, color=color, size_pt=size_pt)
 
 
 def _pf_sym(passes) -> str:
@@ -100,25 +192,55 @@ def _pf_color(passes):
     return None
 
 
-#: Severity band → (text colour, cell shade).  Only "severe" gets alarm red;
-#: "watch" is deliberately a neutral blue-grey because nothing is wrong yet.
+#: The one severity scale. Band → (text colour, cell shade). Alarm is deep
+#: maroon rather than red so it cannot be confused with a brand-red heading;
+#: "watch" is blue because nothing is wrong yet, and blue does no other job.
 _SEVERITY_STYLE = {
-    "compliant":    ((0x1F, 0x7A, 0x1F), "E8F4E8"),
-    "watch":        ((0x4A, 0x5F, 0x73), "EEF1F4"),
-    "minor":        ((0x8A, 0x6D, 0x00), "FFF8E1"),
-    "significant":  ((0xC0, 0x5A, 0x00), "FFECD9"),
-    "severe":       ((0xCC, 0x00, 0x00), "FFE3E3"),
-    "not_assessed": ((0x77, 0x77, 0x77), "F2F2F2"),
+    "compliant":    ((0x1F, 0x7A, 0x1F), "E9F4E9"),
+    "watch":        ((0x1F, 0x5C, 0x8B), "E7EFF7"),
+    "minor":        ((0x8A, 0x6D, 0x00), "FAF2D8"),
+    "significant":  ((0xA8, 0x50, 0x00), "FBE8D6"),
+    "severe":       ((0x8C, 0x1D, 0x1D), "F5DCDC"),
+    "not_assessed": ((0x6B, 0x6B, 0x6B), "F0F0F0"),
+}
+
+#: Three analyses grew their own severity words before there was a shared
+#: scale: neutral integrity grades critical/warning/caution/normal, the
+#: assessment findings grade critical/warning/info, and recommended actions
+#: rank High/Medium/Low. The analysis code keeps those keys -- they are its
+#: data, and tests and CSVs read them -- but every one of them renders through
+#: the band it maps to here, so one seriousness prints as one word in one
+#: colour wherever the reader meets it.
+_SEVERITY_ALIAS = {
+    "critical": "severe",
+    "warning":  "significant",
+    "caution":  "minor",
+    "normal":   "compliant",
+    "info":     "watch",
+    "High":     "severe",
+    "Medium":   "significant",
+    "Low":      "watch",
 }
 
 
+def _sev_band(band) -> str:
+    """Canonical band for any of the scales the analysis code still speaks."""
+    band = _SEVERITY_ALIAS.get(band, band)
+    return band if band in _SEVERITY_STYLE else "not_assessed"
+
+
 def _sev_color(band):
-    rgb, _ = _SEVERITY_STYLE.get(band, _SEVERITY_STYLE["not_assessed"])
+    rgb, _ = _SEVERITY_STYLE[_sev_band(band)]
     return RGBColor(*rgb) if _DOCX_AVAILABLE else None
 
 
 def _sev_shade(band) -> str:
-    return _SEVERITY_STYLE.get(band, _SEVERITY_STYLE["not_assessed"])[1]
+    return _SEVERITY_STYLE[_sev_band(band)][1]
+
+
+def _sev_label(band) -> str:
+    """The word the reader sees, from the shared vocabulary."""
+    return SEVERITY_LABEL[_sev_band(band)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,7 +443,7 @@ def print_report(report: dict) -> None:
                   "file.")
             for d in (dq.get("unreadable_detail") or [])[:3]:
                 label = d.get("name") or f"offset {d.get('offset', '?')}"
-                print(f"    - {label}: {d.get('reason', '')}")
+                print(f"    - {label}: {strip_marks(d.get('reason', ''))}")
         if dq.get("missing_bytes"):
             print(f"  The file is {dq['missing_bytes']:,} bytes shorter than its own "
                   "record headers")
@@ -558,7 +680,8 @@ def print_report(report: dict) -> None:
                 print(f"  Phase {ph.upper()}:  R={r} Ω  X={x} Ω  |Z|={fit['z_ohm']:.4f} Ω  "
                       f"({fit['steps']} load steps, {fit['consistency']:.0%} consistent)")
             else:
-                print(f"  Phase {ph.upper()}:  not measurable — {fit.get('reason', '')}")
+                print(f"  Phase {ph.upper()}:  not measurable — "
+                      f"{strip_marks(fit.get('reason', ''))}")
         asym = si.get("asymmetry") or {}
         if asym.get("ratio"):
             mark = "⚠ " if asym["flagged"] else "  "
@@ -651,7 +774,7 @@ def print_report(report: dict) -> None:
         if nh.get("coincident_events"):
             print(f"  Coincident opposing sag/swell events: {nh['coincident_events']}")
         for f_txt in nh.get("findings", []):
-            print(f"  • {f_txt}")
+            print(f"  • {strip_marks(f_txt)}")
 
     # ── Engineering assessment (likely causes) ────────────────────────────────
     print(f"\n{sep}")
@@ -666,11 +789,13 @@ def print_report(report: dict) -> None:
             conf  = finding["confidence"].upper()
             title = finding["title"]
             print(f"\n  [{sev}] [{conf} confidence]  {title}")
-            print(f"    Finding:       {finding['finding']}")
-            print(f"    Likely cause:  {finding['cause']}")
+            print(f"    Finding:       {strip_marks(finding['finding'])}")
+            print(f"    Likely cause:  {strip_marks(finding['cause'])}")
             if finding.get("origin_evidence"):
-                print(f"    Bearing on origin: {finding['origin_evidence']}")
-            print(f"    Candidate action:  {finding['recommendation']}")
+                print(f"    Bearing on origin: "
+                      f"{strip_marks(finding['origin_evidence'])}")
+            print(f"    Candidate action:  "
+                  f"{strip_marks(finding['recommendation'])}")
 
     # ── Events ────────────────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -751,17 +876,51 @@ def export_results(
 # 8c. WORD REPORT GENERATOR — private section helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _set_font(style_or_run, name: str = _BASE_FONT) -> None:
+    """Name a font on every script slot, not just the Latin one.
+
+    Setting ``font.name`` alone leaves the theme font in ``w:eastAsia`` and
+    ``w:cs``, and Word will fall back to it for characters this report does
+    use -- the em dash and the ohm and degree signs among them.
+    """
+    style_or_run.font.name = name
+    rpr = style_or_run.element.get_or_add_rPr()
+    fonts = rpr.get_or_add_rFonts()
+    for slot in ('w:ascii', 'w:hAnsi', 'w:eastAsia', 'w:cs'):
+        fonts.set(qn(slot), name)
+
+
+def _apply_base_style(doc) -> None:
+    """Put both documents in Arial: body at 10 pt, headings in Xcel red."""
+    normal = doc.styles["Normal"]
+    _set_font(normal)
+    normal.font.size = Pt(_BASE_PT)
+
+    for level, size in ((1, 14), (2, 12), (3, 11)):
+        try:
+            style = doc.styles[f"Heading {level}"]
+        except KeyError:      # a template without the built-in heading styles
+            continue
+        _set_font(style)
+        style.font.size = Pt(size)
+        style.font.bold = True
+        style.font.color.rgb = _XE_RED
+
+
 def _section_heading(doc, title: str, level: int = 1):
     """Real Word heading (level 1 or 2) so Word's navigation pane and an
     auto-generated table of contents both work — not just a bolded paragraph."""
     heading = doc.add_heading(title, level=level)
     for run in heading.runs:
-        run.font.color.rgb = _XE_BLUE if level == 1 else _XE_LBLUE
+        run.font.color.rgb = _XE_RED
+        _set_font(run)
     return heading
 
 
 def _body(doc, text: str) -> None:
-    doc.add_paragraph(text)
+    # Size comes from the Normal style, so body prose stays one size even if the
+    # house size changes; only measured values pick up their own run.
+    _emit_text(doc.add_paragraph(), text, size_pt=None)
 
 
 def _plot_path(outdir: Optional[Path], stem: str, name: str) -> Optional[Path]:
@@ -784,6 +943,31 @@ def _embed_plot(doc, outdir: Optional[Path], stem: str, name: str,
         r.font.size = Pt(8)
         r.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
     return True
+
+
+def _add_page_field(paragraph, size_pt: float = 8) -> None:
+    """Append a PAGE field so Word numbers the page as it paginates.
+
+    A footer that ends in the word "page" followed by literal text cannot
+    number anything -- the count only exists once Word lays the document out,
+    so the number has to be a field it fills in rather than a string we write.
+    """
+    run = paragraph.add_run()
+    run.font.size = Pt(size_pt)
+    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    fld_begin = OxmlElement('w:fldChar')
+    fld_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText')
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = ' PAGE '
+    fld_sep = OxmlElement('w:fldChar')
+    fld_sep.set(qn('w:fldCharType'), 'separate')
+    placeholder = OxmlElement('w:t')
+    placeholder.text = "1"
+    fld_end = OxmlElement('w:fldChar')
+    fld_end.set(qn('w:fldCharType'), 'end')
+    for el in (fld_begin, instr, fld_sep, placeholder, fld_end):
+        run._r.append(el)
 
 
 def _add_toc(doc) -> None:
@@ -935,7 +1119,7 @@ def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, 
     _set_col_widths(info_tbl, [5.0, 11.5])
     for i, (label, value) in enumerate(rows_data):
         cell_l, cell_r = info_tbl.rows[i].cells
-        _cell_shade(cell_l, "E8F1FA")
+        _cell_shade(cell_l, _CHROME_LABEL)
         cell_l.paragraphs[0].add_run(label).bold = True
         cell_r.paragraphs[0].add_run(value)
     doc.add_paragraph()
@@ -967,7 +1151,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     hdr_cells = tbl.rows[0].cells
     for cell, text in zip(hdr_cells,
                           ["Standard", "Measured", "Compliance", "Severity"]):
-        _cell_shade(cell, "004B87")
+        _cell_shade(cell, _CHROME_HDR)
         p = cell.paragraphs[0]
         r = p.add_run(text)
         r.bold = True
@@ -1018,7 +1202,9 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         if clr:
             r3.font.color.rgb = clr
         if s.get("reason"):
-            note = p3.add_run("\n" + s["reason"])
+            # Tables are not marked -- a column of readings is already read as
+            # readings -- so the severity reason drops its markers here.
+            note = p3.add_run("\n" + strip_marks(s["reason"]))
             note.font.size = Pt(7.5)
             note.italic = True
             note.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
@@ -1026,12 +1212,12 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     def _emit_group_heading(text):
         row = tbl.add_row()
         cell = row.cells[0].merge(row.cells[-1])
-        _cell_shade(cell, "DCE6F1")
+        _cell_shade(cell, _CHROME_BAND)
         p = cell.paragraphs[0]
         r = p.add_run(text)
         r.bold = True
         r.font.size = Pt(9)
-        r.font.color.rgb = _XE_BLUE
+        r.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
 
     # Demand / transformer loading. On a shared transformer the row states
     # what was measured -- this service's contribution -- rather than claiming
@@ -2076,8 +2262,8 @@ def _word_recording_overview(doc, report, outdir=None, stem="") -> None:
     _body(doc,
         f"Measured RMS voltage and current over the full recording period, "
         f"{fs['start_time']} to {fs['end_time']} "
-        f"({fs['duration_hours']:.1f} hours, {fs['sample_count']:,} intervals of "
-        f"{fs.get('interval_minutes', 5):g} minutes). These are the recorded "
+        f"({_m(fs['duration_hours'], '.1f', ' hours')}, {fs['sample_count']:,} intervals of "
+        f"{_m(fs.get('interval_minutes', 5), 'g')} minutes). These are the recorded "
         "series as read from the meter file, with no filtering or scaling "
         "applied; every finding in this report derives from them. Any span the "
         "meter did not record is shaded and the trace is broken across it, so a "
@@ -2124,12 +2310,12 @@ def _word_demand(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
         ap = dem.get("apparent_power", {})
         rp = dem.get("real_power", {})
         pc = dem.get("peak_current", {})
-        _pk_str = (f" Peak current within any 5-minute interval was {pc['max_a']:.0f} A."
-                   if pc else "")
+        _pk_str = (" Peak current within any 5-minute interval was "
+                   f"{_m(pc['max_a'], '.0f', ' A')}." if pc else "")
         _body(doc,
-            f"Peak apparent demand was {ap.get('peak_kva', 0):.1f} kVA "
-            f"(mean {ap.get('mean_kva', 0):.1f} kVA, load factor {ap.get('load_factor', 0):.2f}). "
-            f"Peak real power was {rp.get('peak_kw', 0):.1f} kW.{_pk_str}"
+            f"Peak apparent demand was {_m(ap.get('peak_kva', 0), '.1f', ' kVA')} "
+            f"(mean {_m(ap.get('mean_kva', 0), '.1f', ' kVA')}, load factor {_m(ap.get('load_factor', 0), '.2f')}). "
+            f"Peak real power was {_m(rp.get('peak_kw', 0), '.1f', ' kW')}.{_pk_str}"
         )
         if "transformer" in dem:
             tx = dem["transformer"]
@@ -2144,16 +2330,16 @@ def _word_demand(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
                                "measured, so the total is at least this much.")
                 _body(doc,
                     f"The transformer is overloaded. The nameplate is {tx['nameplate_kva']:.0f} kVA; "
-                    f"the 8-hour rolling peak demand was {tx['peak_8h_kva']:.1f} kVA "
-                    f"({tx['pct_nameplate']:.0f}% of nameplate).{shared_note} "
+                    f"the 8-hour rolling peak demand was {_m(tx['peak_8h_kva'], '.1f', ' kVA')} "
+                    f"({_m(tx['pct_nameplate'], '.0f', '%')} of nameplate).{shared_note} "
                     "Transformers can be loaded above nameplate on an 8-hour basis but not continuously. "
                     "A transformer upgrade should be evaluated."
                 )
             elif tx["overloaded"] is False:
                 _body(doc,
                     f"The transformer loading is within acceptable limits. "
-                    f"The 8-hour peak was {tx['peak_8h_kva']:.1f} kVA "
-                    f"({tx['pct_nameplate']:.0f}% of the {tx['nameplate_kva']:.0f} kVA nameplate)."
+                    f"The 8-hour peak was {_m(tx['peak_8h_kva'], '.1f', ' kVA')} "
+                    f"({_m(tx['pct_nameplate'], '.0f', '%')} of the {tx['nameplate_kva']:.0f} kVA nameplate)."
                 )
             else:
                 # Shared transformer, this service below nameplate on its own.
@@ -2161,9 +2347,9 @@ def _word_demand(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
                 # this paragraph used to make one: "within acceptable limits",
                 # about equipment whose load was never measured.
                 _body(doc,
-                    f"This service's 8-hour peak demand was {tx['peak_8h_kva']:.1f} kVA "
+                    f"This service's 8-hour peak demand was {_m(tx['peak_8h_kva'], '.1f', ' kVA')} "
                     f"against a {tx['nameplate_kva']:.0f} kVA transformer "
-                    f"({tx['pct_nameplate']:.0f}% of nameplate). The transformer "
+                    f"({_m(tx['pct_nameplate'], '.0f', '%')} of nameplate). The transformer "
                     "serves other customers whose load was not measured, so this "
                     "figure is this service's contribution to its loading and not "
                     "that loading. Whether the transformer is adequately sized "
@@ -2188,8 +2374,8 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
         is_residential = thresh.customer_class == "r"
         if is_residential:
             _body(doc,
-                f"Measured mean power factor was {pfr['mean_pf']:.3f} {direction} "
-                f"(minimum {pfr['min_pf']:.3f}). "
+                f"Measured mean power factor was {_m(pfr['mean_pf'], '.3f')} {direction} "
+                f"(minimum {_m(pfr['min_pf'], '.3f')}). "
                 "Residential services (PSCo Schedule R) are not subject to the power factor "
                 "tariff clause — values in the 0.85–0.95 range are normal for homes with HVAC, "
                 "appliances, and lighting. No corrective action is required."
@@ -2200,13 +2386,13 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
                 _body(doc,
                     f"Power factor was maintained near unity as required by PSCo Electric Tariff "
                     f"Sheet R121 (Schedule PG — C&I Primary service). "
-                    f"Measured mean {pfr['mean_pf']:.3f} {direction}, minimum {pfr['min_pf']:.3f}."
+                    f"Measured mean {_m(pfr['mean_pf'], '.3f')} {direction}, minimum {_m(pfr['min_pf'], '.3f')}."
                 )
             else:
                 _body(doc,
                     f"Power factor fell below {pfr['limit']:.2f} during "
-                    f"{pfr['pct_below_limit']:.1f}% of the recording "
-                    f"(mean {pfr['mean_pf']:.3f} {direction}, minimum {pfr['min_pf']:.3f}). "
+                    f"{_m(pfr['pct_below_limit'], '.1f', '%')} of the recording "
+                    f"(mean {_m(pfr['mean_pf'], '.3f')} {direction}, minimum {_m(pfr['min_pf'], '.3f')}). "
                     "PSCo Electric Tariff Sheet R121 requires Primary service customers "
                     "(Schedule PG) to maintain power factor as near unity as practicable. "
                     "The customer should evaluate power factor correction equipment to comply "
@@ -2220,13 +2406,13 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
                 _body(doc,
                     f"Power factor was consistently above the 0.90 lagging requirement "
                     f"({tariff_cite}). "
-                    f"Measured mean {pfr['mean_pf']:.3f} {direction}, minimum {pfr['min_pf']:.3f}."
+                    f"Measured mean {_m(pfr['mean_pf'], '.3f')} {direction}, minimum {_m(pfr['min_pf'], '.3f')}."
                 )
             else:
                 _body(doc,
                     f"Power factor fell below the 0.90 lagging requirement during "
-                    f"{pfr['pct_below_limit']:.1f}% of the recording "
-                    f"(mean {pfr['mean_pf']:.3f} {direction}, minimum {pfr['min_pf']:.3f}). "
+                    f"{_m(pfr['pct_below_limit'], '.1f', '%')} of the recording "
+                    f"(mean {_m(pfr['mean_pf'], '.3f')} {direction}, minimum {_m(pfr['min_pf'], '.3f')}). "
                     f"{tariff_cite} requires Commercial and C&I Secondary customers to maintain "
                     f"power factor of not less than 0.90 lagging. The Company reserves the right "
                     f"to discontinue service to customers not complying with this requirement."
@@ -2260,7 +2446,8 @@ def _word_voltage(doc, report, outdir=None, stem="") -> Optional[str]:
         if all_pass:
             vals = {ph: v for ph, v in volt["phases"].items()}
             phase_str = "  ".join(
-                f"Phase {_phase_label(ph)}: {v['min_v']:.1f}–{v['max_v']:.1f} V (mean {v['mean_v']:.1f} V)"
+                f"Phase {_phase_label(ph)}: {_m(v['min_v'], '.1f')}–"
+                f"{_m(v['max_v'], '.1f', ' V')} (mean {_m(v['mean_v'], '.1f', ' V')})"
                 for ph, v in vals.items()
             )
             _body(doc,
@@ -2274,22 +2461,26 @@ def _word_voltage(doc, report, outdir=None, stem="") -> Optional[str]:
                 if v["pct_out_of_bounds"] == 0:
                     _body(doc,
                         f"Phase {_phase_label(ph)}: within ANSI C84.1 Range A ({rng[0]:.1f}–{rng[1]:.1f} V) "
-                        f"for the entire recording. Min {v['min_v']:.1f} V, mean {v['mean_v']:.1f} V, "
-                        f"max {v['max_v']:.1f} V.{_ext_note}"
+                        f"for the entire recording. Min {_m(v['min_v'], '.1f', ' V')}, mean {_m(v['mean_v'], '.1f', ' V')}, "
+                        f"max {_m(v['max_v'], '.1f', ' V')}.{_ext_note}"
                     )
                 else:
                     if pct_over > 0 and pct_under > 0:
                         direction = (
-                            f"{pct_over:.2f}% of intervals above the upper limit ({rng[1]:.1f} V) "
-                            f"and {pct_under:.2f}% below the lower limit ({rng[0]:.1f} V)"
+                            f"{_m(pct_over, '.2f', '%')} of intervals above the "
+                            f"upper limit ({rng[1]:.1f} V) and "
+                            f"{_m(pct_under, '.2f', '%')} below the lower limit "
+                            f"({rng[0]:.1f} V)"
                         )
                     elif pct_over > 0:
-                        direction = f"{pct_over:.2f}% of intervals above the upper limit ({rng[1]:.1f} V)"
+                        direction = (f"{_m(pct_over, '.2f', '%')} of intervals above "
+                                     f"the upper limit ({rng[1]:.1f} V)")
                     else:
-                        direction = f"{pct_under:.2f}% of intervals below the lower limit ({rng[0]:.1f} V)"
+                        direction = (f"{_m(pct_under, '.2f', '%')} of intervals below "
+                                     f"the lower limit ({rng[0]:.1f} V)")
                     _body(doc,
                         f"Phase {_phase_label(ph)}: {direction}. "
-                        f"Min {v['min_v']:.1f} V, mean {v['mean_v']:.1f} V, max {v['max_v']:.1f} V "
+                        f"Min {_m(v['min_v'], '.1f', ' V')}, mean {_m(v['mean_v'], '.1f', ' V')}, max {_m(v['max_v'], '.1f', ' V')} "
                         f"(ANSI C84.1 Range A: {rng[0]:.1f}–{rng[1]:.1f} V).{_ext_note}"
                     )
     _embed_plot(doc, outdir, stem, "voltage.png",
@@ -2335,7 +2526,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _body(doc,
             f"The available short-circuit current at the point of delivery is {tdd_info['isc_amps']:,.0f} A "
             f"(source: {tdd_info.get('isc_source', 'provided')}). "
-            f"The maximum demand load current (IL) over the recording was {tdd_info['il_amps']:.0f} A. "
+            f"The maximum demand load current (IL) over the recording was {_m(tdd_info['il_amps'], '.0f', ' A')}. "
             f"The resulting ISC/IL ratio is {tdd_info['isc_il_ratio']:.1f}, placing this service in the "
             f"IEEE 519-2022 {tdd_info['tdd_class']} class with a TDD limit of {tdd_info['tdd_limit_pct']:.1f}%."
         )
@@ -2345,7 +2536,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             f"references harmonic current to the maximum demand load current (IL) rather "
             f"than to the instantaneous fundamental — this avoids overstating distortion "
             f"during light-load periods. IL over the recording was "
-            f"{tdd_info['il_amps']:.0f} A. The available short-circuit current at the "
+            f"{_m(tdd_info['il_amps'], '.0f', ' A')}. The available short-circuit current at the "
             f"point of delivery was not provided, so the most restrictive IEEE 519-2022 "
             f"class (ISC/IL < 20) is assumed, giving a conservative TDD limit of "
             f"{tdd_info['tdd_limit_pct']:.1f}%; the true limit for this service can only "
@@ -2356,7 +2547,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         if c_thd["pct_exceeding"] == 0:
             _body(doc,
                 f"Current {metric} was within the {c_thd['limit_pct']:.1f}% limit throughout the recording. "
-                f"Maximum {metric} was {c_thd['max_thd_pct']:.2f}%, mean {c_thd['mean_thd_pct']:.2f}%."
+                f"Maximum {metric} was {_m(c_thd['max_thd_pct'], '.2f', '%')}, mean {_m(c_thd['mean_thd_pct'], '.2f', '%')}."
             )
         else:
             ll_note = (
@@ -2366,8 +2557,8 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             )
             _body(doc,
                 f"Current {metric} exceeded the {c_thd['limit_pct']:.1f}% limit during "
-                f"{c_thd['pct_exceeding']:.1f}% of the recording "
-                f"(max {c_thd['max_thd_pct']:.2f}%, mean {c_thd['mean_thd_pct']:.2f}%).{ll_note} "
+                f"{_m(c_thd['pct_exceeding'], '.1f', '%')} of the recording "
+                f"(max {_m(c_thd['max_thd_pct'], '.2f', '%')}, mean {_m(c_thd['mean_thd_pct'], '.2f', '%')}).{ll_note} "
                 "Common sources include VFDs, UPS systems, switched-mode power supplies, and arc furnaces. "
                 "Mitigation options include passive harmonic filters, active front-end drives, "
                 "or 12-pulse converter topologies."
@@ -2378,8 +2569,8 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             _body(doc,
                 f"On a within-interval peak basis (using the meter's 5-minute max record), "
                 f"current {metric} {pk_verdict} the {c_thd['limit_pct']:.1f}% limit "
-                f"(peak max {c_thd['peak_max_tdd_pct']:.2f}%, "
-                f"peak exceedance {c_thd['peak_pct_exceeding']:.1f}%)."
+                f"(peak max {_m(c_thd['peak_max_tdd_pct'], '.2f', '%')}, "
+                f"peak exceedance {_m(c_thd['peak_pct_exceeding'], '.1f', '%')})."
             )
 
     if ih.get("available") and not ih["overall_pass"]:
@@ -2403,7 +2594,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             _body(doc,
                 f"All individual current harmonic orders are within IEEE 519-2022 Table 2 limits. "
                 f"The most constraining harmonic is H{h_ord[0]} (phase {h_ord[1].upper()}) "
-                f"at {ih['worst_pct_of_il']:.2f}% of IL "
+                f"at {_m(ih['worst_pct_of_il'], '.2f', '%')} of IL "
                 f"against a limit of {worst_r.get('limit_pct_il', '—')}%."
             )
 
@@ -2425,7 +2616,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _set_col_widths(harm_tbl, _col_w)
         _ih_hdrs = ["Order"] + [f"{nm} (%IL)" for _, nm in _ph_names] + ["Limit (%IL)"]
         for cell, text in zip(harm_tbl.rows[0].cells, _ih_hdrs):
-            _cell_shade(cell, "E8F1FA")
+            _cell_shade(cell, _CHROME_BAND)
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
         for h in _H519_ORDERS:
@@ -2450,7 +2641,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                         limit_shown = True
             if any_fail:
                 for cell in row_cells:
-                    _cell_shade(cell, "FFF0F0")
+                    _cell_shade(cell, _sev_shade("severe"))
 
     # ── Individual voltage harmonic table ─────────────────────────────────────
     if ivh.get("available"):
@@ -2459,7 +2650,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _vn_cols   = 2 + len(_vph_keys)
         _vcol_w    = [2.0] + [4.5 if is_split else 3.5] * len(_vph_keys) + [3.5]
         _section_heading(doc, "Individual Harmonic Voltage Summary", level=2)
-        doc.add_paragraph(
+        _body(doc,
             f"Limit: 5.0% of nominal ({thresh.nominal_voltage:.0f} V) per IEEE 519-2022 Table 1 "
             f"(bus voltage < 1 kV). Values are absolute Volts converted to % of nominal."
         )
@@ -2468,7 +2659,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _set_col_widths(volt_harm_tbl, _vcol_w)
         _ivh_hdrs = ["Order"] + [f"{nm} (%nom)" for _, nm in _vph_names] + ["Limit (%nom)"]
         for cell, text in zip(volt_harm_tbl.rows[0].cells, _ivh_hdrs):
-            _cell_shade(cell, "E8F1FA")
+            _cell_shade(cell, _CHROME_BAND)
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
         for h in (3, 5, 7, 11, 13):
@@ -2493,7 +2684,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                         limit_shown = True
             if any_fail:
                 for cell in row_cells:
-                    _cell_shade(cell, "FFF0F0")
+                    _cell_shade(cell, _sev_shade("severe"))
 
     if nh.get("available") or sh.get("available") or ss.get("available"):
         _section_heading(doc, "Harmonic Source and Resonance Diagnostics", level=2)
@@ -2510,22 +2701,23 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
 
         acc = nh.get("accumulation_factor")
         t_pct = nh.get("triplen_pct", 0.0)
-        acc_str = f"{acc:.1f}×" if acc is not None else "n/a (phase harmonics not available)"
+        acc_str = (f"{_m(acc, '.1f')}×" if acc is not None
+                   else "n/a (phase harmonics not available)")
         if is_split:
-            doc.add_paragraph(
+            _body(doc,
                 f"In a single-phase 3-wire (split-phase) service, the neutral carries the difference "
                 f"current between L1 and L2, not the sum of zero-sequence currents from three phases. "
                 f"The two legs are 180 degrees apart, so odd harmonics — triplens included — subtract "
                 f"in the neutral as the fundamental does, rather than adding as they would on a "
                 f"120-degree system. No accumulation factor is reported for this service: the "
                 f"quantity is defined over three phases and does not apply here. Neutral harmonic "
-                f"content reflects imbalance between the legs. Triplen content: {t_pct:.0f}% of total "
+                f"content reflects imbalance between the legs. Triplen content: {_m(t_pct, '.0f', '%')} of total "
                 f"neutral harmonic current."
             )
         else:
-            doc.add_paragraph(
+            _body(doc,
                 f"Triplens (H3, H9, H15) are zero-sequence harmonics that add arithmetically in a "
-                f"4-wire wye neutral. Triplen content: {t_pct:.0f}% of total neutral harmonic current. "
+                f"4-wire wye neutral. Triplen content: {_m(t_pct, '.0f', '%')} of total neutral harmonic current. "
                 f"Accumulation factor (H3-neutral ÷ mean H3-phase): {acc_str}. "
                 "A factor near 3 indicates full accumulation from balanced "
                 "single-phase loads on all three phases, and above 3 indicates "
@@ -2540,7 +2732,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _set_col_widths(nh_tbl, [2.0, 3.5, 3.5, 3.5])
         for cell, text in zip(nh_tbl.rows[0].cells,
                                ["Order", "Mean (A)", "Max (A)", "Type"]):
-            _cell_shade(cell, "E8F1FA")
+            _cell_shade(cell, _CHROME_BAND)
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
 
@@ -2570,7 +2762,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             "mixed":            "Mixed / indeterminate",
             "indeterminate":    "Indeterminate",
         }
-        doc.add_paragraph(
+        _body(doc,
             f"Overall indication: {overall_labels.get(overall, overall)}. "
             f"Resonance suspects: {res_str}. "
             "This is an indication only; see Appendix B for the method and its limitations. It concerns the direction distortion appears to come from, not responsibility for it."
@@ -2581,7 +2773,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _set_col_widths(sh_tbl, [1.5, 2.5, 2.5, 2.5, 3.5])
         for cell, text in zip(sh_tbl.rows[0].cells,
                                ["Order", "Apparent Z (Ω)", "Z_ratio", "Correlation", "Indication"]):
-            _cell_shade(cell, "E8F1FA")
+            _cell_shade(cell, _CHROME_BAND)
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
 
@@ -2606,7 +2798,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                 attr_run.bold = True
                 attr_run.font.color.rgb = _FAIL_CLR
                 for cell in row_cells:
-                    _cell_shade(cell, "FFF0F0")
+                    _cell_shade(cell, _sev_shade("severe"))
 
     # ── Spectral shape (broadband vs. resonance classification) ───────────────
     if ss.get("available"):
@@ -2622,9 +2814,9 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         cls = ss.get("classification")
         elev_ratio = ss.get("elevation_ratio")
         elev_str = f"{elev_ratio:.0%} of the {thresh.thd_voltage_limit:.0f}% IEEE 519 limit" if elev_ratio is not None else "limit not configured"
-        doc.add_paragraph(
-            f"{class_labels.get(cls, cls)}. Mean voltage THD {ss['mean_vthd_pct']:.2f}% "
-            f"({elev_str}), per-order spectrum coefficient of variation {ss['flatness_cv']:.2f}."
+        _body(doc,
+            f"{class_labels.get(cls, cls)}. Mean voltage THD {_m(ss['mean_vthd_pct'], '.2f', '%')} "
+            f"({elev_str}), per-order spectrum coefficient of variation {_m(ss['flatness_cv'], '.2f')}."
         )
 
     # ── Which side of the meter the distortion comes from ─────────────────────
@@ -2633,8 +2825,8 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
     # ── IEEE 519-2022 Clause 5 statistical compliance tables ──────────────────
     if hs.get("available"):
         _section_heading(doc, "Statistical Harmonic Evaluation (IEEE 519-2022 Clause 5)", level=2)
-        doc.add_paragraph(
-            f"Percentiles computed over the {hs['period_days']:.1f}-day recording period "
+        _body(doc,
+            f"Percentiles computed over the {_m(hs['period_days'], '.1f')}-day recording period "
             f"(ISC/IL = {hs['isc_il_ratio']:.0f}, class {hs['isc_class']}). "
             "See Appendix B for the statistical method and its limitations."
         )
@@ -2670,7 +2862,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             _set_col_widths(tbl, col_w[:n_cols])
             hdrs = ["Order"] + [ph_labels[p] + " (%IL)" for p in ph_cols] + [lim_label]
             for cell, txt in zip(tbl.rows[0].cells, hdrs):
-                _cell_shade(cell, "E8F1FA")
+                _cell_shade(cell, _CHROME_BAND)
                 r = cell.paragraphs[0].add_run(txt)
                 r.bold = True
                 r.font.size = Pt(9)
@@ -2711,7 +2903,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                         limit_shown = True
                 if any_fail_row:
                     for cell in row.cells:
-                        _cell_shade(cell, "FFF0F0")
+                        _cell_shade(cell, _sev_shade("severe"))
 
         _stat_table(
             f"Weekly 95th Percentile vs 1.0× Limit (Short Time, {hs.get('period_note', '')})",
@@ -2734,7 +2926,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _set_col_widths(vst_tbl, col_w[:n_cols])
         hdrs = ["Order"] + [ph_labels[p] + " worst-day P99" for p in ph_cols] + ["2.0× Limit"]
         for cell, txt in zip(vst_tbl.rows[0].cells, hdrs):
-            _cell_shade(cell, "E8F1FA")
+            _cell_shade(cell, _CHROME_BAND)
             r = cell.paragraphs[0].add_run(txt)
             r.bold = True
             r.font.size = Pt(9)
@@ -2770,7 +2962,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                     limit_shown = True
             if any_fail_row:
                 for cell in row.cells:
-                    _cell_shade(cell, "FFF0F0")
+                    _cell_shade(cell, _sev_shade("severe"))
     if spec_img.exists() or has_kfactor:
         _section_heading(doc, "Harmonic Spectrum and Transformer Loading Impact", level=2)
 
@@ -2788,7 +2980,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             kf_med, kf_min, kf_max = (kf_stats["median"], kf_stats["min"],
                                       kf_stats["max"])
             kf_phase = kf_stats["worst_phase"]
-            kf_detail = ", ".join(f"phase {p} {v['median']:.1f}"
+            kf_detail = ", ".join(f"phase {p} {_m(v['median'], '.1f')}"
                                   for p, v in sorted(kf_stats["phases"].items()))
         else:
             kf_med  = float(df["kfactor_meter"].median())
@@ -2799,8 +2991,8 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
         _body(doc,
             f"The meter-measured harmonic K-factor (IEEE C57.110) over the recording "
             f"period, taken from the worst phase ({kf_phase}) because harmonic heating "
-            f"is per-winding: median {kf_med:.1f}, minimum {kf_min:.1f}, maximum "
-            f"{kf_max:.1f}."
+            f"is per-winding: median {_m(kf_med, '.1f')}, minimum {_m(kf_min, '.1f')}, maximum "
+            f"{_m(kf_max, '.1f')}."
             + (f" By phase: {kf_detail}. " if kf_detail else " ")
             + f"Standard distribution transformers are designed for K=1 (sinusoidal load). "
             f"Harmonic currents cause additional eddy-current and hysteresis losses in the "
@@ -2822,9 +3014,9 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                 # loaded on a transformer that may sit at 95%, and the else
                 # branch would then assert thermal margin nobody measured.
                 _body(doc,
-                    f"This service contributes {pct_tx:.0f}% of the "
+                    f"This service contributes {_m(pct_tx, '.0f', '%')} of the "
                     f"{tx['nameplate_kva']:.0f} kVA nameplate at its 8-hour "
-                    f"peak, and draws a K-factor of {kf_med:.1f}. Harmonic "
+                    f"peak, and draws a K-factor of {_m(kf_med, '.1f')}. Harmonic "
                     "heating scales with load current, so whether this "
                     "K-factor is thermally significant depends on the "
                     "transformer's total loading — which includes other "
@@ -2835,9 +3027,9 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                 )
             elif pct_tx > 70:
                 _body(doc,
-                    f"With the transformer loaded to {pct_tx:.0f}% of its "
+                    f"With the transformer loaded to {_m(pct_tx, '.0f', '%')} of its "
                     f"{tx['nameplate_kva']:.0f} kVA nameplate and a K-factor of "
-                    f"{kf_med:.1f}, the effective thermal load exceeds what the "
+                    f"{_m(kf_med, '.1f')}, the effective thermal load exceeds what the "
                     "nameplate rating assumes. "
                     + (f"A K-{kf_rate} rated unit is indicated before any "
                        "additional load is added."
@@ -2848,9 +3040,9 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                 )
             else:
                 _body(doc,
-                    f"The transformer is loaded to {pct_tx:.0f}% of its "
+                    f"The transformer is loaded to {_m(pct_tx, '.0f', '%')} of its "
                     f"{tx['nameplate_kva']:.0f} kVA nameplate, so despite a "
-                    f"K-factor of {kf_med:.1f} it retains substantial thermal "
+                    f"K-factor of {_m(kf_med, '.1f')} it retains substantial thermal "
                     "margin: harmonic losses scale with load current, and at this "
                     "loading the additional heating is small in absolute terms. "
                     + (f"The K-factor becomes the governing constraint if load "
@@ -2940,7 +3132,7 @@ def _word_harmonic_direction(doc, report, thresh) -> None:
                               ["Order", "Z_h (Ω)", "From load (V)",
                                "Background (V)", "At quietest 10% (V)",
                                "r", "Indication"]):
-            _cell_shade(cell, "E8F1FA")
+            _cell_shade(cell, _CHROME_BAND)
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
         for h, od in sorted((iv.get("orders") or {}).items()):
@@ -2976,7 +3168,7 @@ def _word_harmonic_direction(doc, report, thresh) -> None:
             f"{wf['captures_used']} of {wf['captures_total']} captures were "
             "usable"
             + _direction_exclusions(wf)
-            + (f", measured against a fundamental of {wf['fundamental_hz']:.2f} Hz."
+            + (f", measured against a fundamental of {_m(wf['fundamental_hz'], '.2f', ' Hz')}."
                if wf.get("fundamental_hz") else ".")
         )
         if wf.get("polarity_note"):
@@ -2988,7 +3180,7 @@ def _word_harmonic_direction(doc, report, thresh) -> None:
         for cell, text in zip(tbl.rows[0].cells,
                               ["Order", "Readings", "Toward system",
                                "Median P_h (W)", "Median V–I angle", "Indication"]):
-            _cell_shade(cell, "E8F1FA")
+            _cell_shade(cell, _CHROME_BAND)
             cell.paragraphs[0].add_run(text).bold = True
             cell.paragraphs[0].runs[0].font.size = Pt(9)
         for h, od in sorted((wf.get("orders") or {}).items()):
@@ -3025,9 +3217,7 @@ def _word_harmonic_direction(doc, report, thresh) -> None:
         "rather than measuring it. Neither method establishes what equipment "
         "is responsible."
     )
-    assessment = doc.add_paragraph()
-    _bold(assessment, "Engineer's assessment: ")
-    _normal(assessment, "____________________________________________")
+    _write_in_field(doc, "Engineer's assessment:", lines=2, label_size_pt=11)
     doc.add_paragraph()
 
 
@@ -3140,7 +3330,7 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
     for cell, text in zip(tbl.rows[0].cells,
                           ["Phase", "R (Ω)", "X (Ω)", "|Z| (Ω)",
                            "Load steps", "Basis"]):
-        _cell_shade(cell, "E8F1FA")
+        _cell_shade(cell, _CHROME_BAND)
         cell.paragraphs[0].add_run(text).bold = True
         cell.paragraphs[0].runs[0].font.size = Pt(9)
     for ph, fit in sorted(si.get("phases", {}).items()):
@@ -3158,7 +3348,7 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
             values = [ph.upper(), "—", "—", "—", str(fit.get("steps", "—")),
                       fit.get("reason", "Not measurable")]
         for cell, text in zip(cells, values):
-            cell.paragraphs[0].add_run(text).font.size = Pt(9)
+            cell.paragraphs[0].add_run(strip_marks(text)).font.size = Pt(9)
 
     # ── one phase against the others ─────────────────────────────────────────
     asym = si.get("asymmetry") or {}
@@ -3167,17 +3357,17 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
         _bold(para, "Between phases: ")
         if asym["flagged"]:
             _normal(para,
-                f"phase {asym['worst_phase']} measures {asym['ratio']:.1f}× the "
+                f"phase {asym['worst_phase']} measures {_m(asym['ratio'], '.1f')}× the "
                 f"impedance of phase {asym['best_phase']}, worth "
-                f"{asym['excess_v_at_peak']:.1f} V of extra drop at peak load. "
+                f"{_m(asym['excess_v_at_peak'], '.1f', ' V')} of extra drop at peak load. "
                 "A single connection — a lug, a splice, a crimp — degrading on "
                 "one phase is what produces this; the conductors and the "
                 "transformer are common to all phases and cannot.",
                 color=_FAIL_CLR)
         else:
             _normal(para,
-                f"phase {asym['worst_phase']} measures {asym['ratio']:.1f}× "
-                f"phase {asym['best_phase']} ({asym['excess_v_at_peak']:.1f} V "
+                f"phase {asym['worst_phase']} measures {_m(asym['ratio'], '.1f')}× "
+                f"phase {asym['best_phase']} ({_m(asym['excess_v_at_peak'], '.1f', ' V')} "
                 "at peak load), which is within what unequal loading and "
                 "measurement scatter account for. No single-phase connection "
                 "problem is indicated.")
@@ -3189,9 +3379,9 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
         _bold(para, "Neutral connection: ")
         if neutral.get("identifiable"):
             text = (f"neutral-to-earth voltage rises with neutral current at "
-                    f"{neutral['r_ohm']:.4f} Ω, which is "
-                    f"{neutral['rise_at_peak_v']:.1f} V at the "
-                    f"{neutral['i_peak_a']:.0f} A peak neutral current.")
+                    f"{_m(neutral['r_ohm'], '.4f', ' Ω')}, which is "
+                    f"{_m(neutral['rise_at_peak_v'], '.1f', ' V')} at the "
+                    f"{_m(neutral['i_peak_a'], '.0f', ' A')} peak neutral current.")
             if neutral.get("elevated"):
                 _normal(para, text + " A sound neutral holds this near zero; "
                         "this is the signature of resistance in the neutral "
@@ -3240,24 +3430,28 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
             "length is as entered. Treat the comparison as an order-of-"
             "magnitude check, not a tolerance.")
         if comparison:
+            # The measured impedance is marked; the expected one beside it is
+            # not, which is the whole point of marking -- these two sentences
+            # put a reading and a calculation in the same breath, and only one
+            # of them came off the meter.
             verdict_text = {
-                "high": (f"The measured {comparison['measured_ohm']:.4f} Ω is "
-                         f"{comparison['ratio']:.1f}× the expected "
+                "high": (f"The measured {_m(comparison['measured_ohm'], '.4f', ' Ω')} is "
+                         f"{_m(comparison['ratio'], '.1f')}× the expected "
                          f"{comparison['expected_ohm']:.4f} Ω — "
-                         f"{comparison['excess_v_at_peak']:.1f} V of drop at "
-                         f"the {comparison['i_peak_a']:.0f} A peak beyond what "
+                         f"{_m(comparison['excess_v_at_peak'], '.1f', ' V')} of drop at "
+                         f"the {_m(comparison['i_peak_a'], '.0f', ' A')} peak beyond what "
                          "the transformer and conductor account for."),
-                "elevated": (f"The measured {comparison['measured_ohm']:.4f} Ω "
-                             f"is {comparison['ratio']:.1f}× the expected "
+                "elevated": (f"The measured {_m(comparison['measured_ohm'], '.4f', ' Ω')} "
+                             f"is {_m(comparison['ratio'], '.1f')}× the expected "
                              f"{comparison['expected_ohm']:.4f} Ω, worth "
-                             f"{comparison['excess_v_at_peak']:.1f} V at peak "
+                             f"{_m(comparison['excess_v_at_peak'], '.1f', ' V')} at peak "
                              "load."),
-                "consistent": (f"The measured {comparison['measured_ohm']:.4f} Ω "
+                "consistent": (f"The measured {_m(comparison['measured_ohm'], '.4f', ' Ω')} "
                                f"sits within the range the expected "
                                f"{comparison['expected_ohm']:.4f} Ω accounts "
                                "for."),
                 "below_expected": (
-                    f"The measured {comparison['measured_ohm']:.4f} Ω is below "
+                    f"The measured {_m(comparison['measured_ohm'], '.4f', ' Ω')} is below "
                     f"the expected {comparison['expected_ohm']:.4f} Ω, which "
                     "usually means the run is shorter or the conductor larger "
                     "than what was entered, or the source stiffer than the "
@@ -3267,9 +3461,7 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
             _normal(para, verdict_text,
                     color=_FAIL_CLR if comparison["verdict"] == "high" else None)
 
-    assessment = doc.add_paragraph()
-    _bold(assessment, "Engineer's assessment: ")
-    _normal(assessment, "____________________________________________")
+    _write_in_field(doc, "Engineer's assessment:", lines=2, label_size_pt=11)
     doc.add_paragraph()
     return None
 
@@ -3316,7 +3508,7 @@ def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
     for cell, text in zip(tbl.rows[0].cells,
                           ["Measure", "Phase", "Median", "95th pct", "Max",
                            "% of time over", "Result"]):
-        _cell_shade(cell, "E8F1FA")
+        _cell_shade(cell, _CHROME_BAND)
         cell.paragraphs[0].add_run(text).bold = True
         cell.paragraphs[0].runs[0].font.size = Pt(9)
 
@@ -3333,7 +3525,7 @@ def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
                 run.font.size = Pt(9)
             if not stats["pass"]:
                 for cell in cells:
-                    _cell_shade(cell, "FFF0F0")
+                    _cell_shade(cell, _sev_shade("severe"))
                 cells[-1].paragraphs[0].runs[0].bold = True
                 cells[-1].paragraphs[0].runs[0].font.color.rgb = _FAIL_CLR
 
@@ -3364,7 +3556,7 @@ def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
         )
     else:
         worst = ", ".join(
-            f"{'Pst' if k == 'pst' else 'Plt'} reached {s['max']:.2f} on phase "
+            f"{'Pst' if k == 'pst' else 'Plt'} reached {_m(s['max'], '.2f')} on phase "
             f"{p} against a {fl[k + '_limit']:.2f} limit"
             for k, p, s in failures)
         _body(doc,
@@ -3397,7 +3589,7 @@ def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
         "equipment limit without exceeding what the supply system is expected "
         "to hold. Both standards assess against the 95th percentile over a "
         "week; this recording covers "
-        f"{report['file_summary']['duration_hours'] / 24:.1f} day(s), so the "
+        f"{_m(report['file_summary']['duration_hours'] / 24, '.1f')} day(s), so the "
         "percentiles above describe the period recorded and not a week."
     )
     _embed_plot(doc, outdir, stem, "flicker.png",
@@ -3420,22 +3612,19 @@ def _word_neutral_health(doc, report, thresh, outdir=None, stem="") -> Optional[
 
     _section_heading(doc, "Neutral Integrity Assessment", level=2)
 
+    # The band word comes from the shared scale; only the finding after the dash
+    # is particular to the neutral.
     sev = nh.get("severity", "normal")
-    sev_colors = {
-        "critical": _FAIL_CLR,
-        "warning":  RGBColor(0xCC, 0x66, 0x00),
-        "caution":  RGBColor(0xCC, 0x99, 0x00),
-        "normal":   _PASS_CLR,
-    }
-    sev_labels = {
-        "critical": "CRITICAL — Open or High-Resistance Neutral Suspected",
-        "warning":  "WARNING — Neutral Integrity Concern",
-        "caution":  "CAUTION — Neutral Anomaly Detected",
-        "normal":   "NORMAL — Neutral Appears Healthy",
+    sev_findings = {
+        "critical": "Open or High-Resistance Neutral Suspected",
+        "warning":  "Neutral Integrity Concern",
+        "caution":  "Neutral Anomaly Detected",
+        "normal":   "Neutral Appears Healthy",
     }
     sev_p = doc.add_paragraph()
-    _bold(sev_p, sev_labels.get(sev, sev.upper()),
-          color=sev_colors.get(sev, _XE_BLUE), size_pt=11)
+    _bold(sev_p,
+          f"{_sev_label(sev).upper()} — {sev_findings.get(sev, 'Neutral Assessed')}",
+          color=_sev_color(sev), size_pt=11)
 
     indicators = [
         ("L1 + L2 Sum (mean / std)",
@@ -3466,7 +3655,7 @@ def _word_neutral_health(doc, report, thresh, outdir=None, stem="") -> Optional[
     tbl.style = "Table Grid"
     _set_col_widths(tbl, [3.0, 3.0, 3.5])
     for cell, hdr_txt in zip(tbl.rows[0].cells, ["Indicator", "Measured", "Benchmark"]):
-        _cell_shade(cell, "E8F1FA")
+        _cell_shade(cell, _CHROME_BAND)
         cell.paragraphs[0].add_run(hdr_txt).bold = True
         cell.paragraphs[0].runs[0].font.size = Pt(9)
     for ind, val, bench in indicators:
@@ -3479,7 +3668,7 @@ def _word_neutral_health(doc, report, thresh, outdir=None, stem="") -> Optional[
 
     for finding in nh.get("findings", []):
         p = doc.add_paragraph(style="List Bullet")
-        p.add_run(finding).font.size = Pt(10)
+        _normal(p, finding, size_pt=10)
 
     if sev in ("critical", "warning"):
         doc.add_paragraph()
@@ -3503,7 +3692,7 @@ def _word_neutral_health(doc, report, thresh, outdir=None, stem="") -> Optional[
                 "the meter socket lug. Xcel Energy should inspect the transformer secondary "
                 "neutral and service drop. Re-measure after any repairs to confirm resolution."
             )
-        rec_p.add_run(rec_text).font.size = Pt(10)
+        _normal(rec_p, rec_text, size_pt=10)
 
     _embed_plot(doc, outdir, stem, "neutral_health.png",
                 "Neutral integrity indicators: leg voltages, voltage sum stability, "
@@ -3523,12 +3712,12 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
         if imb["pct_exceeding"] == 0:
             _body(doc,
                 f"Voltage imbalance was within the 3% limit throughout the recording. "
-                f"Maximum {imb['max_imbalance_pct']:.2f}%, mean {imb['mean_imbalance_pct']:.2f}%."
+                f"Maximum {_m(imb['max_imbalance_pct'], '.2f', '%')}, mean {_m(imb['mean_imbalance_pct'], '.2f', '%')}."
             )
         else:
             _body(doc,
-                f"Voltage imbalance exceeded 3% during {imb['pct_exceeding']:.1f}% of the recording "
-                f"(max {imb['max_imbalance_pct']:.2f}%, mean {imb['mean_imbalance_pct']:.2f}%). "
+                f"Voltage imbalance exceeded 3% during {_m(imb['pct_exceeding'], '.1f', '%')} of the recording "
+                f"(max {_m(imb['max_imbalance_pct'], '.2f', '%')}, mean {_m(imb['mean_imbalance_pct'], '.2f', '%')}). "
                 "Distinguishing a supply asymmetry from an unbalanced load requires "
                 "repeating the measurement with all customer loads disconnected."
             )
@@ -3538,9 +3727,9 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
         if "neutral_current" in ci:
             nc = ci["neutral_current"]
             nc_text = (
-                f" Neutral current averaged {nc['mean_amps']:.1f} A "
-                f"({nc['mean_pct_of_phase']:.1f}% of phase average) with a peak of "
-                f"{nc['max_amps']:.1f} A ({nc['max_pct_of_phase']:.1f}%)."
+                f" Neutral current averaged {_m(nc['mean_amps'], '.1f', ' A')} "
+                f"({_m(nc['mean_pct_of_phase'], '.1f', '%')} of phase average) with a peak of "
+                f"{_m(nc['max_amps'], '.1f', ' A')} ({_m(nc['max_pct_of_phase'], '.1f', '%')})."
             )
             if is_single_phase_208(thresh.service_type):
                 # The two legs of a 120/208 service are 120 degrees apart, so
@@ -3571,12 +3760,12 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
         if ci["pct_exceeding"] == 0:
             _body(doc,
                 f"Current imbalance was within the 10% limit throughout the recording. "
-                f"Maximum {ci['max_imbalance_pct']:.2f}%, mean {ci['mean_imbalance_pct']:.2f}%.{nc_text}"
+                f"Maximum {_m(ci['max_imbalance_pct'], '.2f', '%')}, mean {_m(ci['mean_imbalance_pct'], '.2f', '%')}.{nc_text}"
             )
         else:
             _body(doc,
-                f"Current imbalance exceeded 10% during {ci['pct_exceeding']:.1f}% of the recording "
-                f"(max {ci['max_imbalance_pct']:.2f}%, mean {ci['mean_imbalance_pct']:.2f}%). "
+                f"Current imbalance exceeded 10% during {_m(ci['pct_exceeding'], '.1f', '%')} of the recording "
+                f"(max {_m(ci['max_imbalance_pct'], '.2f', '%')}, mean {_m(ci['mean_imbalance_pct'], '.2f', '%')}). "
                 f"Correcting current imbalance requires redistributing single-phase "
                 f"load across the phases.{nc_text}"
             )
@@ -3630,8 +3819,8 @@ def _word_events(doc, report, outdir=None, stem="") -> Optional[str]:
         else:
             w = itic.get("worst") or {}
             w_txt = (f" The most severe was a {w.get('type', '').replace('voltage_', '')} to "
-                     f"{w.get('pct_nominal', 0):.0f}% of nominal lasting "
-                     f"{w.get('duration_ms', 0):.0f} ms." if w else "")
+                     f"{_m(w.get('pct_nominal', 0), '.0f', '%')} of nominal lasting "
+                     f"{_m(w.get('duration_ms', 0), '.0f', ' ms')}." if w else "")
             _body(doc,
                 f"{itic['n_violations']} of {itic['n_events']} detected sag/swell events "
                 f"fall outside the ITIC voltage tolerance envelope — sensitive electronic "
@@ -3685,8 +3874,6 @@ def _word_measurement_review(doc, report, thresh, df, outdir=None, stem="") -> N
 
 _FINDING_CONF_RANK = {"high": 0, "medium": 1, "low": 2}
 _FINDING_SEV_RANK  = {"critical": 0, "warning": 1, "info": 2}
-_FINDING_SEV_LABEL = {"critical": "Critical", "warning": "Warning",
-                      "info": "Observation"}
 
 
 def _word_finding(doc, finding: dict, show_recommendation: bool = False) -> None:
@@ -3701,10 +3888,8 @@ def _word_finding(doc, finding: dict, show_recommendation: bool = False) -> None
     sev  = finding["severity"]
     conf = finding.get("confidence", "")
     p = doc.add_paragraph()
-    _bold(p, f"{_FINDING_SEV_LABEL.get(sev, sev).upper()}: {finding['title']}",
-          color=(_FAIL_CLR if sev == "critical" else
-                 RGBColor(0xCC, 0x66, 0x00) if sev == "warning" else _XE_BLUE),
-          size_pt=10)
+    _bold(p, f"{_sev_label(sev).upper()}: {finding['title']}",
+          color=_sev_color(sev), size_pt=10)
     tag = p.add_run(f"  [{conf.capitalize()} confidence]")
     tag.font.size = Pt(9)
     tag.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
@@ -3714,14 +3899,14 @@ def _word_finding(doc, finding: dict, show_recommendation: bool = False) -> None
     run_f = body_p.add_run("Finding:  ")
     run_f.bold = True
     run_f.font.size = Pt(10)
-    body_p.add_run(finding["finding"]).font.size = Pt(10)
+    _normal(body_p, finding["finding"], size_pt=10)
 
     body_p2 = doc.add_paragraph()
     body_p2.paragraph_format.left_indent = Cm(0.5)
     run_c = body_p2.add_run("Likely cause:  ")
     run_c.bold = True
     run_c.font.size = Pt(10)
-    body_p2.add_run(finding["cause"]).font.size = Pt(10)
+    _normal(body_p2, finding["cause"], size_pt=10)
 
     if finding.get("origin_evidence"):
         body_p3 = doc.add_paragraph()
@@ -3729,7 +3914,7 @@ def _word_finding(doc, finding: dict, show_recommendation: bool = False) -> None
         run_e = body_p3.add_run("Evidence bearing on origin:  ")
         run_e.bold = True
         run_e.font.size = Pt(10)
-        body_p3.add_run(finding["origin_evidence"]).font.size = Pt(10)
+        _normal(body_p3, finding["origin_evidence"], size_pt=10)
 
     if show_recommendation and finding.get("recommendation"):
         body_p4 = doc.add_paragraph()
@@ -3737,19 +3922,13 @@ def _word_finding(doc, finding: dict, show_recommendation: bool = False) -> None
         run_r = body_p4.add_run("Candidate action:  ")
         run_r.bold = True
         run_r.font.size = Pt(10)
-        body_p4.add_run(finding["recommendation"]).font.size = Pt(10)
+        _normal(body_p4, finding["recommendation"], size_pt=10)
 
     # The tool states evidence; attribution is the reviewing engineer's to
     # write, so the document carries an explicit place for it rather than
     # pre-empting it.
-    assess = doc.add_paragraph()
-    assess.paragraph_format.left_indent = Cm(0.5)
-    run_a = assess.add_run("Engineer's assessment:  ")
-    run_a.bold = True
-    run_a.font.size = Pt(10)
-    blank = assess.add_run("_" * 78)
-    blank.font.size = Pt(10)
-    blank.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+    _write_in_field(doc, "Engineer's assessment:", lines=2, indent_cm=0.5,
+                    width_cm=15.5)
 
     doc.add_paragraph()
 
@@ -3837,10 +4016,10 @@ def _word_recommended_actions(doc, actions: List[dict]) -> None:
         doc.add_paragraph()
         return
 
+    # Priority keeps its own words -- how soon to act is not the same question
+    # as how bad the reading is -- but it is coloured from the one severity
+    # ramp, so a High action and a Severe finding look like the same weight.
     _prio_rank = {"High": 0, "Medium": 1, "Low": 2}
-    _prio_clr  = {"High": _FAIL_CLR,
-                  "Medium": RGBColor(0xCC, 0x66, 0x00),
-                  "Low": _XE_BLUE}
     # One list, ordered by priority. Which side of the meter each action falls to
     # follows from the action itself and is the engineer's call to record.
     _body(doc,
@@ -3861,9 +4040,7 @@ def _word_recommended_actions(doc, actions: List[dict]) -> None:
         prio_run = p3.add_run(a["priority"])
         prio_run.bold = True
         prio_run.font.size = Pt(10)
-        clr = _prio_clr.get(a["priority"])
-        if clr:
-            prio_run.font.color.rgb = clr
+        prio_run.font.color.rgb = _sev_color(a["priority"])
         doc.add_paragraph()
 
 
@@ -4021,7 +4198,7 @@ def _word_channel_appendix(doc, report, df) -> None:
     for i, head in enumerate(("Channel", "What it is", "Unit",
                               "Device name in file", "Intervals with data")):
         cell = table.rows[0].cells[i]
-        _cell_shade(cell, "E8F1FA")
+        _cell_shade(cell, _CHROME_BAND)
         r = cell.paragraphs[0].add_run(head)
         r.bold = True
         r.font.size = Pt(9)
@@ -4287,6 +4464,7 @@ def generate_word_report(
 
     df: Optional[pd.DataFrame] = ds.df if ds is not None else None
     doc = _DocxDocument()
+    _apply_base_style(doc)
 
     import datetime
     for section in doc.sections:
@@ -4312,7 +4490,7 @@ def generate_word_report(
 
     hdr = doc.add_paragraph()
     hdr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    _bold(hdr, "Xcel Energy — Internal Engineering Report", color=_XE_BLUE, size_pt=14)
+    _bold(hdr, "Xcel Energy — Internal Engineering Report", color=_XE_RED, size_pt=14)
     sub = doc.add_paragraph()
     # Said on the document itself, not only in its filename: the two documents
     # for a service look similar at a glance, and the one that carries assumed
@@ -4320,6 +4498,14 @@ def generate_word_report(
     # mistake. The customer document is the one written to be sent.
     _normal(sub, "Power quality analysis — internal working document. "
                  "The customer document for this service is issued separately.",
+            color=RGBColor(0x66, 0x66, 0x66), size_pt=9)
+    # Without this line the bold is just emphasis, and the reader has to infer
+    # the rule from examples.
+    key = doc.add_paragraph()
+    _normal(key, "Figures in ", color=RGBColor(0x66, 0x66, 0x66), size_pt=9)
+    _bold(key, "bold", color=RGBColor(0x66, 0x66, 0x66), size_pt=9)
+    _normal(key, " are values measured during this recording. Plain figures are "
+                 "limits, ratings, published constants or entered inputs.",
             color=RGBColor(0x66, 0x66, 0x66), size_pt=9)
     doc.add_paragraph()
 
@@ -4644,10 +4830,11 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
             out.append({
                 "headline": f"The voltage at {site} dropped below the normal range",
                 "measured": (
-                    f"The lowest reading was {worst_low:.0f} volts. Normal service is "
-                    f"{thresh.nominal_voltage:.0f} volts, and the allowed range is "
-                    f"{lo:.0f} to {hi:.0f} volts. Readings fell outside that range "
-                    f"during {pct:.1f}% of the {hours:.0f} hours we recorded."),
+                    f"The lowest reading was {_m(worst_low, '.0f', ' volts')}. Normal "
+                    f"service is {thresh.nominal_voltage:.0f} volts, and the allowed "
+                    f"range is {lo:.0f} to {hi:.0f} volts. Readings fell outside that "
+                    f"range during {_m(pct, '.1f', '%')} of the "
+                    f"{_m(hours, '.0f', ' hours')} we recorded."),
                 "means": (
                     "Low voltage makes motors work harder than they were designed to. "
                     "Over time that shortens the life of "
@@ -4660,8 +4847,8 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
             out.append({
                 "headline": f"The voltage at {site} rose above the normal range",
                 "measured": (
-                    f"The highest reading was {worst_high:.0f} volts, against an "
-                    f"allowed maximum of {hi:.0f} volts."),
+                    f"The highest reading was {_m(worst_high, '.0f', ' volts')}, against "
+                    f"an allowed maximum of {hi:.0f} volts."),
                 "means": (
                     "Sustained high voltage shortens the life of light bulbs and of "
                     "the electronics inside appliances."),
@@ -4730,8 +4917,8 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
         detail = ""
         if worst.get("pct_nominal") and worst.get("duration_ms"):
             secs = worst["duration_ms"] / 1000.0
-            detail = (f" The deepest fell to {worst['pct_nominal']:.0f}% of normal "
-                      f"voltage and lasted {secs:.1f} seconds.")
+            detail = (f" The deepest fell to {_m(worst['pct_nominal'], '.0f', '%')} of "
+                      f"normal voltage and lasted {_m(secs, '.1f', ' seconds')}.")
         out.append({
             "headline": "The voltage dipped briefly on several occasions",
             "measured": (f"We recorded {n_sag} short voltage dip"
@@ -4765,12 +4952,12 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
         if pst is not None:
             multiple = pst / limit if limit else 0
             scale = (
-                f"Flicker measured {pst:.2f} on the international scale used for "
+                f"Flicker measured {_m(pst, '.2f')} on the international scale used for "
                 f"this. The scale is set so that {limit:.1f} is the point at which "
                 "roughly half the people in laboratory testing judged the flicker "
                 "in their lights annoying — it is a measure of irritation, not of "
                 "damage. Your reading is about "
-                + (f"{multiple:.0f} times" if multiple >= 1.5
+                + (f"{_m(multiple, '.0f')} times" if multiple >= 1.5
                    else "the same as")
                 + " that level.")
         else:
@@ -4812,8 +4999,8 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
             out.append({
                 "headline": "Your power factor is below the level the tariff requires",
                 "measured": (
-                    f"Power factor averaged {pfr['mean_pf']:.2f} and fell as low as "
-                    f"{pfr['min_pf']:.2f}. PSCo Electric Tariff {sheet} requires "
+                    f"Power factor averaged {_m(pfr['mean_pf'], '.2f')} and fell as low "
+                    f"as {_m(pfr['min_pf'], '.2f')}. PSCo Electric Tariff {sheet} requires "
                     f"{requirement}."),
                 "means": (
                     explanation
@@ -4839,9 +5026,9 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                 "headline": f"Demand is running above the rating of {owner}",
                 "measured": (
                     f"The highest 8-hour average demand was "
-                    f"{tx['peak_8h_kva']:.0f} kVA against a "
+                    f"{_m(tx['peak_8h_kva'], '.0f', ' kVA')} against a "
                     f"{tx['nameplate_kva']:.0f} kVA nameplate — "
-                    f"{tx['pct_nameplate']:.0f}% of rating."),
+                    f"{_m(tx['pct_nameplate'], '.0f', '%')} of rating."),
                 "means": (
                     "Sustained loading above nameplate shortens transformer "
                     "insulation life and reduces the headroom available for "
@@ -4927,8 +5114,8 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
             "headline": f"The electrical load is unevenly split across {site}",
             "measured": (
                 f"The parts of your service differed in load by an average of "
-                f"{ci['mean_imbalance_pct']:.0f}%, and at times by "
-                f"{ci['max_imbalance_pct']:.0f}%."),
+                f"{_m(ci['mean_imbalance_pct'], '.0f', '%')}, and at times by "
+                f"{_m(ci['max_imbalance_pct'], '.0f', '%')}."),
             "means": (
                 "An uneven split is common and is not a fault in itself. It does make "
                 "low voltage and neutral problems worse, so it is worth correcting if "
@@ -4977,6 +5164,7 @@ def generate_customer_letter(
     vocab = _customer_vocabulary(report, thresh)
     conditions = _customer_conditions(report, thresh)
     doc = _DocxDocument()
+    _apply_base_style(doc)
 
     for section in doc.sections:
         section.top_margin = section.bottom_margin = Cm(2.0)
@@ -4987,9 +5175,10 @@ def generate_customer_letter(
         r = fp.add_run("Xcel Energy — Power Quality Review  |  page ")
         r.font.size = Pt(8)
         r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        _add_page_field(fp)
 
     hdr = doc.add_paragraph()
-    _bold(hdr, "Xcel Energy — Power Quality Review", color=_XE_BLUE, size_pt=15)
+    _bold(hdr, "Xcel Energy — Power Quality Review", color=_XE_RED, size_pt=15)
     sub = doc.add_paragraph()
     _normal(sub, f"What we measured at {vocab['site']}, and what it means",
             size_pt=11)
@@ -5003,7 +5192,7 @@ def generate_customer_letter(
         ("Length of recording", f"{fs['duration_hours']:.0f} hours"),
     ]):
         cl, cr = intro.rows[i].cells
-        _cell_shade(cl, "E8F1FA")
+        _cell_shade(cl, _CHROME_LABEL)
         cl.paragraphs[0].add_run(label).bold = True
         cr.paragraphs[0].add_run(value)
     doc.add_paragraph()
@@ -5074,7 +5263,8 @@ def generate_customer_letter(
         doc.add_paragraph()
         p = doc.add_paragraph()
         _bold(p, f"{idx}. {cond['headline']}",
-              color=(_FAIL_CLR if cond.get("safety") else _XE_BLUE), size_pt=11)
+              color=_sev_color("severe" if cond.get("safety") else "watch"),
+              size_pt=11)
         for label, key in (("What we measured:  ", "measured"),
                            ("What this means:  ", "means"),
                            ("What you may have noticed:  ", "symptom")):
@@ -5127,14 +5317,8 @@ def generate_customer_letter(
            " The service transformer at this site is yours, so anything found "
            "on it falls to you to schedule."))
 
-    note = doc.add_paragraph()
-    _bold(note, "Engineer's notes for this service:", size_pt=10)
-    for _ in range(4):
-        line = doc.add_paragraph()
-        line.paragraph_format.left_indent = Cm(0.6)
-        blank = line.add_run("_" * 88)
-        blank.font.size = Pt(10)
-        blank.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+    _write_in_field(doc, "Engineer's notes for this service:", lines=4,
+                    indent_cm=0.6, width_cm=15.5)
 
     # ── Questions ─────────────────────────────────────────────────────────
     doc.add_paragraph()
@@ -5146,7 +5330,7 @@ def generate_customer_letter(
         + ". "
         + ("Telephone " + engineer_phone + ". " if engineer_phone else "")
         + ("Email " + engineer_email + ". " if engineer_email else "")
-        + "Please quote your service address when you get in touch.")
+        + "You can reply to this letter with any questions.")
     _body(doc,
         "The measurements behind this letter were recorded and reviewed in detail. "
         "If you engage an electrician and they would find the underlying "
@@ -5307,7 +5491,7 @@ def _word_terms_panel(doc, report: dict) -> None:
     _set_col_widths(tbl, [4.8, 11.7])
     for i, (term, definition) in enumerate(terms):
         cl, cr = tbl.rows[i].cells
-        _cell_shade(cl, "F2F6FA")
+        _cell_shade(cl, _CHROME_LABEL)
         run = cl.paragraphs[0].add_run(term)
         run.bold = True
         run.font.size = Pt(9)

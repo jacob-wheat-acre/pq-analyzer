@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from pq_constants import (
+    measured as _m,
     SEVERITY_LABEL,
     SEVERITY_ORDER,
     SEVERITY_SEVERE_MARGIN,
@@ -106,9 +107,9 @@ def grade_finding(
                     else SEVERITY_WATCH_FRACTION)
         if margin is not None and margin >= watch_at:
             band = "watch"
-            reason = (f"within the limit but only {(1 / margin - 1) * 100:.0f}% "
+            reason = (f"within the limit but only {_m((1 / margin - 1) * 100, '.0f', '%')} "
                       "above it" if lower_is_worse
-                      else f"within the limit but at {margin * 100:.0f}% of it")
+                      else f"within the limit but at {_m(margin * 100, '.0f', '%')} of it")
         # A pass built on soft data is still worth qualifying -- a one-day
         # recording that meets a weekly statistical test has met less than the
         # test asks for, and the reader should be told without being alarmed.
@@ -139,10 +140,10 @@ def grade_finding(
     if margin is not None:
         # "1.02x the limit" reads backwards for a floor like power factor, where
         # the failure is falling short of it rather than rising above it.
-        bits.append(f"{(m - 1) * 100:.0f}% below the limit" if lower_is_worse
-                    else f"{m:.2f}x the limit")
+        bits.append(f"{_m((m - 1) * 100, '.0f', '%')} below the limit" if lower_is_worse
+                    else f"{_m(m, '.2f', 'x')} the limit")
     if persistence_pct is not None:
-        bits.append(f"{p:.1f}% of the recording")
+        bits.append(f"{_m(p, '.1f', '%')} of the recording")
     reason = ", ".join(bits)
     if notes:
         reason = (reason + "; " if reason else "") + "; ".join(notes)
@@ -567,8 +568,8 @@ def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict
 
     if steps < _MIN_RESOLUTION_STEPS:
         out["reason"] = (
-            f"The largest harmonic order averages {dominant:.2f} A, only "
-            f"{steps:.1f} times the meter's {CURRENT_RESOLUTION_A} A reporting "
+            f"The largest harmonic order averages {_m(dominant, '.2f', ' A')}, only "
+            f"{_m(steps, '.1f')} times the meter's {CURRENT_RESOLUTION_A} A reporting "
             "resolution. The spectrum is dominated by quantization, so its shape "
             "cannot identify a load type or a resonance."
         )
@@ -578,8 +579,8 @@ def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict
     out["reason"] = (
         (f"{out['loaded_intervals']} loaded interval(s); " if i_cols
          else "load level not verified (no RMS current channel); ")
-        + f"largest harmonic order {dominant:.2f} A "
-        f"({steps:.0f}x the {CURRENT_RESOLUTION_A} A resolution)."
+        + f"largest harmonic order {_m(dominant, '.2f', ' A')} "
+        f"({_m(steps, '.0f', 'x')} the {CURRENT_RESOLUTION_A} A resolution)."
     )
     return out
 
@@ -2808,43 +2809,43 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
     if vne_available:
         if vne_max > 5.0:
             findings.append(
-                f"Neutral-to-earth voltage reached {vne_max:.1f} V (mean {vne_mean:.1f} V). "
+                f"Neutral-to-earth voltage reached {_m(vne_max, '.1f', ' V')} (mean {_m(vne_mean, '.1f', ' V')}). "
                 "Above 2 V indicates significant neutral impedance; above 5 V is a safety hazard — "
                 "investigate immediately."
             )
         elif vne_max > 2.0:
             findings.append(
-                f"Neutral-to-earth voltage elevated: max {vne_max:.1f} V, mean {vne_mean:.1f} V. "
+                f"Neutral-to-earth voltage elevated: max {_m(vne_max, '.1f', ' V')}, mean {_m(vne_mean, '.1f', ' V')}. "
                 "Investigate neutral conductor connections and the grounding electrode system."
             )
         elif vne_max > 0.5:
             findings.append(
-                f"Neutral-to-earth voltage mildly elevated: max {vne_max:.1f} V (normal < 0.5 V). "
+                f"Neutral-to-earth voltage mildly elevated: max {_m(vne_max, '.1f', ' V')} (normal < 0.5 V). "
                 "Monitor and investigate if increasing."
             )
         else:
-            findings.append(f"Neutral-to-earth voltage is normal (max {vne_max:.2f} V).")
+            findings.append(f"Neutral-to-earth voltage is normal (max {_m(vne_max, '.2f', ' V')}).")
 
     if leg_corr < 0.0:
         findings.append(
-            f"Cross-leg voltage correlation is negative (r = {leg_corr:.3f}). "
+            f"Cross-leg voltage correlation is negative (r = {_m(leg_corr, '.3f')}). "
             "When L1 rises, L2 falls — a strong indicator of the neutral floating between legs."
         )
     elif leg_corr < 0.5:
         findings.append(
-            f"Cross-leg voltage correlation is weak (r = {leg_corr:.3f}; healthy > 0.80). "
+            f"Cross-leg voltage correlation is weak (r = {_m(leg_corr, '.3f')}; healthy > 0.80). "
             "Legs are not tracking the source together — investigate neutral continuity."
         )
 
     if sum_std > 3.0:
         findings.append(
-            f"Voltage sum (L1 + L2) is unstable: mean {sum_mean:.1f} V, std {sum_std:.1f} V. "
+            f"Voltage sum (L1 + L2) is unstable: mean {_m(sum_mean, '.1f', ' V')}, std {_m(sum_std, '.1f', ' V')}. "
             f"A solid neutral holds L1 + L2 near {healthy_sum:.0f} V with std < 1 V."
         )
     elif sum_std > 1.0:
         findings.append(
             f"Voltage sum (L1 + L2) shows moderate variation: "
-            f"mean {sum_mean:.1f} V, std {sum_std:.2f} V."
+            f"mean {_m(sum_mean, '.1f', ' V')}, std {_m(sum_std, '.2f', ' V')}."
         )
 
     # On a 120/208 two-leg service the sum separates a healthy neutral from an
@@ -2854,7 +2855,7 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
         if sum_toward_open is not None and sum_toward_open > 0.5:
             findings.append(
                 f"Voltage sum has collapsed toward the line-to-line value: "
-                f"L1 + L2 = {sum_mean:.1f} V against {healthy_sum:.0f} V for a "
+                f"L1 + L2 = {_m(sum_mean, '.1f', ' V')} against {healthy_sum:.0f} V for a "
                 f"healthy neutral and {open_neutral_sum:.0f} V if the two legs "
                 f"were in series across the line-to-line voltage. On a "
                 f"single-phase 120/208 service that is the open-neutral "
@@ -2862,7 +2863,7 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
             )
         else:
             findings.append(
-                f"Voltage sum sits at {sum_mean:.1f} V, near the "
+                f"Voltage sum sits at {_m(sum_mean, '.1f', ' V')}, near the "
                 f"{healthy_sum:.0f} V expected of a healthy neutral rather "
                 f"than the {open_neutral_sum:.0f} V an open neutral would "
                 f"produce on this 120/208 service."
@@ -2878,20 +2879,20 @@ def check_neutral_health(ds: PQDataset, thresh: Thresholds) -> dict:
 
     if asym_pct > 5.0:
         findings.append(
-            f"Sustained voltage asymmetry: mean |L1 − L2| = {asym_mean:.1f} V "
-            f"({asym_pct:.1f}% of nominal), max {asym_max:.1f} V. "
+            f"Sustained voltage asymmetry: mean |L1 − L2| = {_m(asym_mean, '.1f', ' V')} "
+            f"({_m(asym_pct, '.1f', '%')} of nominal), max {_m(asym_max, '.1f', ' V')}. "
             "Investigate load balance and neutral continuity."
         )
     elif asym_pct > 2.0:
         findings.append(
-            f"Moderate voltage asymmetry: mean |L1 − L2| = {asym_mean:.1f} V "
-            f"({asym_pct:.1f}% of nominal)."
+            f"Moderate voltage asymmetry: mean |L1 − L2| = {_m(asym_mean, '.1f', ' V')} "
+            f"({_m(asym_pct, '.1f', '%')} of nominal)."
         )
 
     if not findings:
         findings.append(
-            f"Neutral appears healthy: L1 + L2 = {sum_mean:.1f} V (std {sum_std:.2f} V), "
-            f"leg correlation r = {leg_corr:.3f}, asymmetry {asym_mean:.1f} V ({asym_pct:.1f}%)."
+            f"Neutral appears healthy: L1 + L2 = {_m(sum_mean, '.1f', ' V')} (std {_m(sum_std, '.2f', ' V')}), "
+            f"leg correlation r = {_m(leg_corr, '.3f')}, asymmetry {_m(asym_mean, '.1f', ' V')} ({_m(asym_pct, '.1f', '%')})."
         )
 
     return {
@@ -3034,7 +3035,7 @@ def _impedance_fit(v: pd.Series, i: pd.Series, pf: Optional[pd.Series],
                     "moved_share": round(moved, 3), "reason": (
                         f"Voltage moved by less than the meter's "
                         f"{_VOLTAGE_RESOLUTION_V} V resolution in "
-                        f"{1 - moved:.0%} of the {n_steps} load steps: the "
+                        f"{_m(1 - moved, '.0%')} of the {n_steps} load steps: the "
                         "drop across this impedance is below what the meter "
                         "can report.")})
         return out
@@ -3046,7 +3047,7 @@ def _impedance_fit(v: pd.Series, i: pd.Series, pf: Optional[pd.Series],
     out["consistency"] = round(consistency, 3)
     if consistency < _IMPEDANCE_MIN_CONSISTENCY:
         out.update({"identifiable": False, "reason": (
-            f"Voltage moved against the load in only {consistency:.0%} of the "
+            f"Voltage moved against the load in only {_m(consistency, '.0%')} of the "
             f"{n_steps} load steps. A series impedance would show it in nearly "
             "all of them, so what varies this voltage is not this service's "
             "own current.")})
@@ -3093,8 +3094,8 @@ def _impedance_fit(v: pd.Series, i: pd.Series, pf: Optional[pd.Series],
     out.update({"z_ohm": round(z_eff, 5), "separated": False})
     if z_eff * i_max < _VOLTAGE_RESOLUTION_V:
         out.update({"identifiable": False, "reason": (
-            f"Across the whole {i_max:.1f} A load range the voltage change "
-            f"attributable to this impedance is {z_eff * i_max:.2f} V, below "
+            f"Across the whole {_m(i_max, '.1f', ' A')} load range the voltage change "
+            f"attributable to this impedance is {_m(z_eff * i_max, '.2f', ' V')}, below "
             f"the meter's {_VOLTAGE_RESOLUTION_V} V reporting resolution. "
             "Nothing measurable is there to report.")})
     return out
@@ -3383,7 +3384,7 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
 
     measured_note = (
         f"Measured spectrum: {spectrum_str}. "
-        f"H5/H7={h5_h7:.2f}, H3/H5={h3_h5:.2f}, H5 variability (CV)={h5_cv:.2f}."
+        f"H5/H7={_m(h5_h7, '.2f')}, H3/H5={_m(h3_h5, '.2f')}, H5 variability (CV)={_m(h5_cv, '.2f')}."
     )
 
     top_score, top_sig = scored[0]
@@ -3409,7 +3410,7 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
             "finding":        (
                 f"The measured harmonic spectrum does not correspond to any "
                 f"reference load type closely enough to name one (best score "
-                f"{top_score:.0%}, below the {SIGNATURE_ABSOLUTE_FLOOR:.0%} "
+                f"{_m(top_score, '.0%')}, below the {SIGNATURE_ABSOLUTE_FLOOR:.0%} "
                 f"threshold required to report a match). {measured_note}"
             ),
             "cause": (
@@ -3466,10 +3467,10 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
                 f"The measured spectrum sits between two unrelated load "
                 f"families and cannot be assigned to either: "
                 f"\"{LOAD_FAMILY_LABEL.get(top_family, top_family)}\" "
-                f"({top_score:.0%}) and "
+                f"({_m(top_score, '.0%')}) and "
                 f"\"{LOAD_FAMILY_LABEL.get(other.get('family'), other.get('family'))}\" "
-                f"({next_family_score:.0%}) are separated by only "
-                f"{family_sep * 100:.1f} points. {measured_note}"
+                f"({_m(next_family_score, '.0%')}) are separated by only "
+                f"{_m(family_sep * 100, '.1f')} points. {measured_note}"
             ),
             "cause": (
                 "A spectrum that matches two unrelated topologies equally well "
@@ -3537,8 +3538,8 @@ def _detect_harmonic_signature(df: pd.DataFrame, il_amps: float,
         "experimental":   True,
         "title":          title,
         "finding":        (
-            f"Spectral similarity {top_score:.0%}, separated from the next load "
-            f"family by {family_sep * 100:.1f} points. {measured_note}"
+            f"Spectral similarity {_m(top_score, '.0%')}, separated from the next load "
+            f"family by {_m(family_sep * 100, '.1f')} points. {measured_note}"
             f"{detail}{class_note}"
         ),
         "cause":          top_sig["cause"],
@@ -3681,8 +3682,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "category":       "harmonics",
                 "severity":       "warning",
                 "title":          "TDD approaching IEEE 519-2022 limit",
-                "finding":        (f"Maximum TDD is {tdd_max:.2f}% against a {tdd_lim:.1f}% limit "
-                                   f"({utilization*100:.0f}% of limit consumed). "
+                "finding":        (f"Maximum TDD is {_m(tdd_max, '.2f', '%')} against a {tdd_lim:.1f}% limit "
+                                   f"({_m(utilization*100, '.0f', '%')} of limit consumed). "
                                    "No violation, but limited margin for load growth."),
                 "cause":          ("Current harmonic load is close to the IEEE 519-2022 class limit. "
                                    "Additional VFDs, rectifiers, or other nonlinear loads could "
@@ -3812,8 +3813,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "category":       "imbalance",
                 "severity":       "warning" if in_pct > 20 else "info",
                 "title":          "Elevated neutral current",
-                "finding":        (f"Neutral current averages {in_pct:.1f}% of phase current, "
-                                   f"peaking at {in_max:.1f}% (see Voltage and Current Imbalance "
+                "finding":        (f"Neutral current averages {_m(in_pct, '.1f', '%')} of phase current, "
+                                   f"peaking at {_m(in_max, '.1f', '%')} (see Voltage and Current Imbalance "
                                    f"above for measured amps)."),
                 "cause":          cause_text,
                 "origin_evidence": (
@@ -3847,7 +3848,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 kvar_mean = float(df["power_reactive"].dropna().mean()) / 1000
                 if kvar_mean < -0.5:
                     cap_note = (
-                        f" The site draws {abs(kvar_mean):.1f} kVAR leading — "
+                        f" The site draws {_m(abs(kvar_mean), '.1f', ' kVAR')} leading — "
                         "capacitor banks are likely present and are a probable resonance source."
                     )
             # A commissioned impedance sweep is not a proportionate ask of a
@@ -3887,7 +3888,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "severity":       "warning",
                 "title":          f"Parallel resonance suspected at {h_res_str}",
                 "finding":        (
-                    f"Harmonic impedance at {h_res_str} is {max(source_harm['orders'][h].get('z_ratio', 0) for h in resonant):.1f}× "
+                    f"Harmonic impedance at {h_res_str} is {_m(max(source_harm['orders'][h].get('z_ratio', 0) for h in resonant), '.1f', '×')} "
                     "higher than the linear inductive trend extrapolated from other orders. "
                     "This signature is consistent with a parallel LC resonance between system "
                     "inductance and capacitor banks at that harmonic frequency."
@@ -3919,7 +3920,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                     "title":          "Harmonic voltage and current rise together",
                     "finding":        (
                         f"Voltage and current harmonics are strongly correlated across all "
-                        f"measured orders (mean Pearson r = {mean_corr:.2f}). "
+                        f"measured orders (mean Pearson r = {_m(mean_corr, '.2f')}). "
                         "This confirms harmonics originate from loads on this service rather "
                         "than from background utility voltage distortion."
                     ),
@@ -3953,9 +3954,9 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "category":       "imbalance",
                 "severity":       "warning",
                 "title":          "Current imbalance with balanced supply voltage",
-                "finding":        (f"Current imbalance mean {ci_mean:.1f}%, "
-                                   f"max {ci.get('max_imbalance_pct', 0):.1f}% "
-                                   f"(limit 10%). Voltage imbalance is low ({vi_mean:.2f}%), "
+                "finding":        (f"Current imbalance mean {_m(ci_mean, '.1f', '%')}, "
+                                   f"max {_m(ci.get('max_imbalance_pct', 0), '.1f', '%')} "
+                                   f"(limit 10%). Voltage imbalance is low ({_m(vi_mean, '.2f', '%')}), "
                                    "indicating balanced supply voltage."),
                 "cause":          ("Supply voltage is well balanced while current is not, "
                                    "which is the pattern produced by unequal single-phase "
@@ -3979,8 +3980,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "category":       "imbalance",
                 "severity":       "warning",
                 "title":          "Current imbalance — investigate supply voltage",
-                "finding":        (f"Current imbalance mean {ci_mean:.1f}%, "
-                                   f"voltage imbalance mean {vi_mean:.2f}%. "
+                "finding":        (f"Current imbalance mean {_m(ci_mean, '.1f', '%')}, "
+                                   f"voltage imbalance mean {_m(vi_mean, '.2f', '%')}. "
                                    "Both are elevated; supply may be contributing."),
                 "cause":          ("Both voltage and current are imbalanced. Unbalanced supply "
                                    "voltage (from the utility distribution system) will induce "
@@ -4047,8 +4048,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
             "severity":       "warning",
             "title":          title,
             "finding":        (f"{volt_imb.get('metric_label', 'Voltage imbalance')} "
-                               f"max {vi_max:.2f}%, "
-                               f"mean {volt_imb.get('mean_imbalance_pct', 0):.2f}% "
+                               f"max {_m(vi_max, '.2f', '%')}, "
+                               f"mean {_m(volt_imb.get('mean_imbalance_pct', 0), '.2f', '%')} "
                                f"(limit {volt_imb.get('limit_pct', 3.0):.0f}%)."),
             "cause":          cause,
             "origin_evidence": origin,
@@ -4072,8 +4073,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                     "category":       "voltage",
                     "severity":       "warning",
                     "title":          "Voltage drops with increasing load",
-                    "finding":        (f"Voltage-to-load correlation = {corr:.2f}. "
-                                       f"Minimum recorded voltage {min_v:.1f} V. "
+                    "finding":        (f"Voltage-to-load correlation = {_m(corr, '.2f')}. "
+                                       f"Minimum recorded voltage {_m(min_v, '.1f', ' V')}. "
                                        "Voltage tends to decrease as current increases."),
                     "cause":          ("Negative voltage-load correlation indicates resistive "
                                        "voltage drop in the secondary service conductors or "
@@ -4117,7 +4118,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "category":   "power_factor",
                 "severity":   "info",
                 "title":      "Power factor below tariff limit by a small margin",
-                "finding":    (f"Mean PF {pf_mean:.3f} lagging against a "
+                "finding":    (f"Mean PF {_m(pf_mean, '.3f')} lagging against a "
                                f"{target_pf:.2f} limit. Correcting to the limit "
                                f"needs about {kvar_needed:.1f} kVAR, which is "
                                f"below the smallest practical switched capacitor "
@@ -4139,8 +4140,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
             "category":       "power_factor",
             "severity":       "warning",
             "title":          "Low power factor — capacitor correction needed",
-            "finding":        (f"Mean PF {pf_mean:.3f} lagging (limit {target_pf:.2f}). "
-                               f"Mean reactive power {q_mean:.1f} kVAR. "
+            "finding":        (f"Mean PF {_m(pf_mean, '.3f')} lagging (limit {target_pf:.2f}). "
+                               f"Mean reactive power {_m(q_mean, '.1f', ' kVAR')}. "
                                f"Estimated correction needed: {kvar_needed:.0f} kVAR."),
             "cause":          ("Lagging power factor is caused by inductive reactive loads — "
                                "primarily motors, transformers, and inductive ballasts drawing "
@@ -4180,11 +4181,11 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 f"{n_coinc} coincident opposing sag/swell event{'s' if n_coinc > 1 else ''}"
             )
         if vne_avail and vne_max > 0.5:
-            evidence_parts.append(f"Vne max {vne_max:.1f} V")
+            evidence_parts.append(f"Vne max {_m(vne_max, '.1f', ' V')}")
         if leg_r < 0.5:
-            evidence_parts.append(f"leg correlation r = {leg_r:.3f}")
+            evidence_parts.append(f"leg correlation r = {_m(leg_r, '.3f')}")
         if sum_std > 2.0:
-            evidence_parts.append(f"L1+L2 sum std = {sum_std:.1f} V")
+            evidence_parts.append(f"L1+L2 sum std = {_m(sum_std, '.1f', ' V')}")
 
         findings.append({
             "category":       "voltage",
@@ -4259,15 +4260,15 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 "category":       "demand",
                 "severity":       "warning",
                 "title":          "Transformer derating — harmonic K-factor",
-                "finding":        (f"Transformer loaded at {pct_tx:.0f}% of nameplate. "
-                                   f"Harmonic load K-factor = {k_factor:.1f} ({k_source}). "
-                                   + (", ".join(f"phase {p} = {v['median']:.1f}"
+                "finding":        (f"Transformer loaded at {_m(pct_tx, '.0f', '%')} of nameplate. "
+                                   f"Harmonic load K-factor = {_m(k_factor, '.1f')} ({k_source}). "
+                                   + (", ".join(f"phase {p} = {_m(v['median'], '.1f')}"
                                                 for p, v in sorted(kf["phases"].items()))
                                       + ". " if kf["available"] and len(kf["phases"]) > 1 else "")
                                    + "Standard distribution transformers are rated K=1."),
                 "cause":          ("Harmonic currents cause additional eddy-current losses in "
                                    "transformer windings beyond what the nameplate rating assumes. "
-                                   f"A K-factor of {k_factor:.1f} means harmonic-related heating "
+                                   f"A K-factor of {_m(k_factor, '.1f')} means harmonic-related heating "
                                    "is significantly greater than for a sinusoidal load at "
                                    "the same kVA, increasing winding temperature and accelerating "
                                    "insulation degradation."),

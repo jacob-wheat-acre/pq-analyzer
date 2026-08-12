@@ -45,6 +45,18 @@ _SCHEDULE_KEY = {
     "Schedule PG — C&I Primary":              "pg",
 }
 
+# ── Which version is running ─────────────────────────────────────────────────
+# Read on its own, ahead of the engine import below and out of its try/except:
+# when that import fails, the version is the first thing anyone asks for, and a
+# copy that cannot say what it is cannot be told apart from a current one.
+# pq_constants is pure data with no third-party imports, so it loads even on an
+# install where python-docx or matplotlib is missing.
+try:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from pq_constants import __version__ as _ENGINE_VERSION
+except Exception:
+    _ENGINE_VERSION = "unknown"
+
 # ── Transformer / Blue Book data ──────────────────────────────────────────────
 # Import the same lookup tables used by the analysis engine so the GUI always
 # stays in sync with what pq_analyzer.py will actually compute.
@@ -220,7 +232,7 @@ class _GUILogHandler(_logging.Handler):
 class PQApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PQ Analyzer")
+        self.title(f"PQ Analyzer v{_ENGINE_VERSION}")
         self.resizable(True, True)
         self.configure(bg=_BG)
         self.minsize(680, 520)
@@ -804,7 +816,9 @@ class PQApp(tk.Tk):
 
         tk.Label(
             inner,
-            text=("Transformer/ISC lookup is disabled and analysis will fail.\n"
+            text=("Transformer/ISC lookup is disabled and analysis will not "
+                  "run.\n"
+                  f"This copy is pq-analyzer {_ENGINE_VERSION}.\n"
                   "From a Command Prompt in the pq-analyzer folder, run:\n"
                   "    python check_install.py\n"
                   "It will identify the problem and give you the fix."),
@@ -976,6 +990,25 @@ class PQApp(tk.Tk):
             self.after(0, self._reset_run_btn)
 
     def _do_analysis(self, params):
+        # Stop here, with the reason, rather than part-way down this function.
+        # Everything imported from pq_analyzer comes in through one try/except,
+        # so a single failed import leaves every one of those names undefined
+        # and the run dies later at whichever name it reaches first --
+        # "NameError: name 'Thresholds' is not defined", which describes the
+        # symptom and hides the cause. The traceback that matters was recorded
+        # at startup, and the user cannot send us the .pqd file to reproduce
+        # with, so the message has to carry its own evidence.
+        if not _BOOK_AVAILABLE:
+            raise RuntimeError(
+                "The analysis engine did not load when this tool started, so "
+                "no file can be analysed. This is an install problem, not a "
+                "problem with " + Path(params["filepath"]).name + ".\n\n"
+                f"Version: pq-analyzer {_ENGINE_VERSION}\n\n"
+                "The failure at startup was:\n\n"
+                + (_IMPORT_TRACEBACK
+                   or f"(not recorded — see {Path(__file__).parent / 'import_error.log'})")
+            )
+
         filepath = params["filepath"]
         nominal  = params["nominal"]
         outdir   = _SCRIPT.parent / "pq_output"

@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.33.0"
+__version__ = "0.34.0"
 
 
 @dataclass
@@ -41,6 +41,39 @@ class Thresholds:
     # points, not yet empirically validated across many sites. See check_spectral_shape().
     spectral_elevation_ratio: float = 0.4  # mean VTHD / thd_voltage_limit above this = "elevated"
     spectral_flatness_cv: float = 0.6      # per-order spectrum CV below this = "flat" (broadband-like)
+
+
+# ── Marking measured values ──────────────────────────────────────────────────
+# Prose puts four kinds of number in one sentence -- what the meter recorded,
+# what a standard allows, what a nameplate says, and what the engineer entered
+# -- and only the first was measured here. A value is marked where it is
+# written, because nothing downstream can tell "the measured 0.0226 Ω" from
+# "the expected 0.0249 Ω" by looking at the text. The Word layer renders marked
+# values bold; every other output strips the markers.
+#
+# This lives in the constants module because both the analysis layer, which
+# writes findings, and the report layer, which writes sections, have to speak
+# it, and the analysis layer cannot import the report.
+MEASURED_OPEN  = ""      # private use area: never occurs in report text
+MEASURED_CLOSE = ""
+
+
+def measured(value, spec: str = "", unit: str = "") -> str:
+    """Mark ``value`` as something this recording measured.
+
+    ``spec`` is an ordinary format spec, so ``measured(v, '.1f', ' V')`` reads
+    at the call site the way ``f"{v:.1f} V"`` did. The unit travels with the
+    number: a bold figure beside a plain unit scans worse than either alone.
+    """
+    text = format(value, spec) if spec else f"{value}"
+    return f"{MEASURED_OPEN}{text}{unit}{MEASURED_CLOSE}"
+
+
+def strip_marks(text: str) -> str:
+    """Drop the markers, for every output that cannot render them."""
+    if not isinstance(text, str):
+        return text
+    return text.replace(MEASURED_OPEN, "").replace(MEASURED_CLOSE, "")
 
 
 # ── Finding severity ─────────────────────────────────────────────────────────
