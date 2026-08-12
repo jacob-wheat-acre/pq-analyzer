@@ -14,6 +14,8 @@ from pq_constants import (
     SEVERITY_LABEL,
     SEVERITY_ORDER,
     measured as _m,
+    measured_pct as _mp,
+    pct_text as _pct,
     strip_marks,
     is_single_phase_208,
     ll_factor,
@@ -1767,7 +1769,7 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
                     else " (most restrictive class limit assumed)")
         items.append((0,
             f"Current {metric} exceeded the IEEE 519-2022 limit of {c_thd['limit_pct']:.1f}%"
-            f"{assumed} during {c_thd['pct_exceeding']:.1f}% of the recording "
+            f"{assumed} during {_pct(c_thd['pct_exceeding'])} of the recording "
             f"(maximum {c_thd['max_thd_pct']:.2f}%)."))
 
     v_thd = thd["voltage"]
@@ -1785,7 +1787,7 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
                      f"(1.5 x the {v_thd['limit_pct']:.1f}% limit)")
         items.append((0,
             f"Voltage distortion exceeded IEEE 519-2022: {basis}, sustained "
-            f"across {v_thd['pct_exceeding']:.1f}% of the recording "
+            f"across {_pct(v_thd['pct_exceeding'])} of the recording "
             f"(maximum {v_thd['max_thd_pct']:.2f}%)."))
 
     ih = report["individual_harmonics"]
@@ -1815,7 +1817,7 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
         ph_label = _phase_label(worst_ph)
         items.append((0,
             f"Steady-state voltage was outside ANSI C84.1 Range A during "
-            f"{worst['pct_out_of_bounds']:.2f}% of intervals on the worst phase "
+            f"{_pct(worst['pct_out_of_bounds'], '.2f')} of intervals on the worst phase "
             f"(phase {ph_label}: {worst['min_v']:.1f}–{worst['max_v']:.1f} V)."))
 
     if pf.get("transformer_loading") is False:
@@ -1830,21 +1832,21 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
             and pfr.get("available")):
         items.append((0,
             f"Power factor fell below the {pfr['limit']:.2f} tariff requirement during "
-            f"{pfr['pct_below_limit']:.1f}% of the recording "
+            f"{_pct(pfr['pct_below_limit'])} of the recording "
             f"(minimum {pfr['min_pf']:.3f})."))
 
     imb = report["voltage_imbalance"]
     if pf.get("voltage_imbalance") is False and imb.get("available"):
         items.append((0,
             f"Voltage imbalance exceeded the {imb['limit_pct']:.1f}% limit during "
-            f"{imb['pct_exceeding']:.1f}% of the recording "
+            f"{_pct(imb['pct_exceeding'])} of the recording "
             f"(maximum {imb['max_imbalance_pct']:.2f}%)."))
 
     ci = report["current_imbalance"]
     if pf.get("current_imbalance") is False and ci.get("available"):
         items.append((0,
             f"Current imbalance exceeded the {ci['limit_pct']:.1f}% limit during "
-            f"{ci['pct_exceeding']:.1f}% of the recording "
+            f"{_pct(ci['pct_exceeding'])} of the recording "
             f"(maximum {ci['max_imbalance_pct']:.2f}%)."))
 
     fl = _flicker_status(report)
@@ -2534,7 +2536,7 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
             else:
                 _body(doc,
                     f"Power factor fell below {pfr['limit']:.2f} during "
-                    f"{_m(pfr['pct_below_limit'], '.1f', '%')} of the recording "
+                    f"{_mp(pfr['pct_below_limit'], '.1f')} of the recording "
                     f"(mean {_m(pfr['mean_pf'], '.3f')} {direction}, minimum {_m(pfr['min_pf'], '.3f')}). "
                     "PSCo Electric Tariff Sheet R121 requires Primary service customers "
                     "(Schedule PG) to maintain power factor as near unity as practicable. "
@@ -2554,7 +2556,7 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
             else:
                 _body(doc,
                     f"Power factor fell below the 0.90 lagging requirement during "
-                    f"{_m(pfr['pct_below_limit'], '.1f', '%')} of the recording "
+                    f"{_mp(pfr['pct_below_limit'], '.1f')} of the recording "
                     f"(mean {_m(pfr['mean_pf'], '.3f')} {direction}, minimum {_m(pfr['min_pf'], '.3f')}). "
                     f"{tariff_cite} requires Commercial and C&I Secondary customers to maintain "
                     f"power factor of not less than 0.90 lagging. The Company reserves the right "
@@ -2700,7 +2702,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
             )
             _body(doc,
                 f"Current {metric} exceeded the {c_thd['limit_pct']:.1f}% limit during "
-                f"{_m(c_thd['pct_exceeding'], '.1f', '%')} of the recording "
+                f"{_mp(c_thd['pct_exceeding'], '.1f')} of the recording "
                 f"(max {_m(c_thd['max_thd_pct'], '.2f', '%')}, mean {_m(c_thd['mean_thd_pct'], '.2f', '%')}).{ll_note} "
                 "Common sources include VFDs, UPS systems, switched-mode power supplies, and arc furnaces. "
                 "Mitigation options include passive harmonic filters, active front-end drives, "
@@ -2713,7 +2715,7 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
                 f"On a within-interval peak basis (using the meter's 5-minute max record), "
                 f"current {metric} {pk_verdict} the {c_thd['limit_pct']:.1f}% limit "
                 f"(peak max {_m(c_thd['peak_max_tdd_pct'], '.2f', '%')}, "
-                f"peak exceedance {_m(c_thd['peak_pct_exceeding'], '.1f', '%')})."
+                f"peak exceedance {_mp(c_thd['peak_pct_exceeding'], '.1f')})."
             )
 
     if ih.get("available") and not ih["overall_pass"]:
@@ -3917,7 +3919,7 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
             )
         else:
             _body(doc,
-                f"Voltage imbalance exceeded 3% during {_m(imb['pct_exceeding'], '.1f', '%')} of the recording "
+                f"Voltage imbalance exceeded 3% during {_mp(imb['pct_exceeding'], '.1f')} of the recording "
                 f"(max {_m(imb['max_imbalance_pct'], '.2f', '%')}, mean {_m(imb['mean_imbalance_pct'], '.2f', '%')}). "
                 "Distinguishing a supply asymmetry from an unbalanced load requires "
                 "repeating the measurement with all customer loads disconnected."
@@ -3965,7 +3967,7 @@ def _word_imbalance(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
             )
         else:
             _body(doc,
-                f"Current imbalance exceeded 10% during {_m(ci['pct_exceeding'], '.1f', '%')} of the recording "
+                f"Current imbalance exceeded 10% during {_mp(ci['pct_exceeding'], '.1f')} of the recording "
                 f"(max {_m(ci['max_imbalance_pct'], '.2f', '%')}, mean {_m(ci['mean_imbalance_pct'], '.2f', '%')}). "
                 f"Correcting current imbalance requires redistributing single-phase "
                 f"load across the phases.{nc_text}"
@@ -5062,7 +5064,7 @@ def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
         pct = vc.get("total_pct_out_of_bounds", 0.0)
         add("Supply voltage",
             f"{_m(min(lows), '.0f')} to {_m(max(highs), '.0f', ' V')}"
-            + (f", outside the range for {_m(pct, '.1f', '%')} of the recording"
+            + (f", outside the range for {_mp(pct, '.1f')} of the recording"
                if pct else ""),
             f"ANSI C84.1 Range A: {lo:.0f}–{hi:.0f} V",
             pct == 0)
@@ -5167,7 +5169,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                     f"The lowest reading was {_m(worst_low, '.0f', ' volts')}. Normal "
                     f"service is {thresh.nominal_voltage:.0f} volts, and the allowed "
                     f"range is {lo:.0f} to {hi:.0f} volts. Readings fell outside that "
-                    f"range during {_m(pct, '.1f', '%')} of the "
+                    f"range during {_mp(pct, '.1f')} of the "
                     f"{_m(hours, '.0f', ' hours')} we recorded."),
                 "means": (
                     "Low voltage makes motors work harder than they were designed to. "
@@ -5186,7 +5188,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                     # A peak on its own does not say whether this was a moment
                     # or a condition, and those call for different responses.
                     + (f" Readings sat outside the allowed range during "
-                       f"{_m(pct, '.1f', '%')} of the "
+                       f"{_mp(pct, '.1f')} of the "
                        f"{_m(hours, '.0f', ' hours')} we recorded."
                        if detailed and pct else "")),
                 "means": (

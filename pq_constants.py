@@ -89,6 +89,47 @@ def measured(value, spec: str = "", unit: str = "") -> str:
     return f"{MEASURED_OPEN}{text}{unit}{MEASURED_CLOSE}"
 
 
+def pct_text(value, spec: str = ".1f", mark: bool = False) -> str:
+    """Format a percentage, and never round a real exceedance down to zero.
+
+    A share of the recording is almost always printed beside a claim that a
+    limit was passed, so "0.0% of the recording" next to "Exceeded" reads as a
+    contradiction: the reader is shown a flag and, in the same row, arithmetic
+    that appears to refute it.  What actually happened is that a handful of
+    intervals out of tens of thousands rounded away.  A share that is genuinely
+    zero still prints as zero -- that is not a rounding artifact and has to stay
+    distinguishable from one -- while anything too small for the format to show
+    prints as less than the smallest figure that format can carry.
+
+    ``mark`` marks the figure as measured; leave it off for the outputs that
+    cannot render marks (see ``measured``).
+    """
+    def _fmt(v) -> str:
+        return measured(v, spec, "%") if mark else f"{format(v, spec)}%"
+
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return _fmt(value) if not mark else measured(value, spec, "%")
+    # Only step in where the format itself is what erased the number.
+    if v == 0 or float(format(v, spec)) != 0:
+        return _fmt(v)
+    digits = 0
+    if "." in spec:
+        tail = spec.rsplit(".", 1)[1].rstrip("f%")
+        if tail.isdigit():
+            digits = int(tail)
+    smallest = 10.0 ** -digits
+    # The comparison sign is not itself a measured quantity, so it stays outside
+    # the marks that the Word layer renders bold.
+    return ("<" if v > 0 else ">-") + _fmt(smallest)
+
+
+def measured_pct(value, spec: str = ".1f") -> str:
+    """``pct_text`` for prose that marks what this recording measured."""
+    return pct_text(value, spec, mark=True)
+
+
 def strip_marks(text: str) -> str:
     """Drop the markers, for every output that cannot render them."""
     if not isinstance(text, str):

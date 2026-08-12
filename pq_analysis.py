@@ -9,6 +9,7 @@ import pandas as pd
 
 from pq_constants import (
     measured as _m,
+    measured_pct as _mp,
     SEVERITY_LABEL,
     SEVERITY_ORDER,
     SEVERITY_SEVERE_MARGIN,
@@ -143,7 +144,7 @@ def grade_finding(
         bits.append(f"{_m((m - 1) * 100, '.0f', '%')} below the limit" if lower_is_worse
                     else f"{_m(m, '.2f', 'x')} the limit")
     if persistence_pct is not None:
-        bits.append(f"{_m(p, '.1f', '%')} of the recording")
+        bits.append(f"{_mp(p, '.1f')} of the recording")
     reason = ", ".join(bits)
     if notes:
         reason = (reason + "; " if reason else "") + "; ".join(notes)

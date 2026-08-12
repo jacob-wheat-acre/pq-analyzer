@@ -3950,6 +3950,34 @@ class TestSeverityGrading:
         assert g["band"] == "minor"
         assert g["downgraded"] is False
 
+    def test_a_flagged_exceedance_never_reports_zero_persistence(self):
+        """"Exceeded" beside "0.0% of the recording" reads as self-refuting.
+
+        A handful of intervals out of tens of thousands is a real exceedance
+        that one decimal place cannot show, and the reader who checks the row
+        against itself concludes the flag is wrong rather than the rounding.
+        """
+        from pq_analysis import grade_finding
+        g = grade_finding(False, measured=8.1, limit=8.0, persistence_pct=0.04)
+        reason = strip_marks(g["reason"])
+        assert "0.0% of the recording" not in reason
+        assert "<0.1% of the recording" in reason
+
+    def test_a_genuinely_zero_share_still_prints_as_zero(self):
+        """The guard must not turn a true zero into a fake exceedance."""
+        from pq_constants import pct_text
+        assert pct_text(0.0, ".1f") == "0.0%"
+        assert pct_text(0.0, ".2f") == "0.00%"
+
+    def test_the_floor_tracks_the_format_it_is_given(self):
+        from pq_constants import pct_text
+        assert pct_text(0.004, ".2f") == "<0.01%"
+        assert pct_text(0.004, ".1f") == "<0.1%"
+        assert pct_text(0.4, ".0f") == "<1%"
+        # Anything the format can show is left exactly as it was.
+        assert pct_text(0.05, ".1f") == "0.1%"
+        assert pct_text(17.3, ".1f") == "17.3%"
+
     def test_close_to_the_limit_is_watch_not_compliant(self):
         from pq_analysis import grade_finding
         g = grade_finding(True, measured=7.2, limit=8.0)
