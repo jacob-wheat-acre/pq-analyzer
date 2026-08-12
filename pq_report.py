@@ -4898,6 +4898,7 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "pf_sheet": "Sheet R73 (Schedule SG)",
         "owns_transformer": False,
         "fix_agent": "your electrical contractor or maintenance team",
+        "detail": "full",
     },
     "pg": {
         "site": "your facility",
@@ -4906,8 +4907,16 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "pf_sheet": "Sheet R121 (Schedule PG)",
         "owns_transformer": True,
         "fix_agent": "your electrical engineer or contractor",
+        "detail": "full",
     },
 }
+
+#: A letter that lists only exceptions leaves its reader unable to tell a clean
+#: check from one that was never run. A facility with maintenance staff can use
+#: the whole picture -- and is likely to hand this letter to a contractor, who
+#: will ask what else was looked at. A homeowner cannot, so they do not get it.
+for _key, _reg in _LETTER_REGISTER.items():
+    _reg.setdefault("detail", "brief")
 
 #: Service classes that get the plain-language letter, and what to call the
 #: site. Every class does; the depth is what differs, per _LETTER_REGISTER.
@@ -5026,6 +5035,106 @@ def _neutral_indicator_sentence(nh: dict) -> str:
     return "In detail: " + "; ".join(bits) + "."
 
 
+def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
+    """Every check this recording could run, and how the service did on each.
+
+    The findings section describes only what went wrong, which leaves a reader
+    unable to tell "we looked and it was fine" from "we never looked". A
+    facility hands this letter to a contractor, and the contractor's first
+    question is what else was examined.
+
+    Each row names the standard the figure was judged against, because this
+    reader can look one up and a homeowner cannot. It states measurements and
+    limits and nothing else: no cause, no party, no undertaking.
+    """
+    rows: List[dict] = []
+
+    def add(item, measured, against, ok):
+        rows.append({"item": item, "measured": measured, "against": against,
+                     "result": {True: "Within limits", False: "Outside limits"}
+                                .get(ok, "Not measured")})
+
+    vc = report.get("voltage_compliance") or {}
+    if vc.get("available"):
+        lo, hi = vc["range_v"]
+        lows = [s["min_v"] for s in vc["phases"].values()]
+        highs = [s["max_v"] for s in vc["phases"].values()]
+        pct = vc.get("total_pct_out_of_bounds", 0.0)
+        add("Supply voltage",
+            f"{_m(min(lows), '.0f')} to {_m(max(highs), '.0f', ' V')}"
+            + (f", outside the range for {_m(pct, '.1f', '%')} of the recording"
+               if pct else ""),
+            f"ANSI C84.1 Range A: {lo:.0f}–{hi:.0f} V",
+            pct == 0)
+    else:
+        add("Supply voltage", "No usable voltage data", "ANSI C84.1 Range A", None)
+
+    llv = report.get("voltage_ll_compliance") or {}
+    if llv.get("available"):
+        pairs = llv["pairs"].values()
+        add("Voltage between phases",
+            f"{_m(min(p['min_v'] for p in pairs), '.0f')} to "
+            f"{_m(max(p['max_v'] for p in pairs), '.0f', ' V')}",
+            f"ANSI C84.1 Range A: {llv['range_v'][0]:.0f}–"
+            f"{llv['range_v'][1]:.0f} V",
+            llv.get("overall_pass"))
+
+    imb = report.get("voltage_imbalance") or {}
+    if imb.get("available"):
+        add("Voltage balance between phases",
+            f"highest {_m(imb['max_imbalance_pct'], '.2f', '%')}, "
+            f"average {_m(imb['mean_imbalance_pct'], '.2f', '%')}",
+            f"{imb.get('metric_label') or 'NEMA MG1'}: "
+            f"{imb['limit_pct']:.0f}% maximum",
+            imb["max_imbalance_pct"] <= imb["limit_pct"])
+
+    itic = report.get("itic") or {}
+    if itic.get("available"):
+        n_bad = itic.get("n_violations", 0)
+        add("Brief dips and surges",
+            (f"{_m(itic['n_events'])} recorded, {_m(n_bad)} beyond the curve"
+             if itic.get("n_events") else "none recorded"),
+            "ITIC (CBEMA) equipment tolerance curve",
+            n_bad == 0)
+
+    fl = report.get("flicker") or {}
+    if fl.get("available") and fl.get("pst_max") is not None:
+        add("Flicker (visible lamp flutter)",
+            f"worst short-term reading {_m(fl['pst_max'], '.2f')}",
+            f"IEC 61000-3-3: Pst {fl['pst_limit']:.2f}, "
+            f"Plt {fl['plt_limit']:.2f}",
+            fl.get("overall_pass"))
+
+    v_thd = (report.get("thd_compliance") or {}).get("voltage") or {}
+    if v_thd.get("available"):
+        p95 = v_thd.get("p95_thd_pct", v_thd.get("max_thd_pct"))
+        add("Waveform distortion on the voltage",
+            f"{_m(p95, '.2f', '%')} at the 95th percentile",
+            f"IEEE 519-2022: {v_thd['limit_pct']:.0f}% maximum",
+            p95 <= v_thd["limit_pct"])
+
+    pfr = report.get("power_factor") or {}
+    register = _letter_register(thresh.customer_class)
+    if pfr.get("available") and register.get("pf_sheet"):
+        add("Power factor",
+            f"lowest {_m(pfr['min_pf'], '.2f')}, "
+            f"average {_m(pfr['mean_pf'], '.2f')}",
+            f"Xcel Energy tariff {register['pf_sheet']}: "
+            f"{pfr['limit']:.2f} minimum",
+            pfr["mean_pf"] >= pfr["limit"])
+
+    dem = report.get("demand") or {}
+    tx = dem.get("transformer") if isinstance(dem, dict) else None
+    if tx and tx.get("overloaded") is not None:
+        add("Demand against the transformer serving this service",
+            f"{_m(tx['peak_8h_kva'], '.0f', ' kVA')} sustained peak, which is "
+            f"{_m(tx['pct_nameplate'], '.0f', '%')} of the transformer",
+            f"{tx['nameplate_kva']:.0f} kVA nameplate rating",
+            not tx["overloaded"])
+
+    return rows
+
+
 def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     """Conditions worth telling a residential or small-business customer about."""
     out: List[dict] = []
@@ -5040,6 +5149,10 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     hours = (report.get("file_summary") or {}).get("duration_hours") or 0
     vocab = _customer_vocabulary(report, thresh)
     site = vocab["site"]
+    #: Whether this reader gets extent and phase alongside the peak, or just
+    #: the peak. A facility engineer acts on how long a condition held; a
+    #: homeowner is served by the shortest true sentence.
+    detailed = vocab["register"]["detail"] == "full"
 
     # ── Voltage outside the allowed range ─────────────────────────────────
     if vc.get("available") and vc.get("total_pct_out_of_bounds", 0) > 0:
@@ -5069,12 +5182,49 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                 "headline": f"The voltage at {site} rose above the normal range",
                 "measured": (
                     f"The highest reading was {_m(worst_high, '.0f', ' volts')}, against "
-                    f"an allowed maximum of {hi:.0f} volts."),
+                    f"an allowed maximum of {hi:.0f} volts."
+                    # A peak on its own does not say whether this was a moment
+                    # or a condition, and those call for different responses.
+                    + (f" Readings sat outside the allowed range during "
+                       f"{_m(pct, '.1f', '%')} of the "
+                       f"{_m(hours, '.0f', ' hours')} we recorded."
+                       if detailed and pct else "")),
                 "means": (
                     "Sustained high voltage shortens the life of light bulbs and of "
                     "the electronics inside appliances."),
                 "symptom": _SYMPTOMS["over_voltage"],
             })
+
+    # ── Voltage unbalance between the phases ──────────────────────────────
+    # Only where NEMA MG1's definition applies. A split-phase service has two
+    # legs 180 degrees apart, the leg difference is not unbalance in that
+    # sense, and no limit is set for it -- reporting one would invent a
+    # standard. Nothing here says where the unbalance comes from: it can
+    # originate on either side of the meter, and this letter does not attribute.
+    imb = report.get("voltage_imbalance") or {}
+    if (imb.get("available") and imb.get("metric") == "nema_mg1"
+            and imb.get("max_imbalance_pct", 0) > imb.get("limit_pct", 0)):
+        out.append({
+            "headline": "The three phases are not supplying equal voltage",
+            "measured": (
+                f"The largest difference between the phases was "
+                f"{_m(imb['max_imbalance_pct'], '.2f', '%')}, against a limit "
+                f"of {imb['limit_pct']:.0f}%. Across the recording it averaged "
+                f"{_m(imb['mean_imbalance_pct'], '.2f', '%')}."),
+            "means": (
+                "Three-phase motors are built for phases that match. When they "
+                "do not, the motor draws a current unbalance several times "
+                "larger than the voltage difference — a few percent on the "
+                "voltage can be ten times that on the current — and the extra "
+                "current becomes heat in the windings. NEMA guidance is to "
+                "derate a motor running on this much unbalance; left as it is, "
+                "the winding insulation ages faster than it should."),
+            "symptom": (
+                "Three-phase motors running hot, humming louder than usual, or "
+                "tripping their overload protection without an obvious load "
+                "change. Motors and drives failing earlier than expected, often "
+                "the same ones repeatedly."),
+        })
 
     # ── Neutral integrity ─────────────────────────────────────────────────
     # Scaled to what was actually measured. These indicators move for ordinary
@@ -5473,6 +5623,39 @@ def generate_customer_letter(
             f"covers the period named above. The other recording{'s' if len(sessions) > 2 else ''} "
             f"{'were' if len(sessions) > 2 else 'was'} made on {other_periods}, "
             "and can be reviewed as well if you would like us to.")
+        doc.add_paragraph()
+
+    # ── What we checked ───────────────────────────────────────────────────
+    # Before the exceptions, the whole list. A reader who sees only findings
+    # cannot tell a check that passed from one that was never run, and this
+    # reader is likely to be asked exactly that by a contractor.
+    checks = _customer_checks(report, thresh) if register["detail"] == "full" else []
+    if checks:
+        _section_heading(doc, "What we checked", level=1)
+        _body(doc,
+            "Every measurement this recording supports, with the standard each "
+            "was judged against. The findings that follow are drawn from the "
+            "rows marked outside limits; the rest are here so the list is "
+            "complete.")
+        tbl = doc.add_table(rows=1, cols=4)
+        tbl.style = "Table Grid"
+        _set_col_widths(tbl, [4.4, 5.0, 4.6, 2.5])
+        for cell, text in zip(tbl.rows[0].cells,
+                              ["What we looked at", "What we measured",
+                               "Measured against", "Result"]):
+            _cell_shade(cell, _CHROME_HDR)
+            r = cell.paragraphs[0].add_run(text)
+            r.bold = True
+            r.font.size = Pt(9.5)
+            r.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        for chk in checks:
+            cells = tbl.add_row().cells
+            cells[0].paragraphs[0].add_run(chk["item"]).font.size = Pt(9.5)
+            _emit_text(cells[1].paragraphs[0], chk["measured"], size_pt=9.5)
+            cells[2].paragraphs[0].add_run(chk["against"]).font.size = Pt(9.5)
+            rr = cells[3].paragraphs[0].add_run(chk["result"])
+            rr.font.size = Pt(9.5)
+            rr.bold = chk["result"] == "Outside limits"
         doc.add_paragraph()
 
     # ── What we found ─────────────────────────────────────────────────────

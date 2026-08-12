@@ -4952,6 +4952,67 @@ class TestCustomerLetter:
         assert out is not None and out.exists()
         assert out.name.endswith("_customer_letter.docx")
 
+    def _letter_text(self, path, tmp_path, customer_class, nominal=120.0):
+        from pq_report import generate_customer_letter
+        docx = pytest.importorskip("docx")
+        rep, th = self._report(Path(path), customer_class, nominal)
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        doc = docx.Document(str(out))
+        return doc, "\n".join(p.text for p in doc.paragraphs)
+
+    def test_a_facility_gets_the_full_list_of_checks(self, tmp_path):
+        # An exceptions-only letter cannot distinguish a check that passed from
+        # one that never ran, and a facility hands this to a contractor.
+        doc, text = self._letter_text("test_data/test_commercial_large.pqd",
+                                      tmp_path, "sg", 277.0)
+        assert "What we checked" in text
+        tbl = next(t for t in doc.tables
+                   if t.rows[0].cells[0].text.strip() == "What we looked at")
+        items = [r.cells[0].text.strip() for r in tbl.rows[1:]]
+        assert "Supply voltage" in items
+        # The standard is named, because this reader can look one up.
+        against = " ".join(r.cells[2].text for r in tbl.rows[1:])
+        assert "ANSI C84.1" in against and "IEEE 519" in against
+
+    def test_a_homeowner_does_not_get_it(self, tmp_path):
+        _doc, text = self._letter_text("test_data/test_residential.pqd",
+                                       tmp_path, "r")
+        assert "What we checked" not in text
+        assert "ANSI C84.1" not in text
+
+    def test_every_row_outside_limits_has_a_finding_to_match(self, tmp_path):
+        # The letter tells the reader the findings are drawn from these rows,
+        # so a row marked outside limits with no finding is a contradiction the
+        # reader can see. Voltage unbalance was exactly that before this test.
+        doc, text = self._letter_text("test_data/test_commercial_large.pqd",
+                                      tmp_path, "sg", 277.0)
+        tbl = next(t for t in doc.tables
+                   if t.rows[0].cells[0].text.strip() == "What we looked at")
+        outside = [r for r in tbl.rows[1:]
+                   if r.cells[3].text.strip() == "Outside limits"]
+        assert outside, "this fixture is meant to fail at least one check"
+        n_findings = len([p for p in doc.paragraphs
+                          if p.text.strip()[:2] in {f"{i}." for i in range(1, 10)}])
+        assert n_findings >= len(outside), (
+            f"{len(outside)} rows outside limits but only {n_findings} findings")
+
+    def test_an_unbalanced_three_phase_service_is_told_about_it(self, tmp_path):
+        _doc, text = self._letter_text("test_data/test_commercial_large.pqd",
+                                       tmp_path, "sg", 277.0)
+        assert "The three phases are not supplying equal voltage" in text
+        assert "derate" in text
+        # No attribution: unbalance can start on either side of the meter.
+        for blamed in ("your equipment is causing", "our equipment is causing",
+                       "caused by your", "caused by our"):
+            assert blamed not in text.lower()
+
+    def test_a_split_phase_service_is_not_told_it_failed_nema(self, tmp_path):
+        # Two legs 180 degrees apart are not a three-phase unbalance, and no
+        # limit is set for the leg difference.
+        _doc, text = self._letter_text("test_data/test_residential.pqd",
+                                       tmp_path, "r")
+        assert "The three phases are not supplying equal voltage" not in text
+
     def test_the_letter_is_brand_red_and_nothing_else(self, tmp_path):
         # Every coloured run in a customer document is the Xcel Energy red.
         # The numbered findings were drawn from the severity palette, which put
