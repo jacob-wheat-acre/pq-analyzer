@@ -221,6 +221,29 @@ EXAMPLES
                    help=("Length of that run in feet, transformer to meter. "
                          "Needed with --conductor; without both, the service "
                          "impedance is measured but not compared."))
+    p.add_argument("--shared-secondary", default=None,
+                   choices=[k for k, _label in conductor_options()],
+                   metavar="KEY",
+                   help=("Shared secondary main between the transformer and "
+                         "this service's tap, where the service is not a "
+                         "dedicated run. Same choices as --conductor."))
+    p.add_argument("--shared-secondary-ft", type=float, default=None,
+                   help=("Length of the shared secondary in feet, transformer "
+                         "to the tap for this service."))
+    p.add_argument("--primary-metered", action="store_true",
+                   help=("Service is metered on the primary. The transformer "
+                         "and secondary are the customer's and downstream of "
+                         "the meter, so the expected impedance is the primary "
+                         "line, entered with --primary-r1/--primary-x1."))
+    p.add_argument("--primary-r1", type=float, default=None,
+                   help="Primary line positive-sequence resistance to the meter (ohms).")
+    p.add_argument("--primary-x1", type=float, default=None,
+                   help="Primary line positive-sequence reactance to the meter (ohms).")
+    p.add_argument("--primary-r0", type=float, default=None,
+                   help=("Primary line zero-sequence resistance (ohms). Optional; "
+                         "used for triplen harmonics and earth-return unbalance."))
+    p.add_argument("--primary-x0", type=float, default=None,
+                   help="Primary line zero-sequence reactance (ohms). Optional.")
     p.add_argument("--resample",  default=None,  help="Resample interval, e.g. '1s', '1min', '10min'")
     p.add_argument("--outdir",    default=str(Path(__file__).parent / "pq_output"),
                    help="Output directory (default: pq_output/ next to this script)")
@@ -293,6 +316,13 @@ def main():
         topology=args.topology,
         conductor_key=args.conductor,
         run_length_ft=args.run_length_ft,
+        shared_secondary_key=args.shared_secondary,
+        shared_secondary_ft=args.shared_secondary_ft,
+        primary_metered=args.primary_metered,
+        primary_r1_ohm=args.primary_r1,
+        primary_x1_ohm=args.primary_x1,
+        primary_r0_ohm=args.primary_r0,
+        primary_x0_ohm=args.primary_x0,
     )
 
     # ── Choose adapter ────────────────────────────────────────────────────────

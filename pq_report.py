@@ -720,8 +720,17 @@ def print_report(report: dict) -> None:
                   f"{cmp_['expected_ohm']:.4f} Ω = {cmp_['ratio']:.1f}×  "
                   f"({cmp_['excess_v_at_peak']:+.1f} V at {cmp_['i_peak_a']:.0f} A peak)")
         elif not (si.get("expected") or {}).get("available"):
-            print("    No expected impedance: pick the service conductor and run "
-                  "length to compare against one.")
+            if (si.get("expected") or {}).get("primary_metered"):
+                print("    No expected impedance: this service is metered on "
+                      "the primary — enter the primary line R1 and X1 to "
+                      "compare against one.")
+            else:
+                print("    No expected impedance: pick the service conductor and run "
+                      "length to compare against one.")
+        exp_ = si.get("expected") or {}
+        if exp_.get("shared_secondary_z_ohm") is not None:
+            print(f"    Includes {exp_.get('shared_secondary_ft', 0):.0f} ft of "
+                  f"shared secondary — neighbours' current on it widens the fit")
 
     # ── Harmonic source direction ─────────────────────────────────────────────
     hd = report.get("harmonic_direction", {})
@@ -3360,6 +3369,46 @@ _IMPEDANCE_HEADLINE = {
 }
 
 
+def _primary_sequence_note(expected: dict) -> str:
+    """Which sequence impedance the comparison used, and why that one.
+
+    Named explicitly rather than left implied: a primary line's Z0 differs from
+    its Z1 by a factor of two or three, so a reader who assumes the wrong one
+    misreads every figure beside it.
+    """
+    primary = expected.get("primary") or {}
+    note = (
+        "This service is metered on the primary, so the transformer and the "
+        "secondary conductors belong to the customer and sit downstream of the "
+        "meter. Neither is in the path measured here; the primary line is, and "
+        "its impedance is as entered from a planning model or fault study "
+        "rather than from any table in this tool. The comparison uses positive "
+        "sequence, because balanced load current flows in positive sequence "
+        "and the measurement below is a per-phase voltage-against-current fit, "
+        "which on balanced load is that same loop."
+    )
+    if primary.get("z0_ohm") is None:
+        return note + (" No zero-sequence impedance was entered, which the "
+                       "comparison does not need.")
+    ratio = primary.get("z0_over_z1")
+    extra = (
+        f" Zero sequence was also entered, at {primary['z0_ohm']:.4f} Ω"
+        + (f" — {ratio:.1f}× the positive-sequence value" if ratio else "")
+        + ", the usual relationship for a line whose zero-sequence return is "
+        "through earth. It is not what the comparison below uses. It is the "
+        "right impedance for two things this recording may raise elsewhere: "
+        "the triplen harmonics — the 3rd, 9th and 15th — which are zero-"
+        "sequence on a balanced system, and the earth-return path taken by "
+        "whatever part of an unbalanced load current does not cancel between "
+        "phases."
+    )
+    loop = primary.get("single_phase_loop_ohm")
+    if loop:
+        extra += (f" A single-phase load tapped off this line would see "
+                  f"{loop:.4f} Ω, which is (2·Z1 + Z0)/3 rather than Z1.")
+    return note + extra
+
+
 def _word_service_impedance(doc, report, thresh) -> Optional[str]:
     """Series impedance from the source to the meter, measured and expected.
 
@@ -3473,6 +3522,11 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
         if expected.get("upstream_ohm") is not None:
             parts.append(f"{expected['upstream_ohm']:.4f} Ω from "
                          f"{expected.get('upstream_source', 'upstream')}")
+        if expected.get("shared_secondary_z_ohm") is not None:
+            parts.append(
+                f"{expected['shared_secondary_z_ohm']:.4f} Ω from "
+                f"{expected.get('shared_secondary_ft', 0):.0f} ft of "
+                f"{expected.get('shared_secondary_label')} shared secondary")
         if expected.get("conductor_z_ohm") is not None:
             parts.append(
                 f"{expected['conductor_z_ohm']:.4f} Ω from "
@@ -3483,12 +3537,25 @@ def _word_service_impedance(doc, report, thresh) -> Optional[str]:
               + f" — {expected.get('total_ohm', 0):.4f} Ω in total."
               + (f" This omits {expected['partial']}, so it is a floor."
                  if expected.get("partial") else ""))
-        _body(doc,
-            "The conductor constants are generic published values (NEC "
-            "Chapter 9 Table 8 resistance at 75 °C, with a typical reactance "
-            "for the construction), not PSCo Blue Book figures, and the run "
-            "length is as entered. Treat the comparison as an order-of-"
-            "magnitude check, not a tolerance.")
+        if expected.get("primary_metered"):
+            _body(doc, _primary_sequence_note(expected))
+        else:
+            _body(doc,
+                "The conductor constants are generic published values (NEC "
+                "Chapter 9 Table 8 resistance at 75 °C, with a typical reactance "
+                "for the construction), not PSCo Blue Book figures, and the run "
+                "length is as entered. Treat the comparison as an order-of-"
+                "magnitude check, not a tolerance.")
+        if expected.get("shared_secondary_z_ohm") is not None:
+            _body(doc,
+                "Part of that path is a secondary main shared with other "
+                "services. This customer's current flows through it, so its "
+                "drop is in the measurement and belongs in the expected value. "
+                "The neighbours' current flows through it too, and their share "
+                "of the drop moves independently of this customer's load — it "
+                "widens the scatter in the fit below rather than shifting it, "
+                "so an impedance measured here is less precise than one "
+                "measured on a dedicated run.")
         if comparison:
             # The measured impedance is marked; the expected one beside it is
             # not, which is the whole point of marking -- these two sentences
@@ -4390,12 +4457,23 @@ def _word_appendix(doc, report, thresh, df) -> None:
             "value: one phase against the others, which no common conductor or "
             "transformer can explain, and neutral-to-earth voltage against "
             "neutral current."
-            + (" The expected impedance uses generic published conductor "
+            + (" This service is metered on the primary, so the expected value "
+               "is the primary line impedance as entered, in positive sequence; "
+               "the transformer and secondary conductors are the customer's and "
+               "sit downstream of the meter."
+               if expected.get("primary_metered") else
+               " The expected impedance uses generic published conductor "
                "constants (NEC Chapter 9 Table 8 resistance at 75 °C with a "
                "typical reactance for the construction), not PSCo Blue Book "
                "figures, and the run length as entered, so it is an "
                "order-of-magnitude check rather than a tolerance."
-               if expected.get("generic_conductor_constants") else "")))
+               if expected.get("generic_conductor_constants") else "")
+            + (" Part of the path is a secondary main shared with other "
+               "services, whose current adds drop that does not move with this "
+               "customer's load; that widens the scatter in the fit rather than "
+               "biasing it, so the measurement is less precise here than on a "
+               "dedicated run."
+               if expected.get("shared_secondary_z_ohm") is not None else "")))
 
     hd = report.get("harmonic_direction", {})
     if hd.get("available"):

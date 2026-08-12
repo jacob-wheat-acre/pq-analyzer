@@ -14,6 +14,7 @@ Coverage:
   7. Pipeline smoke test: MockAdapter → extract_dataset → check_voltage_compliance
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -1081,6 +1082,153 @@ class TestExpectedServiceImpedance:
         assert "generic published values" in text
         assert "not PSCo Blue Book figures" in text
         assert "Engineer's assessment" in text
+
+
+class TestAServiceThatTapsASharedSecondary:
+    """A secondary main shared with the neighbours is in this service's path."""
+
+    def _thresh(self, **kw):
+        base = dict(nominal_voltage=120.0, service_type="1ph-overhead",
+                    transformer_kva=25, topology="split-phase",
+                    conductor_key="al-2-triplex", run_length_ft=100)
+        base.update(kw)
+        return Thresholds(**base)
+
+    def test_the_shared_run_adds_to_the_expected_impedance(self):
+        from pq_constants import expected_service_impedance
+        alone = expected_service_impedance(self._thresh())
+        tapped = expected_service_impedance(self._thresh(
+            shared_secondary_key="al-4-0-triplex", shared_secondary_ft=300))
+        # 4/0 AL at 0.100 Ω/1000 ft, 300 ft out and back on the shared neutral.
+        assert tapped["shared_secondary_r_ohm"] == pytest.approx(0.060, abs=1e-6)
+        assert tapped["total_ohm"] > alone["total_ohm"]
+        assert tapped["total_ohm"] == pytest.approx(
+            alone["total_ohm"] + tapped["shared_secondary_z_ohm"], abs=1e-9)
+
+    def test_a_dedicated_run_is_what_leaving_it_blank_means(self):
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(self._thresh())
+        assert "shared_secondary_z_ohm" not in e
+        assert e["available"] is True
+
+    def test_a_shared_run_alone_still_gives_an_expected_value(self):
+        # The service conductor may be unknown while the main is not.
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(Thresholds(
+            nominal_voltage=120.0, topology="split-phase",
+            shared_secondary_key="al-4-0-triplex", shared_secondary_ft=300))
+        assert e["available"] is True
+        assert "the service conductors" in e["partial"]
+
+    def test_a_three_phase_service_counts_the_shared_run_one_way(self):
+        # A balanced three-phase load's neutral carries almost nothing, so the
+        # return path is not doubled -- the same rule as the service conductor.
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(Thresholds(
+            nominal_voltage=277.0, service_type="3ph-padmount", topology="3ph-wye",
+            transformer_kva=500, shared_secondary_key="al-350-urd",
+            shared_secondary_ft=400))
+        assert e["shared_secondary_r_ohm"] == pytest.approx(
+            0.0611 * 400 / 1000.0, abs=1e-9)
+
+    def test_the_report_says_the_neighbours_widen_the_fit(self):
+        # Sharing a main does not bias the measurement, it scatters it, and an
+        # engineer reading a loose fit needs to know which of the two it was.
+        docx = pytest.importorskip("docx")
+        from pq_analysis import check_source_impedance
+        from pq_report import _word_service_impedance
+        thresh = self._thresh(customer_class="r",
+                              shared_secondary_key="al-4-0-triplex",
+                              shared_secondary_ft=300)
+        df = _service_frame(r_ohm=0.20, x_ohm=0.0)
+        doc = docx.Document()
+        _word_service_impedance(
+            doc, {"service_impedance": check_source_impedance(df, thresh)}, thresh)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "shared secondary" in text
+        assert "widens the scatter" in text
+
+
+class TestAServiceMeteredOnThePrimary:
+    """Metered on the high side, the customer's transformer is below the meter."""
+
+    def _thresh(self, **kw):
+        base = dict(nominal_voltage=7620.0, customer_class="pg",
+                    service_type="3ph-padmount", topology="3ph-wye",
+                    primary_metered=True,
+                    primary_r1_ohm=0.42, primary_x1_ohm=0.88)
+        base.update(kw)
+        return Thresholds(**base)
+
+    def test_the_expected_value_is_the_primary_line(self):
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(self._thresh())
+        assert e["available"] is True
+        assert e["total_ohm"] == pytest.approx(math.hypot(0.42, 0.88))
+        assert e["sequence_used"] == "positive"
+
+    def test_the_customers_transformer_and_conductors_are_left_out(self):
+        # They sit downstream of the meter, so adding them would count wire the
+        # recording never saw.
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(self._thresh(
+            transformer_kva=1500, isc_amps=33900,
+            conductor_key="al-350-urd", run_length_ft=200,
+            shared_secondary_key="al-500-urd", shared_secondary_ft=500))
+        assert e["total_ohm"] == pytest.approx(math.hypot(0.42, 0.88))
+        assert "conductor_z_ohm" not in e
+        assert "shared_secondary_z_ohm" not in e
+
+    def test_zero_sequence_is_optional(self):
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(self._thresh())
+        assert e["available"] is True
+        assert e["primary"].get("z0_ohm") is None
+
+    def test_zero_sequence_is_carried_but_not_compared_against(self):
+        # Z0 is the right impedance for triplens and earth return, and the
+        # wrong one for a balanced-load voltage drop.
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(self._thresh(
+            primary_r0_ohm=1.30, primary_x0_ohm=2.90))
+        p = e["primary"]
+        assert p["z0_ohm"] == pytest.approx(math.hypot(1.30, 2.90))
+        assert p["z0_over_z1"] == pytest.approx(p["z0_ohm"] / p["z1_ohm"])
+        # The comparison still runs against Z1 alone.
+        assert e["total_ohm"] == pytest.approx(p["z1_ohm"])
+
+    def test_a_single_phase_tap_sees_two_z1_plus_z0_over_three(self):
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(self._thresh(
+            primary_r0_ohm=1.30, primary_x0_ohm=2.90))
+        assert e["primary"]["single_phase_loop_ohm"] == pytest.approx(
+            math.hypot((2 * 0.42 + 1.30) / 3.0, (2 * 0.88 + 2.90) / 3.0))
+
+    def test_no_entered_impedance_says_which_field_is_missing(self):
+        from pq_constants import expected_service_impedance
+        e = expected_service_impedance(Thresholds(nominal_voltage=7620.0,
+                                                  primary_metered=True))
+        assert e["available"] is False
+        assert "metered on the primary" in e["reason"]
+        assert "R1/X1" in e["reason"]
+
+    def test_the_report_names_the_sequence_it_used(self):
+        # Z0 runs two to three times Z1, so a reader who assumes the wrong one
+        # misreads every figure beside it.
+        docx = pytest.importorskip("docx")
+        from pq_analysis import check_source_impedance
+        from pq_report import _word_service_impedance
+        thresh = self._thresh(primary_r0_ohm=1.30, primary_x0_ohm=2.90)
+        df = _service_frame(r_ohm=2.0, x_ohm=0.0, v0=7620.0)
+        doc = docx.Document()
+        _word_service_impedance(
+            doc, {"service_impedance": check_source_impedance(df, thresh)}, thresh)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "metered on the primary" in text
+        assert "positive sequence" in text
+        assert "triplen" in text
+        # And it does not claim generic conductor constants it never used.
+        assert "generic published values" not in text
 
 
 # ─────────────────────────────────────────────────────────────────────────────

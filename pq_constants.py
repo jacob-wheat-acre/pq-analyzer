@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.35.0"
+__version__ = "0.36.0"
 
 
 @dataclass
@@ -37,6 +37,26 @@ class Thresholds:
     # one; without them the measurement still stands on its own.
     conductor_key: Optional[str] = None   # key into _CONDUCTOR_TABLE
     run_length_ft: Optional[float] = None # transformer → meter, one way
+    # Where the transformer does not land at this meter but on a secondary main
+    # shared with the neighbours, that main is in this customer's path too and
+    # its drop belongs in the expected impedance. Left unset, the service is
+    # taken to be a dedicated run from the transformer, which is what a
+    # dedicated-transformer class already is.
+    shared_secondary_key: Optional[str] = None   # key into _CONDUCTOR_TABLE
+    shared_secondary_ft: Optional[float] = None  # transformer → service tap
+    # A primary-metered service is metered on the high side, so the transformer
+    # and the secondary run are the customer's, not the utility's, and neither
+    # is in the path being measured. What is in it is the primary line from the
+    # source to the metering point, entered as sequence impedances in ohms.
+    # Z1 carries balanced load current and is what the report compares against;
+    # Z0 is optional and used only where the physics asks for it -- triplen
+    # harmonics, which are zero-sequence, and unbalanced current returning
+    # through earth. Z2 is not asked for: for a passive line it equals Z1.
+    primary_metered: bool = False
+    primary_r1_ohm: Optional[float] = None
+    primary_x1_ohm: Optional[float] = None
+    primary_r0_ohm: Optional[float] = None
+    primary_x0_ohm: Optional[float] = None
     # Spectral-shape ("broadband vs. resonance") classifier -- heuristic starting
     # points, not yet empirically validated across many sites. See check_spectral_shape().
     spectral_elevation_ratio: float = 0.4  # mean VTHD / thd_voltage_limit above this = "elevated"
@@ -868,6 +888,7 @@ _CONDUCTOR_TABLE: Dict[str, Tuple[str, float, float]] = {
     "al-1-0-urd":      ("1/0 AL URD (underground service)",     0.201, 0.030),
     "al-4-0-urd":      ("4/0 AL URD (underground service)",     0.100, 0.030),
     "al-350-urd":      ("350 kcmil AL URD (underground)",       0.0611, 0.030),
+    "al-500-urd":      ("500 kcmil AL URD (underground)",       0.0424, 0.030),
     # Copper, for older services.
     "cu-4":            ("#4 CU service conductor",              0.308, 0.050),
     "cu-2":            ("#2 CU service conductor",              0.194, 0.050),
@@ -901,6 +922,48 @@ def conductor_impedance(key: str, length_ft: float,
 def conductor_label(key: Optional[str]) -> Optional[str]:
     row = _CONDUCTOR_TABLE.get(key or "")
     return row[0] if row else None
+
+
+def primary_line_impedance(thresh: "Thresholds") -> Optional[dict]:
+    """Sequence impedance of the primary line, for a primary-metered service.
+
+    Entered rather than derived: a primary line's impedance comes off a
+    planning model or a fault study, and there is no table here that could
+    reproduce one honestly from a conductor size alone.
+
+    Positive sequence is what balanced load current flows in, so Z1 is what the
+    measured impedance is compared against and the only part that is required.
+    Zero sequence is optional and carried through for the two places it is the
+    right number rather than Z1: triplen harmonics, which are zero-sequence on
+    a balanced system, and the earth-return path of unbalanced current. Negative
+    sequence is not asked for because a passive line has Z2 = Z1.
+    """
+    r1, x1 = thresh.primary_r1_ohm, thresh.primary_x1_ohm
+    if r1 is None and x1 is None:
+        return None
+    r1 = float(r1 or 0.0)
+    x1 = float(x1 or 0.0)
+    out = {
+        "r1_ohm": r1,
+        "x1_ohm": x1,
+        "z1_ohm": float(_np.hypot(r1, x1)),
+    }
+    r0, x0 = thresh.primary_r0_ohm, thresh.primary_x0_ohm
+    if r0 is not None or x0 is not None:
+        r0 = float(r0 or 0.0)
+        x0 = float(x0 or 0.0)
+        out.update({
+            "r0_ohm": r0,
+            "x0_ohm": x0,
+            "z0_ohm": float(_np.hypot(r0, x0)),
+        })
+        if out["z1_ohm"] > 0:
+            out["z0_over_z1"] = out["z0_ohm"] / out["z1_ohm"]
+        # A single-phase load tapped off this line sees the phase out and the
+        # earth back, which is (2*Z1 + Z0)/3 rather than Z1 alone.
+        out["single_phase_loop_ohm"] = float(
+            _np.hypot((2 * r1 + r0) / 3.0, (2 * x1 + x0) / 3.0))
+    return out
 
 
 # Service type → human label for report display
@@ -1065,7 +1128,32 @@ def expected_service_impedance(thresh: "Thresholds") -> dict:
         "conductor_label": conductor_label(thresh.conductor_key),
         "run_length_ft": thresh.run_length_ft,
         "generic_conductor_constants": True,
+        "primary_metered": bool(thresh.primary_metered),
     }
+
+    # ── metered on the high side ─────────────────────────────────────────────
+    # The transformer and everything below it belong to the customer and sit
+    # downstream of the meter, so neither is in the path this recording sees.
+    # What is in it is the primary line, which is entered rather than looked up.
+    if thresh.primary_metered:
+        primary = primary_line_impedance(thresh)
+        if primary is None:
+            out["reason"] = (
+                "No expected impedance: this service is metered on the primary, "
+                "so the expected value is the primary line impedance to the "
+                "metering point, and no R1/X1 was entered."
+            )
+            return out
+        out["primary"] = primary
+        out["sequence_used"] = "positive"
+        out["available"] = True
+        out["upstream_ohm"] = primary["z1_ohm"]
+        out["upstream_source"] = (
+            f"the primary line to the metering point, as entered: "
+            f"R1 {primary['r1_ohm']:.4f} Ω, X1 {primary['x1_ohm']:.4f} Ω"
+        )
+        out["total_ohm"] = primary["z1_ohm"]
+        return out
 
     # ── upstream of the service conductors ───────────────────────────────────
     z_upstream: Optional[float] = None
@@ -1112,7 +1200,23 @@ def expected_service_impedance(thresh: "Thresholds") -> dict:
             "almost nothing"
         )
 
-    if z_upstream is None and conductor is None:
+    # ── the shared secondary main, where the service taps one ────────────────
+    # This customer's current flows through it on the way to the transformer,
+    # so its drop is in the measurement whether or not anyone entered it. It is
+    # counted the same way as the service conductor, since the return path is
+    # the same shared neutral.
+    shared = conductor_impedance(thresh.shared_secondary_key or "",
+                                 thresh.shared_secondary_ft or 0.0,
+                                 return_path=single_phase)
+    if shared:
+        r_s, x_s = shared
+        out["shared_secondary_r_ohm"] = r_s
+        out["shared_secondary_x_ohm"] = x_s
+        out["shared_secondary_z_ohm"] = float(_np.hypot(r_s, x_s))
+        out["shared_secondary_label"] = conductor_label(thresh.shared_secondary_key)
+        out["shared_secondary_ft"] = thresh.shared_secondary_ft
+
+    if z_upstream is None and conductor is None and shared is None:
         out["reason"] = (
             "No expected impedance: it needs the transformer kVA or the "
             "short-circuit current, and the service conductor type and run "
@@ -1121,7 +1225,9 @@ def expected_service_impedance(thresh: "Thresholds") -> dict:
         return out
 
     out["available"] = True
-    out["total_ohm"] = (z_upstream or 0.0) + (out.get("conductor_z_ohm") or 0.0)
+    out["total_ohm"] = ((z_upstream or 0.0)
+                        + (out.get("shared_secondary_z_ohm") or 0.0)
+                        + (out.get("conductor_z_ohm") or 0.0))
     missing = []
     if z_upstream is None:
         missing.append("the transformer and primary system")

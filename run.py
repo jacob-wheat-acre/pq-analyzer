@@ -465,22 +465,34 @@ class PQApp(tk.Tk):
         tk.Label(isc_frame, text="A  (from fault study or manual calculation)",
                  bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left")
 
+        # ── The path from the source to the meter ──────────────────────────────
+        # Which controls belong here depends on where the meter sits. Metered on
+        # the secondary, the path is the transformer, whatever shared secondary
+        # main the service taps, and the service run. Metered on the primary,
+        # the transformer and everything below it are the customer's and sit
+        # downstream of the meter, so the path is the primary line instead and
+        # asking for a conductor size would be asking about the wrong wire.
+        self._path_wrap = tk.Frame(self, bg=_BG)
+        self._path_wrap.pack(fill="x")
+
+        self._conductor_labels = {label: key for key, label in conductor_options()}
+        cond_values = [_CONDUCTOR_NONE] + list(self._conductor_labels.keys())
+
         # ── Service conductor row ──────────────────────────────────────────────
-        # The run between that transformer and the meter. With it the measured
-        # service impedance gets an expected value to be compared against;
-        # without it the measurement still stands, uncompared.
-        cond_frame = tk.Frame(self, bg=_BG)
+        # The run between the transformer (or the shared secondary tap) and the
+        # meter. With it the measured service impedance gets an expected value
+        # to be compared against; without it the measurement still stands,
+        # uncompared.
+        self._cond_frame = cond_frame = tk.Frame(self._path_wrap, bg=_BG)
         cond_frame.pack(fill="x", padx=12, pady=(0, 6))
 
         tk.Label(cond_frame, text="Service conductor", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
 
-        self._conductor_labels = {label: key for key, label in conductor_options()}
         self._conductor_var = tk.StringVar(value=_CONDUCTOR_NONE)
         self._conductor_combo = ttk.Combobox(
             cond_frame, textvariable=self._conductor_var, state="readonly",
-            values=[_CONDUCTOR_NONE] + list(self._conductor_labels.keys()),
-            width=32, font=_FONT_UI,
+            values=cond_values, width=32, font=_FONT_UI,
         )
         self._conductor_combo.pack(side="left")
 
@@ -492,6 +504,67 @@ class PQApp(tk.Tk):
         tk.Label(cond_frame, text="ft  (transformer to meter — enables the "
                                   "expected-impedance check)",
                  bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(3, 0))
+
+        # ── Shared secondary row ───────────────────────────────────────────────
+        # Where the transformer does not land at this meter but on a secondary
+        # main shared with the neighbours, that main carries this customer's
+        # current too and its drop is already in the measurement. Leaving it
+        # blank says the service is a dedicated run from the transformer.
+        self._shared_frame = shared_frame = tk.Frame(self._path_wrap, bg=_BG)
+        shared_frame.pack(fill="x", padx=12, pady=(0, 6))
+
+        tk.Label(shared_frame, text="Shared secondary", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+
+        self._shared_var = tk.StringVar(value=_CONDUCTOR_NONE)
+        self._shared_combo = ttk.Combobox(
+            shared_frame, textvariable=self._shared_var, state="readonly",
+            values=cond_values, width=32, font=_FONT_UI,
+        )
+        self._shared_combo.pack(side="left")
+
+        tk.Label(shared_frame, text="Run", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(10, 3))
+        self._shared_length_var = tk.StringVar(value="")
+        tk.Entry(shared_frame, textvariable=self._shared_length_var,
+                 font=_FONT_UI, width=7).pack(side="left")
+        tk.Label(shared_frame, text="ft  (transformer to this service's tap — "
+                                    "leave blank for a dedicated run)",
+                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(3, 0))
+
+        # ── Primary line impedance row ─────────────────────────────────────────
+        # Entered, not looked up: a primary line's impedance comes off a
+        # planning model or a fault study. Z1 is what balanced load current
+        # flows in and is what the comparison uses; Z0 is optional and read
+        # only where it is the right number -- triplen harmonics, which are
+        # zero-sequence, and unbalanced current returning through earth. Z2 is
+        # not asked for because a passive line has Z2 = Z1.
+        self._primary_frame = prim_frame = tk.Frame(self._path_wrap, bg=_BG)
+
+        tk.Label(prim_frame, text="Primary line Z", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+
+        # Each entry is also an attribute, not only a dict value: Clear All
+        # snapshots the form by walking vars(self) for tk variables, and a
+        # field it cannot see is a field that carries the last site's
+        # impedance into the next run.
+        self._primary_r1_var = tk.StringVar(value="")
+        self._primary_x1_var = tk.StringVar(value="")
+        self._primary_r0_var = tk.StringVar(value="")
+        self._primary_x0_var = tk.StringVar(value="")
+        self._primary_vars = {
+            "r1": self._primary_r1_var, "x1": self._primary_x1_var,
+            "r0": self._primary_r0_var, "x0": self._primary_x0_var,
+        }
+        for field, label in (("r1", "R1"), ("x1", "X1"),
+                             ("r0", "R0"), ("x0", "X0")):
+            tk.Label(prim_frame, text=label, bg=_BG, fg=_LABEL_FG,
+                     font=_FONT_UI).pack(side="left", padx=(0 if field == "r1" else 8, 3))
+            tk.Entry(prim_frame, textvariable=self._primary_vars[field],
+                     font=_FONT_UI, width=8).pack(side="left")
+        tk.Label(prim_frame, text="Ω  (to the metering point; R1/X1 required, "
+                                  "R0/X0 optional)",
+                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(6, 0))
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", padx=12, pady=(4, 0))
 
@@ -730,9 +803,26 @@ class PQApp(tk.Tk):
         else:
             self._isc_entry.config(state="disabled")
 
+    def _refresh_path_rows(self):
+        """Show the controls that describe the path this meter actually sees.
+
+        Metered on the secondary that is the shared main and the service run;
+        metered on the primary it is the primary line, and the two conductor
+        pickers are asking about wire on the customer's side of the meter.
+        """
+        primary = self._xfmr_type_key == _PRIMARY_KEY
+        for frame in (self._cond_frame, self._shared_frame, self._primary_frame):
+            frame.pack_forget()
+        if primary:
+            self._primary_frame.pack(fill="x", padx=12, pady=(0, 6))
+        else:
+            self._cond_frame.pack(fill="x", padx=12, pady=(0, 6))
+            self._shared_frame.pack(fill="x", padx=12, pady=(0, 6))
+
     def _refresh_kva_options(self):
         """Rebuild kVA combo list for the current type + nominal voltage."""
         key = self._xfmr_type_key
+        self._refresh_path_rows()
 
         if key == _PRIMARY_KEY:
             # Primary metered: no kVA lookup, user must supply ISC manually
@@ -1026,8 +1116,55 @@ class PQApp(tk.Tk):
                 "the conductor back to \u2014 not specified \u2014.")
             return
 
+        # Shared secondary — same rule as the service run: a picked conductor
+        # with no length silently drops out of the expected impedance instead
+        # of announcing that it was ignored.
+        shared_length_ft = None
+        shared_str = self._shared_length_var.get().strip()
+        if shared_str:
+            try:
+                shared_length_ft = float(shared_str)
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid input",
+                    "Shared secondary length must be a number of feet (e.g. 300).")
+                return
+        shared_key = self._conductor_labels.get(self._shared_var.get())
+        if shared_key and not shared_length_ft:
+            messagebox.showerror(
+                "Invalid input",
+                "A shared secondary was picked without a run length. Enter the "
+                "length in feet from the transformer to this service's tap, or "
+                "set it back to — not specified —.")
+            return
+
         # Transformer kVA
         xfmr_key = self._xfmr_type_key
+
+        # Primary line impedance, for a service metered on the high side. R1
+        # and X1 carry the comparison, so they go together; R0 and X0 are
+        # optional and used only where zero sequence is the right number.
+        primary_metered = xfmr_key == _PRIMARY_KEY
+        primary_z = {}
+        for field, var in self._primary_vars.items():
+            text = var.get().strip()
+            if not text:
+                continue
+            try:
+                primary_z[field] = float(text)
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid input",
+                    f"Primary line {field.upper()} must be a number of ohms "
+                    "(e.g. 0.42).")
+                return
+        if primary_metered and ("r1" in primary_z) != ("x1" in primary_z):
+            messagebox.showerror(
+                "Invalid input",
+                "Primary line impedance needs both R1 and X1. Enter the other "
+                "one, or clear both and the impedance will be measured without "
+                "an expected value to compare against.")
+            return
         kva = None
         kva_str = self._kva_var.get().strip()
         if xfmr_key and xfmr_key != _PRIMARY_KEY and kva_str:
@@ -1057,8 +1194,19 @@ class PQApp(tk.Tk):
             # report and its charts describe; without these the plots fall back
             # to guessing from which channels happen to be present.
             "topology":       self._topo_var.get(),
-            "conductor_key":  self._conductor_labels.get(self._conductor_var.get()),
-            "run_length_ft":  run_length_ft,
+            # A primary-metered service is measured above its own transformer,
+            # so the secondary conductors are downstream of the meter and are
+            # dropped here rather than quietly added to the expected impedance.
+            "conductor_key":  None if primary_metered else
+                              self._conductor_labels.get(self._conductor_var.get()),
+            "run_length_ft":  None if primary_metered else run_length_ft,
+            "shared_secondary_key": None if primary_metered else shared_key,
+            "shared_secondary_ft":  None if primary_metered else shared_length_ft,
+            "primary_metered":      primary_metered,
+            "primary_r1_ohm":       primary_z.get("r1"),
+            "primary_x1_ohm":       primary_z.get("x1"),
+            "primary_r0_ohm":       primary_z.get("r0"),
+            "primary_x0_ohm":       primary_z.get("x0"),
         }
 
         self._log_clear()
@@ -1131,6 +1279,13 @@ class PQApp(tk.Tk):
             topology=params.get("topology", "auto"),
             conductor_key=params.get("conductor_key"),
             run_length_ft=params.get("run_length_ft"),
+            shared_secondary_key=params.get("shared_secondary_key"),
+            shared_secondary_ft=params.get("shared_secondary_ft"),
+            primary_metered=bool(params.get("primary_metered")),
+            primary_r1_ohm=params.get("primary_r1_ohm"),
+            primary_x1_ohm=params.get("primary_x1_ohm"),
+            primary_r0_ohm=params.get("primary_r0_ohm"),
+            primary_x0_ohm=params.get("primary_x0_ohm"),
         )
 
         # ── Adapter ───────────────────────────────────────────────────────────
