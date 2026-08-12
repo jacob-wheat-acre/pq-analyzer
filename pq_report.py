@@ -5481,9 +5481,12 @@ def generate_customer_letter(
     for idx, cond in enumerate(conditions, start=1):
         doc.add_paragraph()
         p = doc.add_paragraph()
-        _bold(p, f"{idx}. {cond['headline']}",
-              color=_sev_color("severe" if cond.get("safety") else "watch"),
-              size_pt=11)
+        # Brand red, like every other heading in this letter. These are
+        # headings, not severity statements: colouring them from the severity
+        # palette put every ordinary finding in the Watch blue, which says
+        # something about the finding that was never assessed. What is a safety
+        # concern is answered in words, in its own section immediately below.
+        _bold(p, f"{idx}. {cond['headline']}", color=_XE_RED, size_pt=11)
         for label, key in (("What we measured:  ", "measured"),
                            ("What this means:  ", "means"),
                            ("What you may have noticed:  ", "symptom")):

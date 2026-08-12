@@ -4910,6 +4910,48 @@ class TestCustomerLetter:
         assert out is not None and out.exists()
         assert out.name.endswith("_customer_letter.docx")
 
+    def test_the_letter_is_brand_red_and_nothing_else(self, tmp_path):
+        # Every coloured run in a customer document is the Xcel Energy red.
+        # The numbered findings were drawn from the severity palette, which put
+        # each ordinary finding in the Watch blue -- a severity claim about a
+        # finding whose severity was never assessed for the customer.
+        docx = pytest.importorskip("docx")
+        from pq_report import generate_customer_letter, _XE_RED
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        doc = docx.Document(str(out))
+        colours = {
+            str(r.font.color.rgb)
+            for p in doc.paragraphs for r in p.runs
+            if r.font.color is not None and r.font.color.type is not None
+        }
+        assert colours == {str(_XE_RED)}, f"non-brand colour in the letter: {colours}"
+
+    def test_a_numbered_finding_is_a_red_heading(self, tmp_path):
+        docx = pytest.importorskip("docx")
+        from pq_report import generate_customer_letter, _XE_RED
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        doc = docx.Document(str(out))
+        numbered = [p for p in doc.paragraphs
+                    if p.text.strip()[:2] in {f"{i}." for i in range(1, 10)}]
+        assert numbered, "the letter listed no findings to check"
+        for p in numbered:
+            for r in p.runs:
+                assert r.font.color.rgb == _XE_RED
+                assert r.font.bold
+
+    def test_a_safety_finding_is_called_out_in_words_not_only_colour(self, tmp_path):
+        # The colour distinction went away with this change, so the safety
+        # signal has to survive somewhere a reader actually reads.
+        from pq_report import generate_customer_letter
+        docx = pytest.importorskip("docx")
+        rep, th = self._report(Path("test_data/test_residential.pqd"))
+        out = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, "t")
+        text = "\n".join(p.text for p in docx.Document(str(out)).paragraphs)
+        assert "Is this a safety concern?" in text
+        assert "needs prompt attention" in text
+
     def test_a_letter_from_an_earlier_run_never_survives(self, tmp_path):
         # A letter that outlives the run that wrote it sits beside a fresh
         # report describing a different recording, and says nothing about which
