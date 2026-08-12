@@ -1791,8 +1791,13 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         meas = _voltage_band_cell(worst, llv, f"Worst pair {worst_pair}: ")
         if llv.get("range_b_note"):
             meas += f"  |  {llv['range_b_note']}"
+        # Where the engineer stated the nominal, say so: on a primary service
+        # the band is built from what they entered, and a reader checking the
+        # limit needs to know it came from the form rather than from the file.
+        nominal_note = ("" if llv.get("nominal_source") != "entered"
+                        else ", entered")
         add_row(f"Line-to-line voltage within ANSI C84.1 Range A "
-                f"({llv['nominal_v']:.0f} V nominal)",
+                f"({llv['nominal_v']:.0f} V nominal{nominal_note})",
                 meas, llv.get("overall_pass"),
                 sev.get("voltage_line_to_line"), group="voltage",
                 verdict=_VOLTAGE_BAND_VERDICT.get(worst["band"]))

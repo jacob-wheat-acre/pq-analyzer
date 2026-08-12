@@ -424,10 +424,21 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
                           "infer the line-to-line nominal."),
                 "pairs": {}, "total_pct_out_of_bounds": None}
 
-    nominal = thresh.nominal_voltage * factor
-    snapped = min(_STANDARD_LL_NOMINAL, key=lambda v: abs(v - nominal))
-    if abs(snapped - nominal) / nominal <= 0.02:
-        nominal = float(snapped)
+    # An entered primary nominal wins outright. Inference recovers the topology
+    # -- whether the legs are 120 or 180 degrees apart -- but not the nominal
+    # itself, and PSCo runs several primary voltages that no part of the file
+    # names. Snapping a 13.2 kV service to the nearest table entry is a guess
+    # dressed as a limit, so where the engineer has stated the voltage it is
+    # used as stated and the source is recorded for the report.
+    if thresh.primary_ll_voltage:
+        nominal = float(thresh.primary_ll_voltage)
+        nominal_source = "entered"
+    else:
+        nominal = thresh.nominal_voltage * factor
+        snapped = min(_STANDARD_LL_NOMINAL, key=lambda v: abs(v - nominal))
+        if abs(snapped - nominal) / nominal <= 0.02:
+            nominal = float(snapped)
+        nominal_source = "inferred"
 
     bands = ansi_bands(nominal)
     if not bands["range_a_evaluated"]:
@@ -438,6 +449,7 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "available":     True,
         "error":         None,
         "nominal_v":     nominal,
+        "nominal_source": nominal_source,
         "range_v":       (vmin, vmax),
         "range_b_v":     ((bands["b_min"], bands["b_max"])
                           if bands["range_b_evaluated"] else None),

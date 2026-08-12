@@ -4113,6 +4113,45 @@ class TestANSIVoltageRanges:
         assert "outside Range B" in cell
         assert "all below 253.9 V" in cell
 
+    # ── The primary nominal ──────────────────────────────────────────────────
+    def test_an_entered_primary_nominal_beats_inference(self):
+        """PSCo runs several primary voltages and the file names none of them."""
+        import pandas as pd
+        from pq_analysis import check_line_to_line_voltage
+        idx = pd.date_range("2026-01-01", periods=200, freq="30s")
+        ln  = 7621.0
+        df = pd.DataFrame({
+            "voltage_a":  pd.Series(ln, index=idx),
+            "voltage_b":  pd.Series(ln, index=idx),
+            "voltage_c":  pd.Series(ln, index=idx),
+            "voltage_ab": pd.Series(ln * 3 ** 0.5, index=idx),
+        })
+        th = Thresholds(nominal_voltage=ln, primary_ll_voltage=13200.0)
+        res = check_line_to_line_voltage(df, th)
+        assert res["available"] is True
+        assert res["nominal_v"] == pytest.approx(13200.0)
+        assert res["nominal_source"] == "entered"
+        # Judged against the over-600 V group, not the secondary one.
+        assert res["nominal_group"] == "over_600v"
+        assert res["range_v"][0] == pytest.approx(13200.0 * 0.975)
+        assert res["range_b_v"][0] == pytest.approx(13200.0 * 0.95)
+
+    def test_without_an_entered_nominal_inference_still_runs(self):
+        import pandas as pd
+        from pq_analysis import check_line_to_line_voltage
+        idx = pd.date_range("2026-01-01", periods=200, freq="30s")
+        df = pd.DataFrame({
+            "voltage_a":  pd.Series(277.0, index=idx),
+            "voltage_b":  pd.Series(277.0, index=idx),
+            "voltage_c":  pd.Series(277.0, index=idx),
+            "voltage_ab": pd.Series(480.0, index=idx),
+        })
+        res = check_line_to_line_voltage(df, Thresholds(nominal_voltage=277.0))
+        assert res["nominal_source"] == "inferred"
+        assert res["nominal_v"] == pytest.approx(480.0)
+        assert res["range_v"][0] == pytest.approx(456.0)
+        assert res["range_v"][1] == pytest.approx(504.0)
+
 
 class TestSeverityGrading:
     """Severity is a second axis beside compliance, not a replacement for it.

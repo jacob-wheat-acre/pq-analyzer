@@ -54,8 +54,17 @@ _SCHEDULE_KEY = {
 try:
     sys.path.insert(0, str(Path(__file__).parent))
     from pq_constants import __version__ as _ENGINE_VERSION
+    from pq_constants import ansi_bands, ll_factor
 except Exception:
     _ENGINE_VERSION = "unknown"
+
+    def ansi_bands(nominal_v):                       # type: ignore[misc]
+        # C84.1 Table 1, over-600 V group, since this fallback is only ever
+        # reached by the primary-voltage hint.
+        return {"a_min": nominal_v * 0.975, "a_max": nominal_v * 1.05}
+
+    def ll_factor(service_type=None, topology="auto"):   # type: ignore[misc]
+        return 2.0 if topology == "split-phase" else 3.0 ** 0.5
 
 # ── Transformer / Blue Book data ──────────────────────────────────────────────
 # Import the same lookup tables used by the analysis engine so the GUI always
@@ -154,6 +163,13 @@ _PRIMARY_KEY    = "__primary__"
 _PRIMARY_LABEL  = "Primary metered"
 # Sentinel for the service-conductor picker
 _CONDUCTOR_NONE = "— not specified —"
+
+#: Primary distribution nominals offered to a primary-metered service, from the
+#: over-600 V half of ANSI C84.1 Table 1. The combobox is editable rather than
+#: readonly: this is a starting list, not the set of voltages that exist, and an
+#: engineer metering a service on something not listed must still be able to say
+#: so rather than pick the nearest wrong one.
+_PRIMARY_LL_CHOICES = [2400, 4160, 4800, 12470, 13200, 13800, 24940, 34500]
 
 #: Variables the form derives rather than accepts: the ISC hint label is
 #: rewritten by the transformer cascade, and the details panel's open state is
@@ -532,6 +548,38 @@ class PQApp(tk.Tk):
                                     "leave blank for a dedicated run)",
                  bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(3, 0))
 
+        # ── Primary nominal voltage row ───────────────────────────────────────
+        # Entered, not inferred. The L-L/L-N ratio in the file recovers the
+        # topology -- whether the legs sit 120 or 180 degrees apart -- but says
+        # nothing about the nominal, and PSCo runs several primary voltages. The
+        # secondary path can afford to guess and snap to the nearest standard
+        # value because there are only a handful in play; on the primary that
+        # guess would become the ANSI C84.1 band the customer is judged against.
+        self._primary_v_frame = primv_frame = tk.Frame(self._path_wrap, bg=_BG)
+
+        tk.Label(primv_frame, text="Primary voltage", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+        self._primary_ll_var = tk.StringVar(value="")
+        primv_combo = ttk.Combobox(
+            primv_frame, textvariable=self._primary_ll_var,
+            values=[str(v) for v in _PRIMARY_LL_CHOICES],
+            width=9, font=_FONT_UI,
+        )
+        primv_combo.pack(side="left")
+        tk.Label(primv_frame, text="V L-L", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(3, 0))
+        # The L-N figure the ANSI check actually runs on is derived, so it is
+        # shown as it is derived: an engineer who reads 7621 V here and expected
+        # something else has caught a wrong entry before the report is written.
+        self._primary_ln_hint = tk.Label(
+            primv_frame, text="(nominal at the metering point — sets the "
+                              "ANSI C84.1 band)",
+            bg=_BG, fg="#888888", font=_FONT_UI_S)
+        self._primary_ln_hint.pack(side="left", padx=(8, 0))
+        primv_combo.bind("<<ComboboxSelected>>", self._on_primary_v_change)
+        primv_combo.bind("<KeyRelease>",         self._on_primary_v_change)
+        primv_combo.bind("<FocusOut>",           self._on_primary_v_change)
+
         # ── Primary line impedance row ─────────────────────────────────────────
         # Entered, not looked up: a primary line's impedance comes off a
         # planning model or a fault study. Z1 is what balanced load current
@@ -779,6 +827,39 @@ class PQApp(tk.Tk):
         """Re-derive kVA options when nominal voltage changes."""
         self._refresh_kva_options()
 
+    def _on_primary_v_change(self, _event=None):
+        """Show the L-N nominal derived from the entered primary L-L voltage.
+
+        The ANSI check runs per phase against L-N, so that is the number the
+        entry really sets. Showing it as it is typed lets a wrong entry be
+        caught here rather than in the band printed on the finished report.
+        """
+        text = self._primary_ll_var.get().strip()
+        if not text:
+            self._primary_ln_hint.config(
+                text="(nominal at the metering point — sets the ANSI C84.1 band)",
+                fg="#888888")
+            return
+        try:
+            ll = float(text)
+        except ValueError:
+            self._primary_ln_hint.config(text="(not a number)", fg="#cc6666")
+            return
+        if ll <= 0:
+            self._primary_ln_hint.config(text="(must be above zero)", fg="#cc6666")
+            return
+        ln = ll / ll_factor(None, self._topo_var.get())
+        band = ansi_bands(ln)
+        if band.get("a_min") is None:
+            self._primary_ln_hint.config(
+                text=f"= {ln:,.0f} V L-N  ·  above 34.5 kV, outside ANSI C84.1",
+                fg="#cc6666")
+            return
+        self._primary_ln_hint.config(
+            text=f"= {ln:,.0f} V L-N  ·  ANSI C84.1 Range A "
+                 f"{band['a_min']:,.0f}–{band['a_max']:,.0f} V",
+            fg="#888888")
+
     def _on_type_change(self, _event=None):
         """Map display label back to internal key, then refresh kVA list."""
         display = self._xfmr_type_var.get()
@@ -811,9 +892,11 @@ class PQApp(tk.Tk):
         pickers are asking about wire on the customer's side of the meter.
         """
         primary = self._xfmr_type_key == _PRIMARY_KEY
-        for frame in (self._cond_frame, self._shared_frame, self._primary_frame):
+        for frame in (self._cond_frame, self._shared_frame,
+                      self._primary_v_frame, self._primary_frame):
             frame.pack_forget()
         if primary:
+            self._primary_v_frame.pack(fill="x", padx=12, pady=(0, 6))
             self._primary_frame.pack(fill="x", padx=12, pady=(0, 6))
         else:
             self._cond_frame.pack(fill="x", padx=12, pady=(0, 6))
@@ -1158,6 +1241,25 @@ class PQApp(tk.Tk):
                     f"Primary line {field.upper()} must be a number of ohms "
                     "(e.g. 0.42).")
                 return
+        # The primary nominal is required, not optional. Falling back to
+        # inference here would put the guess this field exists to remove back
+        # into the ANSI band, and it would do it silently.
+        primary_ll = None
+        if primary_metered:
+            text = self._primary_ll_var.get().strip()
+            try:
+                primary_ll = float(text)
+            except ValueError:
+                primary_ll = None
+            if primary_ll is None or primary_ll <= 0:
+                messagebox.showerror(
+                    "Primary voltage required",
+                    "Enter the primary line-to-line voltage for this service.\n\n"
+                    "It sets the ANSI C84.1 band the readings are judged "
+                    "against. Nothing in the meter file names the primary "
+                    "voltage, so it cannot be inferred — a guess here would "
+                    "become the limit printed in the report.")
+                return
         if primary_metered and ("r1" in primary_z) != ("x1" in primary_z):
             messagebox.showerror(
                 "Invalid input",
@@ -1203,6 +1305,7 @@ class PQApp(tk.Tk):
             "shared_secondary_key": None if primary_metered else shared_key,
             "shared_secondary_ft":  None if primary_metered else shared_length_ft,
             "primary_metered":      primary_metered,
+            "primary_ll_voltage":   primary_ll,
             "primary_r1_ohm":       primary_z.get("r1"),
             "primary_x1_ohm":       primary_z.get("x1"),
             "primary_r0_ohm":       primary_z.get("r0"),
@@ -1256,6 +1359,23 @@ class PQApp(tk.Tk):
         outdir   = _SCRIPT.parent / "pq_output"
         stem     = Path(filepath).stem
 
+        # On a primary-metered service the entered L-L voltage is the nominal,
+        # and the per-phase ANSI check runs against L-N -- so it is derived here
+        # rather than read from the secondary-oriented Nominal Voltage picker,
+        # which is not describing this service. Logged because a derived limit
+        # that appears without explanation is the kind a reader cannot check.
+        primary_ll = params.get("primary_ll_voltage")
+        if params.get("primary_metered") and primary_ll:
+            nominal = primary_ll / ll_factor(None, params.get("topology", "auto"))
+            _band = ansi_bands(nominal)
+            _logging.getLogger(__name__).info(
+                "Primary-metered service: %.0f V L-L entered -> %.1f V L-N "
+                "nominal; ANSI C84.1 Range A %s V L-N.",
+                primary_ll, nominal,
+                "not defined above 34.5 kV" if _band.get("a_min") is None
+                else f"{_band['a_min']:.1f}-{_band['a_max']:.1f}",
+            )
+
         # ── ISC resolution ────────────────────────────────────────────────────
         isc_amps   = params["isc_amps"]
         isc_source = None
@@ -1282,6 +1402,7 @@ class PQApp(tk.Tk):
             shared_secondary_key=params.get("shared_secondary_key"),
             shared_secondary_ft=params.get("shared_secondary_ft"),
             primary_metered=bool(params.get("primary_metered")),
+            primary_ll_voltage=primary_ll,
             primary_r1_ohm=params.get("primary_r1_ohm"),
             primary_x1_ohm=params.get("primary_x1_ohm"),
             primary_r0_ohm=params.get("primary_r0_ohm"),

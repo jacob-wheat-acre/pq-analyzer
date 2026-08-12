@@ -241,6 +241,12 @@ EXAMPLES
                          "and secondary are the customer's and downstream of "
                          "the meter, so the expected impedance is the primary "
                          "line, entered with --primary-r1/--primary-x1."))
+    p.add_argument("--primary-voltage", type=float, default=None, metavar="VLL",
+                   help=("Nominal line-to-line voltage at a primary metering "
+                         "point (e.g. 13200). Required with --primary-metered: "
+                         "it sets the ANSI C84.1 band, the L-N nominal is "
+                         "derived from it, and nothing in the meter file names "
+                         "the primary voltage for it to be inferred from."))
     p.add_argument("--primary-r1", type=float, default=None,
                    help="Primary line positive-sequence resistance to the meter (ohms).")
     p.add_argument("--primary-x1", type=float, default=None,
@@ -269,7 +275,14 @@ EXAMPLES
                    choices=["r", "c", "sg", "pg"],
                    help="PSCo tariff schedule: r=Residential, c=Small Comm., sg=C&I Secondary, pg=C&I Primary")
     p.add_argument("--verbose",   action="store_true", help="Debug logging")
-    return p.parse_args()
+    args = p.parse_args()
+    # Checked here rather than in main() so it fails as a usage error, with the
+    # usage text, before any file is opened.
+    if args.primary_metered and not args.primary_voltage:
+        p.error("--primary-metered requires --primary-voltage VLL: the ANSI "
+                "C84.1 band is built from it, and nothing in the meter file "
+                "names the primary voltage for it to be inferred from.")
+    return args
 
 
 def main():
@@ -307,8 +320,18 @@ def main():
     elif isc_amps is not None:
         isc_source = isc_note
 
+    # A primary metering point is described by its L-L nominal; the per-phase
+    # ANSI check runs on L-N, so derive it rather than making the caller pass
+    # two numbers that have to agree.
+    nominal_v = args.nominal
+    if args.primary_metered and args.primary_voltage:
+        nominal_v = args.primary_voltage / ll_factor(args.service_type, args.topology)
+        log.info("Primary-metered: %.0f V L-L -> %.1f V L-N nominal.",
+                 args.primary_voltage, nominal_v)
+
     thresh = Thresholds(
-        nominal_voltage=args.nominal,
+        nominal_voltage=nominal_v,
+        primary_ll_voltage=args.primary_voltage,
         volt_tolerance=args.volt_tol,
         thd_voltage_limit=args.thd_limit,
         power_factor_limit=args.pf_limit,

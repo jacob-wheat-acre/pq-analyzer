@@ -13,6 +13,12 @@ class Thresholds:
     """All engineering limits in one place — pass to PQAnalyzer."""
     nominal_voltage: float = 120.0        # V (line-to-neutral)
     volt_tolerance: float = 0.05          # ±5 % → ANSI C84.1 Range A
+    # A primary-metered service is metered on the high side, and PSCo runs a
+    # variety of primary voltages. Nothing in the file identifies which one, and
+    # inferring it from the measured L-L/L-N ratio only recovers the topology,
+    # not the nominal -- so the engineer enters it and the ANSI bands are built
+    # from it. Left unset, the L-L nominal is inferred as it always was.
+    primary_ll_voltage: Optional[float] = None  # V line-to-line, primary metering
     thd_voltage_limit: float = 8.0        # % → IEEE 519 Table 2 (≤1 kV bus)
     thd_current_limit: float = 5.0        # % THD fallback when no RMS current channels (TDD unavailable)
     power_factor_limit: float = 0.90      # lagging — flag below this
