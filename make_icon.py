@@ -119,15 +119,75 @@ def _draw_icon(size: int) -> Image.Image:
 
 
 def make_ico(out: Path):
-    """Windows multi-resolution .ico"""
+    """Windows multi-resolution .ico.
+
+    Saved from the LARGEST frame, which is not incidental: Pillow's ICO writer
+    silently drops every requested size larger than the image it is saving, so
+    handing it the 16 px frame first produced a one-entry 16x16 file. Windows
+    then had nothing to draw the 32 px taskbar or 48 px desktop icon from and
+    fell back to the host interpreter's own icon -- the tool looked like it had
+    no icon at all on Windows while looking fine on macOS, which reads the
+    separate .icns.
+
+    Every size Windows asks for is drawn at that size rather than resampled from
+    one master, so the 16 and 24 px entries stay legible instead of turning into
+    a smear of the 256 px artwork.
+    """
     sizes  = [16, 24, 32, 48, 64, 128, 256]
     frames = [_draw_icon(s).convert("RGBA") for s in sizes]
-    frames[0].save(
+    largest = frames[-1]
+    largest.save(
         out, format="ICO",
         sizes=[(s, s) for s in sizes],
-        append_images=frames[1:],
+        append_images=frames[:-1],
+        # Pillow writes every entry as PNG unless told otherwise, and Windows
+        # only reads PNG inside an .ico at 256x256 -- it skips smaller PNG
+        # entries in silence. DIB for all of them costs a few hundred KB and
+        # is what every Windows version back to XP can actually draw.
+        bitmap_format="bmp",
     )
+    _verify_ico(out, sizes)
     print(f"  Created {out}")
+
+
+def _verify_ico(path: Path, sizes: list) -> None:
+    """Fail loudly if the .ico did not come out the way Windows needs it.
+
+    This file is generated on a Mac and consumed on Windows, so nothing on the
+    machine that writes it will notice it is wrong. The last breakage shipped
+    and sat there. Checking the directory here is the only place the mistake is
+    visible to the person who made it.
+    """
+    data = path.read_bytes()
+    reserved, kind, count = struct.unpack("<HHH", data[:6])
+    if reserved or kind != 1:
+        raise SystemExit(f"{path}: not an icon file (reserved={reserved} type={kind})")
+
+    found, offset = {}, 6
+    for _ in range(count):
+        w, h, _ncol, _r, _planes, bpp, length, data_off = struct.unpack(
+            "<BBBBHHII", data[offset:offset + 16])
+        offset += 16
+        # 0 means 256 in the ICO directory, which is why 256 is the ceiling.
+        w, h = w or 256, h or 256
+        # Windows only reads PNG-compressed entries at 256x256; below that it
+        # wants a DIB and will skip -- not fail, skip -- anything else, which is
+        # how an icon goes missing without an error anywhere.
+        is_png = data[data_off:data_off + 8] == b"\x89PNG\r\n\x1a\n"
+        if is_png and w < 256:
+            raise SystemExit(
+                f"{path}: the {w}x{h} entry is PNG-compressed. Windows only "
+                "accepts PNG inside an .ico at 256x256; smaller entries must be "
+                "DIB-encoded or they are ignored.")
+        found[w] = bpp
+
+    missing = [s for s in sizes if s not in found]
+    if missing:
+        raise SystemExit(
+            f"{path}: missing {missing}. Pillow drops sizes larger than the "
+            "image being saved — save from the largest frame.")
+    print(f"  Verified {path.name}: {sorted(found)} px, "
+          f"{', '.join(f'{s}px@{found[s]}bpp' for s in sorted(found))}")
 
 
 def make_icns(out: Path):

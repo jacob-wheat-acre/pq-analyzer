@@ -257,21 +257,52 @@ class PQApp(tk.Tk):
         self._running = False
 
     def _set_icon(self):
+        """Title bar, taskbar and Alt-Tab icon.
+
+        Windows wants two separate things here and reports neither when it does
+        not get them, which is why this went unnoticed while macOS looked fine:
+
+          * a multi-size DIB .ico — a lone 16 px entry leaves the 32 px taskbar
+            and 48 px desktop icon with nothing to draw, and Windows falls back
+            to the host interpreter's icon rather than erroring;
+          * an explicit AppUserModelID — the taskbar groups a window by that ID,
+            and a script run under pythonw.exe inherits Python's own, so the
+            taskbar draws the Python logo however the window is decorated.
+
+        Failures are logged rather than swallowed. The icon is cosmetic and must
+        never block startup, but "cosmetic" is not "invisible": the last time
+        this broke, nothing anywhere said so, and this tool is used on machines
+        whose files cannot be sent back for diagnosis.
+        """
+        log = _logging.getLogger(__name__)
         icon_dir = Path(__file__).parent
-        try:
-            if sys.platform == "win32":
-                ico = icon_dir / "icon.ico"
-                if ico.exists():
-                    self.iconbitmap(str(ico))
+
+        if sys.platform == "win32":
+            ico = icon_dir / "icon.ico"
+            if ico.exists():
+                try:
+                    # default= covers this window and every dialog opened from
+                    # it; without it the message boxes revert to the Tk feather.
+                    self.iconbitmap(default=str(ico))
+                    return
+                except Exception as exc:
+                    log.warning("Could not load %s (%s); falling back to the "
+                                "PNG icon.", ico.name, exc)
             else:
-                png = icon_dir / "icon.png"
-                if png.exists():
-                    from PIL import Image, ImageTk
-                    img = Image.open(png).resize((64, 64), Image.LANCZOS)
-                    self._tk_icon = ImageTk.PhotoImage(img)
-                    self.iconphoto(True, self._tk_icon)
-        except Exception:
-            pass  # icon is cosmetic — never block startup
+                log.warning("%s is missing — run make_icon.py to rebuild it.",
+                            ico)
+
+        # PNG path: macOS and Linux always, Windows only if the .ico would not
+        # load. Tk 8.6 reads PNG natively, so this does not require Pillow.
+        png = icon_dir / "icon.png"
+        if not png.exists():
+            log.warning("%s is missing — the window will use the default icon.", png)
+            return
+        try:
+            self._tk_icon = tk.PhotoImage(file=str(png))
+            self.iconphoto(True, self._tk_icon)
+        except Exception as exc:
+            log.warning("Could not set the window icon from %s: %s", png, exc)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -2500,6 +2531,33 @@ class PQApp(tk.Tk):
         self._log.config(state="disabled")
 
 
+def _claim_windows_taskbar_identity() -> None:
+    """Give this app its own taskbar identity on Windows.
+
+    The taskbar groups windows by AppUserModelID and draws that group's icon.
+    A script launched through pythonw.exe inherits Python's ID, so the taskbar
+    button shows the Python logo no matter what icon the window itself carries
+    -- which is what "the icon works on the Mac but not on Windows" looks like.
+
+    Has to run before the first window is mapped, so it is called here rather
+    than from inside the window's own setup.
+
+    No-op everywhere else, and never fatal: an unrecognised shell32 or a locked
+    down host costs an icon, not a session.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "XcelEnergy.PQAnalyzer")
+    except Exception as exc:
+        _logging.getLogger(__name__).debug(
+            "Could not set the taskbar AppUserModelID (%s); the taskbar may "
+            "show the Python icon.", exc)
+
+
 if __name__ == "__main__":
+    _claim_windows_taskbar_identity()
     app = PQApp()
     app.mainloop()

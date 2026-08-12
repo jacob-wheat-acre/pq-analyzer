@@ -108,12 +108,19 @@ def install_windows():
     bat      = TOOL_DIR / "PQ Analyzer.bat"
     ico      = TOOL_DIR / "icon.ico"
 
+    if not ico.exists():
+        print(f"\n  Warning: {ico.name} is missing, so the shortcut will get a "
+              "default icon.\n  Run:  python3 make_icon.py\n")
+
     ps = (
         "$ws = New-Object -ComObject WScript.Shell; "
         f"$sc = $ws.CreateShortcut('{shortcut}'); "
         f"$sc.TargetPath = '{bat}'; "
         f"$sc.WorkingDirectory = '{TOOL_DIR}'; "
-        f"$sc.IconLocation = '{ico}'; "
+        # ",0" names the icon's index within the file. WScript defaults to 0
+        # without it, but the explicit form is what Windows documents and it
+        # costs nothing to be unambiguous in a multi-size .ico.
+        f"$sc.IconLocation = '{ico},0'; "
         "$sc.Description = 'PQ Analyzer — Power Quality Analysis Tool'; "
         "$sc.Save()"
     )
@@ -124,6 +131,13 @@ def install_windows():
     )
     if shortcut.exists():
         print(f"\n  Shortcut created: {shortcut}\n")
+        # Windows caches shortcut icons per path. A shortcut that previously
+        # pointed at a broken .ico keeps showing the fallback even once the
+        # file is fixed, which reads as "the fix did not work".
+        print("  If the shortcut still shows the Python icon, Windows is "
+              "serving a cached\n  copy. Clear it with:\n")
+        print("      ie4uinit.exe -show\n")
+        print("  or sign out and back in.\n")
     else:
         print(f"\n  Could not create shortcut: {result.stderr.strip()}")
         print(f"  You can still launch by double-clicking 'PQ Analyzer.bat'\n")
