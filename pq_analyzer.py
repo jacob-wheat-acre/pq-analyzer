@@ -183,6 +183,11 @@ EXAMPLES
     p.add_argument("filepath", nargs="?", help="Path to .pqd PQDIF file")
     p.add_argument("--demo",          action="store_true", help="Run with synthetic demo data")
     p.add_argument("--list-channels", action="store_true", help="Print all channels and exit")
+    p.add_argument("--list-sessions", action="store_true",
+                   help="Print the recording sessions in the file and exit")
+    p.add_argument("--session", type=int, default=None, metavar="N",
+                   help="Analyse session N (1-based) of a file holding several; "
+                        "default is the longest")
     p.add_argument("--nominal",   type=float, default=120.0,  help="Nominal voltage V (default 120)")
     p.add_argument("--volt-tol",  type=float, default=0.05,   help="Voltage tolerance ±fraction (default 0.05)")
     p.add_argument("--thd-limit", type=float, default=8.0,    help="Voltage THD %% limit (default 8.0)")
@@ -302,7 +307,9 @@ def main():
             sys.exit(1)
         log.info("Opening %s  (%.1f MB)", fp, fp.stat().st_size / 1e6)
         if fp.suffix.lower() == ".pqd":
-            adapter = ProntoAdapter(fp)
+            # --session is 1-based for the user, 0-based inside.
+            adapter = ProntoAdapter(
+                fp, session=None if args.session is None else args.session - 1)
         elif _PQDIF_AVAILABLE:
             adapter = PQDIFAdapter(fp)
         else:
@@ -315,6 +322,23 @@ def main():
     else:
         log.error("Provide a .pqd file or use --demo.")
         sys.exit(1)
+
+    # ── List-sessions mode ────────────────────────────────────────────────────
+    if args.list_sessions:
+        sessions = getattr(adapter, "sessions", []) or []
+        if not sessions:
+            print("\nThis file holds one recording session.\n")
+            return
+        current = getattr(adapter, "session_index", 0)
+        print(f"\n{len(sessions)} recording sessions:\n")
+        for s in sessions:
+            mark = "→" if s["index"] == current else " "
+            print(f"  {mark} --session {s['index'] + 1}   "
+                  f"{(s['start_time'] or '')[:16].replace('T', ' ')} → "
+                  f"{(s['end_time'] or '')[:16].replace('T', ' ')}   "
+                  f"{s['hours']:.1f} h, {s['intervals']} intervals")
+        print("\n(→ marks the one analysed by default: the longest.)\n")
+        return
 
     # ── List-channels debug mode ──────────────────────────────────────────────
     if args.list_channels:

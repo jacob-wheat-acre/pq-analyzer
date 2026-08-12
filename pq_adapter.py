@@ -635,16 +635,41 @@ class ProntoAdapter:
     # per file at load time: _scan_entry_table locates the table by pattern,
     # and _identify_adaptive_channels assigns names by signature.
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, session: Optional[int] = None):
         self.filepath = Path(filepath)
         self._raw_channels: List[RawChannelInfo] = []
         self._obs_ts: Optional[np.ndarray] = None
         self._obs_data: Dict[int, np.ndarray] = {}
         self._adaptive_df: Optional[pd.DataFrame] = None
         self._waveforms: List[dict] = []
+        #: Every recording session the file holds, in time order. A "download
+        #: all data" export carries more than one when the meter was reset or
+        #: re-armed in the field; only one is analysed per run.
+        self.sessions: List[dict] = []
+        #: Which of them this run read (index into ``sessions``).
+        self.session_index: int = 0
+        self._session_request = session
         self._load()
 
     # ── Public interface (same contract as PQDIFAdapter) ──────────────────────
+
+    @classmethod
+    def scan_sessions(cls, filepath) -> List[dict]:
+        """List the recording sessions in a file without decoding its values.
+
+        Only each observation's TIME series is read, which is what tells the
+        sessions apart, so a picker can be filled in from a large file without
+        paying for the analysis run.
+        """
+        self = cls.__new__(cls)
+        self.filepath = Path(filepath)
+        self._session_request = None
+        self._spec = pqdif.PQDIFFile(self.filepath)
+        interval_obs, _adaptive, _waveforms = self._classify_observations()
+        if not interval_obs:
+            return []
+        groups = self._group_sessions(interval_obs)
+        return [self._describe_session(g, i) for i, g in enumerate(groups)]
 
     def list_channels(self) -> List[RawChannelInfo]:
         return self._raw_channels
@@ -1122,19 +1147,109 @@ class ProntoAdapter:
         base = np.datetime64(start.replace(tzinfo=None), 'ns')
         return base + (seconds * 1e9).astype('int64').view('timedelta64[ns]')
 
-    def _load_spec_interval(self, interval_obs: List) -> None:
-        """Build the interval channel set from every uniform-grid observation.
+    def _group_sessions(self, interval_obs: List) -> List[List]:
+        """Split interval observations into recording sessions.
 
-        Pronto splits interval data across two records that share one time
-        base: 'Interval (avg)' holds the derived quantities (THD, harmonics,
-        power, flicker) and 'Interval (max-min)' holds the true RMS voltages
-        and currents with their per-interval MAX and MIN.  Both are needed, so
-        channels are pooled across them.
+        Two things put more than one uniform-grid observation in a file, and
+        they need opposite handling. Pronto writes each session as a pair --
+        'Interval (avg)' and 'Interval (max-min)' -- which share one time base
+        and have to be pooled into one set of channels. A "download all data"
+        export additionally carries every session the meter still held, and
+        those must not be pooled: they are separate recordings, often days
+        apart, and clause 6 of IEEE 1159.3-2019 describes exactly this
+        chunking of a log into observation records.
+
+        The time base tells them apart without reading any label: records of
+        one session carry the same sample count and the same first and last
+        time, records of different sessions do not.
         """
-        # The largest observation defines the grid; any observation whose grid
-        # matches contributes channels to the same pool.
-        interval_obs = sorted(interval_obs, key=lambda o: -len(o.channels))
-        primary = interval_obs[0]
+        groups: List[List] = []
+        for obs in sorted(interval_obs, key=lambda o: -len(o.channels)):
+            t = obs.channels[0].time
+            for group in groups:
+                ref = group[0].channels[0].time
+                if (len(t) == len(ref) and t[0] == ref[0] and t[-1] == ref[-1]
+                        and obs.start_time == group[0].start_time):
+                    group.append(obs)
+                    break
+            else:
+                groups.append([obs])
+        # Time order, so "session 1" is the earliest recording rather than
+        # whichever record happened to carry the most channels.
+        groups.sort(key=lambda g: (g[0].start_time is None, g[0].start_time))
+        return groups
+
+    def _describe_session(self, group: List, index: int) -> dict:
+        """What a reader needs to tell one session from another."""
+        primary = max(group, key=lambda o: len(o.channels))
+        t = primary.channels[0].time
+        stride = self._step_pair_stride(t)
+        times = self._spec_times(primary, t[0::stride],
+                                 primary.channels[0].time_units_id)
+        start = pd.Timestamp(times[0]) if len(times) else None
+        end = pd.Timestamp(times[-1]) if len(times) else None
+        hours = ((end - start).total_seconds() / 3600
+                 if start is not None and end is not None else 0.0)
+        return {
+            "index":      index,
+            "start_time": start.isoformat() if start is not None else None,
+            "end_time":   end.isoformat() if end is not None else None,
+            "intervals":  len(times),
+            "hours":      round(hours, 2),
+            "channels":   sum(len(o.channels) for o in group),
+            "records":    [o.name for o in group],
+        }
+
+    def _load_spec_interval(self, interval_obs: List) -> None:
+        """Build the interval channel set from one recording session.
+
+        Pronto splits a session's interval data across two records that share
+        one time base: 'Interval (avg)' holds the derived quantities (THD,
+        harmonics, power, flicker) and 'Interval (max-min)' holds the true RMS
+        voltages and currents with their per-interval MAX and MIN. Both are
+        needed, so channels are pooled across them.
+
+        A file may hold several sessions. Analysing one is deliberate -- the
+        gap between two sessions is not recorded time, so pooling them would
+        make every "% of the recording" figure, the rolling demand window and
+        the event detector read across a hole as though it were data. Which
+        session was read, and which were not, is carried out to both documents
+        rather than left in the log.
+        """
+        groups = self._group_sessions(interval_obs)
+        self.sessions = [self._describe_session(g, i)
+                         for i, g in enumerate(groups)]
+
+        # Default to the longest session -- the one most likely to be the
+        # deployment of interest, and the one the report can say most about.
+        default = max(range(len(groups)),
+                      key=lambda i: (self.sessions[i]["intervals"],
+                                     self.sessions[i]["channels"]))
+        wanted = self._session_request
+        if wanted is None:
+            self.session_index = default
+        elif 0 <= wanted < len(groups):
+            self.session_index = wanted
+        else:
+            raise ValueError(
+                f"{self.filepath.name}: session {wanted + 1} was requested but "
+                f"the file holds {len(groups)} "
+                f"session{'s' if len(groups) != 1 else ''}."
+            )
+
+        if len(groups) > 1:
+            log.warning(
+                "ProntoAdapter (spec): %s holds %d recording sessions; "
+                "analysing session %d of %d (%s, %.1f h). The others are "
+                "listed in the report and can be analysed by re-running "
+                "against them.",
+                self.filepath.name, len(groups), self.session_index + 1,
+                len(groups), self.sessions[self.session_index]["start_time"],
+                self.sessions[self.session_index]["hours"],
+            )
+
+        session = groups[self.session_index]
+        primary = max(session, key=lambda o: len(o.channels))
         reference = primary.channels[0].time
         stride = self._step_pair_stride(reference)
 
@@ -1144,7 +1259,7 @@ class ProntoAdapter:
         n = len(obs_times)
 
         pooled: List = []
-        for obs in interval_obs:
+        for obs in session:
             t = obs.channels[0].time
             if len(t) != len(reference) or t[0] != reference[0] or t[-1] != reference[-1]:
                 log.warning(
@@ -1158,7 +1273,7 @@ class ProntoAdapter:
         log.info(
             "ProntoAdapter (spec): %d interval channels pooled from %d "
             "observation(s), %d intervals%s",
-            len(pooled), len(interval_obs), n,
+            len(pooled), len(session), n,
             " (step-paired encoding)" if stride == 2 else "",
         )
 
@@ -2779,6 +2894,11 @@ def extract_dataset(
         "end_time":         df.index[-1].isoformat() if len(df) else None,
         "channel_map":      df.attrs.get("channel_map", {}),
         "device_channels":  df.attrs.get("device_channel_count", 0),
+        # A file can hold more than one recording session; this run read one of
+        # them. Both documents say so, because a report that silently covers
+        # half a download is a report nobody can check.
+        "sessions":         list(getattr(adapter, "sessions", []) or []),
+        "session_index":    getattr(adapter, "session_index", 0),
     }
 
     ds = PQDataset(df=df, adaptive_df=adaptive_df, meta=meta,

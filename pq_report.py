@@ -295,6 +295,8 @@ def generate_report(
             "data_quality":     ds.meta.get("data_quality", {}),
             "channel_map":      ds.meta.get("channel_map", {}),
             "device_channels":  ds.meta.get("device_channels", 0),
+            "sessions":         ds.meta.get("sessions", []),
+            "session_index":    ds.meta.get("session_index", 0),
             "has_maxmin":       ds.has_maxmin,
             "has_adaptive":     ds.has_adaptive,
             "catalog":          ds.catalog(),
@@ -427,6 +429,21 @@ def print_report(report: dict) -> None:
                       "customers on this transformer add to that.")
         else:
             print("  (Pass --transformer-kva to check transformer loading)")
+
+    # ── Sessions ──────────────────────────────────────────────────────────────
+    _sessions = report["file_summary"].get("sessions") or []
+    if len(_sessions) > 1:
+        _current = report["file_summary"].get("session_index", 0)
+        print(f"\n{sep}")
+        print(f"  ⚠  {len(_sessions)} RECORDING SESSIONS IN THIS FILE — "
+              f"SESSION {_current + 1} ANALYSED")
+        for s in _sessions:
+            mark = "→" if s["index"] == _current else " "
+            print(f"  {mark} Session {s['index'] + 1}: "
+                  f"{(s['start_time'] or '')[:16].replace('T', ' ')} → "
+                  f"{(s['end_time'] or '')[:16].replace('T', ' ')}  "
+                  f"({s['hours']:.1f} h, {s['intervals']} intervals)")
+        print("  Re-run with --session to analyse another one.")
 
     # ── File integrity ────────────────────────────────────────────────────────
     dq = (report["file_summary"].get("data_quality") or {})
@@ -921,6 +938,42 @@ def _body(doc, text: str) -> None:
     # Size comes from the Normal style, so body prose stays one size even if the
     # house size changes; only measured values pick up their own run.
     _emit_text(doc.add_paragraph(), text, size_pt=None)
+
+
+def _session_note(fs: dict, *, plain: bool = False) -> str:
+    """What the file held, when it held more than this report covers.
+
+    A "download all data" export carries every session the meter still had --
+    a reset or a re-arm in the field starts a new one -- and only one is
+    analysed, because the gap between two sessions is not recorded time.
+    Saying which one, and what else was in the file, is the difference between
+    a report a reviewer can check and a report that quietly covers half a
+    download. Empty string when the file holds a single session, which is the
+    ordinary case and needs no explanation.
+    """
+    sessions = fs.get("sessions") or []
+    if len(sessions) < 2:
+        return ""
+    current = fs.get("session_index", 0)
+    others = []
+    for s in sessions:
+        if s["index"] == current:
+            continue
+        start = (s["start_time"] or "")[:16].replace("T", " ")
+        hours = f"{s['hours']:.0f}" if plain else _m(s["hours"], ".0f")
+        others.append(f"{start} ({hours} hours)")
+    listed = "; ".join(others)
+    n = len(sessions)
+    return (
+        f"This file holds {n if plain else _m(n, 'd')} separate recording "
+        f"sessions. A meter that is reset or re-armed in the field starts a "
+        f"new one, and a download of everything on the meter carries them all. "
+        f"This report covers session {current + 1} of {n} only. Also in the "
+        f"file: {listed}. Analysing one session at a time is deliberate: the "
+        f"time between two sessions was not recorded, so a figure quoted as a "
+        f"share of the recording would be wrong if they were run together. "
+        f"Re-run against the other session to have it assessed."
+    )
 
 
 def _plot_path(outdir: Optional[Path], stem: str, name: str) -> Optional[Path]:
@@ -2272,6 +2325,13 @@ def _word_recording_overview(doc, report, outdir=None, stem="") -> None:
            "the header table above."
            if (dq.get("missing_bytes") or dq.get("unreadable_observations"))
            else ""))
+    note = _session_note(fs)
+    if note:
+        # Immediately under the period this report covers, where a reader
+        # checking the dates is already looking.
+        p = doc.add_paragraph()
+        _bold(p, "More than one session in this file: ")
+        _normal(p, note)
     _embed_plot(doc, outdir, stem, "overview.png",
                 caption="Measured voltage and current over the recording period.")
     doc.add_paragraph()
@@ -5235,6 +5295,23 @@ def generate_customer_letter(
             "below can be read against the conditions they came from.")
         _embed_plot(doc, outdir, stem, "overview.png",
                     caption="Voltage and current recorded at your service.")
+        doc.add_paragraph()
+
+    # The customer is told the dates on the first page; if the meter recorded
+    # more than one stretch, they are entitled to know this letter covers one
+    # of them. Said without the file-format reasoning, which is ours to carry.
+    sessions = fs.get("sessions") or []
+    if len(sessions) > 1:
+        current = fs.get("session_index", 0)
+        other_periods = "; ".join(
+            (s["start_time"] or "")[:10] + f" ({_m(s['hours'], '.0f')} hours)"
+            for s in sessions if s["index"] != current)
+        _body(doc,
+            "The meter recorded in more than one stretch at this service — it "
+            "was stopped and started again while it was installed. This letter "
+            f"covers the period named above. The other recording{'s' if len(sessions) > 2 else ''} "
+            f"{'were' if len(sessions) > 2 else 'was'} made on {other_periods}, "
+            "and can be reviewed as well if you would like us to.")
         doc.add_paragraph()
 
     # ── What we found ─────────────────────────────────────────────────────

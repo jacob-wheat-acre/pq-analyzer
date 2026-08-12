@@ -289,11 +289,13 @@ def _data_source(name: str, channels: list[Channel]) -> bytes:
 
 
 def _observation(name: str, channels: list[Channel],
-                 definition_indices: list[int]) -> bytes:
+                 definition_indices: list[int],
+                 start_time: datetime = None) -> bytes:
+    start_time = start_time or START_TIME
     root = Collection()
     root.add(pqdif.TAG_OBSERVATION_NAME, Vector(10, name))
-    root.add(pqdif.TAG_TIME_CREATE, Scalar(50, START_TIME))
-    root.add(pqdif.TAG_TIME_START, Scalar(50, START_TIME))
+    root.add(pqdif.TAG_TIME_CREATE, Scalar(50, start_time))
+    root.add(pqdif.TAG_TIME_START, Scalar(50, start_time))
     root.add(pqdif._u('3d786f8d-f76e-11cf-9d89-0080c72e70a3'),   # tagTriggerMethodID
              Scalar(32, 1))
 
@@ -313,16 +315,23 @@ def _observation(name: str, channels: list[Channel],
     return serialize_body(root)
 
 
-def build_file(site: str, observations: list[tuple[str, list[Channel]]]) -> bytes:
+def build_file(site: str, observations) -> bytes:
     """Assemble container + data source + observations into one PQDIF file.
 
     Channel definitions are pooled across observations, and each channel
     instance references its definition by index, which is the definition/
     instance split described in clause 5.4.
+
+    Each observation is ``(name, channels)`` or ``(name, channels, start_time)``.
+    Giving a start time is how a file comes to hold more than one recording
+    session -- a meter reset in the field, downloaded as "all data" -- which
+    clause 6 describes as chunking a log into observation records.
     """
+    observations = [obs if len(obs) == 3 else (*obs, None)
+                    for obs in observations]
     all_channels: list[Channel] = []
     indices: list[list[int]] = []
-    for _name, channels in observations:
+    for _name, channels, _start in observations:
         obs_indices = []
         for channel in channels:
             obs_indices.append(len(all_channels))
@@ -333,9 +342,9 @@ def build_file(site: str, observations: list[tuple[str, list[Channel]]]) -> byte
         (pqdif.TAG_CONTAINER, _container(f'{site}.pqd'), False),
         (pqdif.TAG_DATA_SOURCE, _data_source(site, all_channels), True),
     ]
-    for (name, channels), obs_indices in zip(observations, indices):
+    for (name, channels, start), obs_indices in zip(observations, indices):
         bodies.append((pqdif.TAG_OBSERVATION,
-                       _observation(name, channels, obs_indices), True))
+                       _observation(name, channels, obs_indices, start), True))
 
     # Two passes: the header of each record holds the absolute offset of the
     # next one, so the compressed sizes must be known before any link is set.
@@ -1011,6 +1020,45 @@ SCENARIOS = [
 ]
 
 
+#: The second session's start, three days after the first: long enough that
+#: nothing could mistake the two for one recording with a gap in it.
+SECOND_SESSION_START = datetime(2025, 6, 28, 0, 0, 0)
+
+
+def _write_two_session_file(out_dir: Path) -> None:
+    """A file holding two recording sessions, as "download all data" gives.
+
+    A meter reset or re-armed in the field starts a new session, and a download
+    of everything on the meter carries every session it still holds. The reader
+    analyses one of them, so there has to be a fixture where choosing the wrong
+    one is visible: the sessions here differ in length (24 h against 12 h) and
+    start three days apart.
+    """
+    labels, arrays = make_residential()
+    first_avg, first_maxmin = scenario_channels(labels, arrays, T_SEC, INTERVAL_SEC)
+
+    half = N_SAMPLES // 2
+    short_arrays = [np.asarray(a, dtype=float)[:half] for a in arrays]
+    short_t = T_SEC[:half]
+    second_avg, second_maxmin = scenario_channels(
+        labels, short_arrays, short_t, INTERVAL_SEC)
+
+    site = "test_two_sessions"
+    pqd_bytes = build_file(site, [
+        (f"{site} (general) - Interval (avg)", first_avg, START_TIME),
+        (f"{site} (general) - Interval (max-min)", first_maxmin, START_TIME),
+        (f"{site} (general) - Interval (avg)", second_avg, SECOND_SESSION_START),
+        (f"{site} (general) - Interval (max-min)", second_maxmin,
+         SECOND_SESSION_START),
+    ])
+    path = out_dir / f"{site}.pqd"
+    path.write_bytes(pqd_bytes)
+    parsed = pqdif.PQDIFFile(path)
+    print(f"  wrote {path}  ({len(pqd_bytes):,} bytes, "
+          f"{parsed.observation_count} observations in 2 sessions: "
+          f"{N_SAMPLES} and {half} intervals)")
+
+
 def main():
     out_dir = Path(__file__).parent / "test_data"
     out_dir.mkdir(exist_ok=True)
@@ -1038,6 +1086,8 @@ def main():
         print(f"  wrote {path}  ({len(pqd_bytes):,} bytes, "
               f"{len(parsed.definitions)} channel definitions, "
               f"{len(avg)} avg + {len(maxmin)} max-min channels)")
+
+    _write_two_session_file(out_dir)
 
     print(f"\nSample CLI commands (run from repo root):\n")
     print("  python pq_analyzer.py test_data/test_residential.pqd \\")

@@ -270,16 +270,40 @@ class PQApp(tk.Tk):
             self._build_import_error_banner()
 
         # ── File row ──────────────────────────────────────────────────────────
-        file_frame = tk.Frame(self, bg=_BG)
+        file_frame = self._file_frame = tk.Frame(self, bg=_BG)
         file_frame.pack(fill="x", **pad)
 
         tk.Label(file_frame, text="PQD File", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
         self._file_var = tk.StringVar()
+        # A path is as often pasted in as browsed to, and the session picker
+        # has to appear either way. Debounced, so typing does not scan once
+        # per keystroke.
+        self._file_var.trace_add("write", self._on_file_changed)
+        self._scan_after_id = None
         tk.Entry(file_frame, textvariable=self._file_var, font=_FONT_UI,
                  width=40).pack(side="left", padx=(0, 6), fill="x", expand=True)
         tk.Button(file_frame, text="Browse…", command=self._browse,
                   font=_FONT_UI).pack(side="left")
+
+        # ── Session row ───────────────────────────────────────────────────────
+        # A "download all data" export holds every session the meter still had.
+        # Only one is analysed per run, so which one has to be the engineer's
+        # choice rather than ours; the row stays hidden for the ordinary
+        # single-session file so it is not one more thing to read past.
+        self._session_frame = tk.Frame(self, bg=_BG)
+        tk.Label(self._session_frame, text="Session", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+        self._session_var = tk.StringVar()
+        self._session_combo = ttk.Combobox(
+            self._session_frame, textvariable=self._session_var,
+            values=[], width=48, font=_FONT_UI, state="readonly",
+        )
+        self._session_combo.pack(side="left")
+        self._session_note = tk.Label(
+            self._session_frame, text="", bg=_BG, fg="#c08a3e", font=_FONT_UI_S)
+        self._session_note.pack(side="left", padx=(6, 0))
+        self._sessions: list = []
 
         # ── Customer name row ─────────────────────────────────────────────────
         site_frame = tk.Frame(self, bg=_BG)
@@ -796,6 +820,75 @@ class PQApp(tk.Tk):
             self._file_var.set(path)
             self._address_var.set(Path(path).stem)
 
+    def _on_file_changed(self, *_args):
+        """Re-scan for sessions a moment after the path stops changing."""
+        if self._scan_after_id is not None:
+            try:
+                self.after_cancel(self._scan_after_id)
+            except Exception:
+                pass
+        self._scan_after_id = self.after(400, self._scan_current_file)
+
+    def _scan_current_file(self):
+        self._scan_after_id = None
+        path = self._file_var.get().strip().strip('"')
+        if path.lower().endswith(".pqd") and Path(path).exists():
+            self._scan_sessions(path)
+        else:
+            self._show_sessions([])
+
+    def _scan_sessions(self, path):
+        """Fill the session picker for the chosen file, off the UI thread.
+
+        Reading only the time series is fast, but a file on a OneDrive folder
+        may still have to come down from the network first, so this never runs
+        inline: a picker that freezes the window is worse than no picker.
+        """
+        def work():
+            try:
+                sessions = ProntoAdapter.scan_sessions(Path(path))
+            except Exception as exc:
+                # The run itself will report a file it cannot read, with the
+                # full traceback. Here it only means no picker.
+                sessions = []
+                _logging.getLogger(__name__).debug(
+                    "session scan failed for %s: %s", path, exc)
+            self.after(0, lambda: self._show_sessions(sessions))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_sessions(self, sessions):
+        """Show the picker only when there is a choice to make."""
+        self._sessions = sessions
+        if len(sessions) < 2:
+            self._session_frame.pack_forget()
+            self._session_var.set("")
+            return
+
+        labels = []
+        longest = max(sessions, key=lambda s: s["intervals"])
+        for s in sessions:
+            start = (s["start_time"] or "")[:16].replace("T", " ")
+            end = (s["end_time"] or "")[11:16]
+            labels.append(f"{s['index'] + 1}:  {start} → {end}   "
+                          f"({s['hours']:.1f} h, {s['intervals']} intervals)"
+                          + ("   — longest" if s is longest else ""))
+        self._session_combo.config(values=labels)
+        self._session_var.set(labels[longest["index"]])
+        self._session_note.config(
+            text=f"{len(sessions)} sessions in this file — one is analysed")
+        self._session_frame.pack(fill="x", padx=12, pady=6,
+                                 after=self._file_frame)
+
+    def _selected_session(self):
+        """Zero-based index of the chosen session, or None for a plain file."""
+        if len(self._sessions) < 2:
+            return None
+        try:
+            return int(self._session_var.get().split(":", 1)[0]) - 1
+        except (ValueError, AttributeError):
+            return None
+
     def _build_import_error_banner(self):
         """Red banner shown when pq_analyzer failed to import.
 
@@ -945,6 +1038,7 @@ class PQApp(tk.Tk):
 
         params = {
             "filepath":       filepath,
+            "session":        self._selected_session(),
             "nominal":        nominal,
             "cclass_key":     _SCHEDULE_KEY.get(self._cclass_var.get(), "sg"),
             "site":           self._site_var.get().strip(),
@@ -1042,7 +1136,7 @@ class PQApp(tk.Tk):
         # ── Adapter ───────────────────────────────────────────────────────────
         fp = Path(filepath)
         if fp.suffix.lower() == ".pqd":
-            adapter = ProntoAdapter(fp)
+            adapter = ProntoAdapter(fp, session=params.get("session"))
         elif _PQDIF_AVAILABLE:
             adapter = PQDIFAdapter(fp)
         else:

@@ -1476,13 +1476,36 @@ class TestFixturesAreCompliant:
                 assert series.characteristic in pqdif.CHARACTERISTIC_NAMES.values()
                 assert series.value_type in pqdif.VALUE_TYPE_NAMES.values()
 
-    def test_interval_records_share_one_time_base(self, path):
+    @staticmethod
+    def _analysed_observations(path):
+        """The observations of the session the adapter reads by default.
+
+        Most fixtures hold one session, where this is every observation. The
+        two-session fixture holds two, and a test that pooled both would be
+        asserting against data the run never saw.
+        """
         f = pqdif.PQDIFFile(path)
-        grids = {
-            len(obs.channels[0].time)
-            for obs in f.observations if obs.channels
-        }
-        assert len(grids) == 1, f"observations disagree on sample count: {grids}"
+        obs = [o for o in f.observations if o.channels]
+        by_session = {}
+        for o in obs:
+            key = (o.start_time, len(o.channels[0].time))
+            by_session.setdefault(key, []).append(o)
+        # The default is the longest session; ties go to the earliest.
+        best = max(by_session, key=lambda k: (k[1], -(k[0].timestamp() if k[0] else 0)))
+        return by_session[best]
+
+    def test_records_of_one_session_share_one_time_base(self, path):
+        # Within a session, 'Interval (avg)' and 'Interval (max-min)' are
+        # pooled, which is only sound when they sit on the same grid.
+        f = pqdif.PQDIFFile(path)
+        by_start = {}
+        for obs in f.observations:
+            if obs.channels:
+                by_start.setdefault(obs.start_time, set()).add(
+                    len(obs.channels[0].time))
+        for start, grids in by_start.items():
+            assert len(grids) == 1, (
+                f"observations starting {start} disagree on sample count: {grids}")
 
     def test_step_pair_encoding_is_detected(self, path):
         f = pqdif.PQDIFFile(path)
@@ -1496,8 +1519,9 @@ class TestFixturesAreCompliant:
         # The regression this guards: 'Harm 1 of Van' (SPECTRA_HGROUP) is the
         # fundamental and is smaller than the true RMS by sqrt(1 + THD^2). The
         # mapped voltage_a column must be the RMS channel, not the fundamental.
-        f = pqdif.PQDIFFile(path)
-        by_name = {c.name: c for obs in f.observations for c in obs.channels}
+        by_name = {c.name: c
+                   for obs in self._analysed_observations(path)
+                   for c in obs.channels}
         rms_channel = by_name["RMS Van (V1)"]
         fundamental_channel = by_name["Harm 1 of Van"]
         assert rms_channel.characteristic == "RMS"
@@ -2553,6 +2577,152 @@ class TestBothDocumentsOpen:
         assert app.errors and "customer document" in app.errors[0]
         # The one that did get written still opens.
         assert app._open_btn.state == "normal"
+
+
+_TWO_SESSION = Path(__file__).parent / "test_data" / "test_two_sessions.pqd"
+
+
+@pytest.mark.skipif(not _TWO_SESSION.exists(),
+                    reason="test_data/test_two_sessions.pqd not generated")
+class TestAFileHoldingSeveralSessions:
+    """A "download all data" export carries every session on the meter.
+
+    A meter reset or re-armed in the field starts a new one, and IEEE 1159.3
+    clause 6 describes exactly this: one log chunked into several observation
+    records. The reader used to pool observations by time base and skip
+    whatever did not match, so the second session was dropped with only a log
+    line to say so -- the report then claimed a 24-hour recording while half
+    the download went unread.
+    """
+
+    def _report(self, session=None):
+        import pq_analysis as An
+        from pq_report import generate_report
+        ds = extract_dataset(ProntoAdapter(_TWO_SESSION, session=session),
+                             ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        df = ds.df
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), An.detect_events(ds, th), th,
+            neutral_health_result=An.check_neutral_health(ds, th))
+        return ds, th, rep
+
+    def test_both_sessions_are_found(self):
+        sessions = ProntoAdapter.scan_sessions(_TWO_SESSION)
+        assert len(sessions) == 2
+        assert sessions[0]["start_time"] < sessions[1]["start_time"]
+        assert sessions[0]["intervals"] == 2 * sessions[1]["intervals"]
+        # Scanning must not need the values, only the time series.
+        assert all(s["channels"] for s in sessions)
+
+    def test_the_longest_session_is_analysed_by_default(self):
+        ds, _th, rep = self._report()
+        fs = rep["file_summary"]
+        assert fs["session_index"] == 0
+        assert len(fs["sessions"]) == 2
+        assert fs["duration_hours"] == pytest.approx(23.9, abs=0.2)
+
+    def test_the_other_session_can_be_analysed(self):
+        ds, _th, rep = self._report(session=1)
+        fs = rep["file_summary"]
+        assert fs["session_index"] == 1
+        assert fs["duration_hours"] == pytest.approx(11.9, abs=0.2)
+        # And it is a different recording, not a slice of the first.
+        assert fs["start_time"] > self._report()[2]["file_summary"]["end_time"]
+
+    def test_a_session_that_is_not_there_is_refused(self):
+        with pytest.raises(ValueError, match="holds 2 session"):
+            ProntoAdapter(_TWO_SESSION, session=7)
+
+    def test_no_session_is_silently_pooled_into_another(self):
+        # The bug this replaces: 144 intervals appended to 288, or dropped.
+        ds, _th, _rep = self._report()
+        assert len(ds.df) == 288
+        span = (ds.df.index[-1] - ds.df.index[0]).total_seconds() / 3600
+        assert span < 24, "the three-day gap was read as recorded time"
+
+    def test_the_engineering_report_says_which_session_it_covers(self, tmp_path):
+        import docx
+        from pq_plots import plot_overview
+        from pq_report import generate_word_report
+        ds, th, rep = self._report()
+        rep["root_causes"] = []
+        plot_overview(ds, th, outdir=tmp_path, stem="two")
+        doc = docx.Document(str(generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", engineer_contact="", outdir=tmp_path, stem="two")))
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "More than one session in this file" in text
+        assert "session 1 of 2" in text
+        assert "2025-06-28" in text, "the unread session's date is not stated"
+
+    def test_the_customer_letter_says_it_too(self, tmp_path):
+        import docx
+        from pq_plots import plot_overview
+        from pq_report import generate_customer_letter
+        ds, th, rep = self._report()
+        rep["root_causes"] = []
+        plot_overview(ds, th, outdir=tmp_path, stem="two")
+        doc = docx.Document(str(generate_customer_letter(
+            rep, th, "1 Test St", "Eng", tmp_path, "two")))
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "recorded in more than one stretch" in text
+        assert "2025-06-28" in text
+        # Said plainly: the customer is not told about observation records.
+        for jargon in ("session", "PQDIF", "observation"):
+            assert jargon not in text.lower()
+
+    def test_the_picker_appears_only_when_there_is_a_choice(self, gui_app):
+        # The scan itself runs on a worker thread; the display is called back
+        # on the UI thread, which is what this exercises.
+        import run
+        sessions = run.ProntoAdapter.scan_sessions(_TWO_SESSION)
+        gui_app._show_sessions(sessions)
+        gui_app.update_idletasks()
+        assert gui_app._session_frame.winfo_ismapped()
+        labels = gui_app._session_combo.cget("values")
+        assert len(labels) == 2
+        # Defaults to the longest, and hands the analysis a zero-based index.
+        assert "longest" in gui_app._session_var.get()
+        assert gui_app._selected_session() == 0
+        gui_app._session_var.set(labels[1])
+        assert gui_app._selected_session() == 1
+
+        gui_app._show_sessions([])
+        gui_app.update_idletasks()
+        assert not gui_app._session_frame.winfo_ismapped()
+        assert gui_app._selected_session() is None
+
+    def test_a_single_session_file_says_nothing_about_sessions(self, tmp_path):
+        import docx
+        import pq_analysis as An
+        from pq_plots import plot_overview
+        from pq_report import generate_report, generate_word_report
+        ds = extract_dataset(
+            ProntoAdapter(Path("test_data/test_residential.pqd")), ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        df = ds.df
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), An.detect_events(ds, th), th)
+        rep["root_causes"] = []
+        plot_overview(ds, th, outdir=tmp_path, stem="one")
+        doc = docx.Document(str(generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", engineer_contact="", outdir=tmp_path, stem="one")))
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "More than one session" not in text
 
 
 class TestABrokenInstallSaysWhatBroke:
