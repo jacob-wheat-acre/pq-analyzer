@@ -4079,6 +4079,48 @@ class TestMeasuredValuesAreMarkedInProse:
         assert "".join(r.text for r in runs) == (
             "The measured 0.0226 Ω sits inside the expected 0.0249 Ω.")
 
+    def _compliance_measured_column(self, tmp_path):
+        """Every Measured cell in the compliance table, as (bold, plain)."""
+        import docx
+        for path in _sample_documents(tmp_path):
+            if "internal" not in path.name:
+                continue
+            doc = docx.Document(str(path))
+            tbl = next((t for t in doc.tables
+                        if t.rows[0].cells[0].text.strip() == "Standard"), None)
+            if tbl is None:
+                continue
+            for row in tbl.rows[1:]:
+                # Group headings merge across the row; skip them.
+                if row.cells[0]._tc is row.cells[1]._tc:
+                    continue
+                runs = [r for p in row.cells[1].paragraphs for r in p.runs]
+                if not runs:
+                    continue
+                yield ("".join(r.text for r in runs if r.bold),
+                       "".join(r.text for r in runs if not r.bold))
+
+    def test_the_measured_column_bolds_readings_and_not_limits(self, tmp_path):
+        # The whole point of the column: "P95 6.80% (limit 8.00%)" puts a
+        # reading and the standard it is judged against in one cell, and only
+        # the first came off the meter.
+        pytest.importorskip("docx")
+        checked = 0
+        for bold, plain in self._compliance_measured_column(tmp_path):
+            # A limit is never a reading, wherever it appears.
+            for word in ("limit", "Allowed", "allowed", "nameplate"):
+                if word in bold:
+                    pytest.fail(f"a limit was bolded as measured: {bold!r}")
+            checked += 1
+        assert checked, "the compliance table produced no Measured cells"
+
+    def test_at_least_one_reading_is_bolded(self, tmp_path):
+        # Guards the opposite failure: a table where nothing is marked passes
+        # the test above trivially.
+        pytest.importorskip("docx")
+        assert any(bold.strip() for bold, _plain
+                   in self._compliance_measured_column(tmp_path))
+
     def test_the_markers_never_reach_the_page(self, tmp_path):
         # The sentinels are private-use characters; if a prose path ever
         # bypasses the splitter they would print as boxes in a customer's copy.

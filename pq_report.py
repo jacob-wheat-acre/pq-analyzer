@@ -1294,7 +1294,10 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         row   = tbl.add_row()
         cells = row.cells
         cells[0].paragraphs[0].add_run(standard).font.size = Pt(10)
-        cells[1].paragraphs[0].add_run(measured).font.size = Pt(10)
+        # The Measured column is the case the marking exists for: one cell puts
+        # a reading and the limit it is judged against in the same breath --
+        # "P95 6.80% (limit 8.00%)" -- and only the first came off the meter.
+        _emit_text(cells[1].paragraphs[0], measured, size_pt=10)
 
         # Compliance column — the standard's own binary verdict, unshaded so it
         # reads as a fact rather than an alarm.
@@ -1341,7 +1344,9 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     # the transformer was inside its nameplate, which one meter cannot show.
     if "transformer" in dem:
         tx   = dem["transformer"]
-        meas = f"{tx['peak_8h_kva']:.0f} kVA 8-hr peak  /  {tx['nameplate_kva']:.0f} kVA nameplate  ({tx['pct_nameplate']:.0f}%)"
+        meas = (f"{_m(tx['peak_8h_kva'], '.0f', ' kVA')} 8-hr peak  /  "
+                f"{tx['nameplate_kva']:.0f} kVA nameplate  "
+                f"({_m(tx['pct_nameplate'], '.0f', '%')})")
         if tx["overloaded"] is None:
             add_row("This service's demand against transformer nameplate "
                     "(8-hr peak; shared transformer, total loading not measured)",
@@ -1357,11 +1362,14 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     # Power factor
     if pfr["available"]:
         if thresh.customer_class == "r":
-            meas = (f"Min {pfr['min_pf']:.3f}  /  Mean {pfr['mean_pf']:.3f}  "
+            meas = (f"Min {_m(pfr['min_pf'], '.3f')}  /  "
+                    f"Mean {_m(pfr['mean_pf'], '.3f')}  "
                     f"(residential — tariff PF clause not applicable)")
             add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas, None, group="power")
         else:
-            meas = f"Min {pfr['min_pf']:.3f}  /  Mean {pfr['mean_pf']:.3f}  (limit ≥ {pfr['limit']:.2f})"
+            meas = (f"Min {_m(pfr['min_pf'], '.3f')}  /  "
+                    f"Mean {_m(pfr['mean_pf'], '.3f')}  "
+                    f"(limit ≥ {pfr['limit']:.2f})")
             # Graded on the mean, not the minimum: the tariff clause is about
             # sustained operation, and a single low interval is not a billing
             # condition.  The minimum still shows in the Measured column.
@@ -1392,17 +1400,19 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             band_note = "All intervals in band"
         else:
             if worst_st["pct_under"] and worst_st["pct_over"]:
-                excursion = (f"{worst_st['pct_under']:.1f}% under / "
-                             f"{worst_st['pct_over']:.1f}% over")
+                excursion = (f"{_m(worst_st['pct_under'], '.1f', '%')} under / "
+                             f"{_m(worst_st['pct_over'], '.1f', '%')} over")
             elif worst_st["pct_under"]:
                 excursion = f"all below {rng[0]:.1f} V"
             else:
                 excursion = f"all above {rng[1]:.1f} V"
-            band_note = f"{worst_oob:.1f}% of intervals out of band, {excursion}"
+            band_note = (f"{_m(worst_oob, '.1f', '%')} of intervals out of "
+                         f"band, {excursion}")
 
         meas = (f"Worst phase {_phase_label(worst_col)}: "
-                f"{worst_st['min_v']:.1f}–{worst_st['max_v']:.1f} V "
-                f"(mean {worst_st['mean_v']:.1f})  |  {band_note}  |  "
+                f"{_m(worst_st['min_v'], '.1f')}–"
+                f"{_m(worst_st['max_v'], '.1f', ' V')} "
+                f"(mean {_m(worst_st['mean_v'], '.1f')})  |  {band_note}  |  "
                 f"Allowed {rng[0]:.1f}–{rng[1]:.1f} V{missing_note}")
         # Voltage severity is driven by how much of the recording sat out of
         # band; the excursion depth now shows in the Measured column.
@@ -1417,16 +1427,16 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         if itic["n_events"] == 0:
             it_meas = "No voltage sag/swell events detected"
         else:
-            it_meas = (f"{itic['n_events']} sag/swell event(s) evaluated; "
-                       f"{itic['n_violations']} outside the ITIC envelope")
+            it_meas = (f"{_m(itic['n_events'])} sag/swell event(s) evaluated; "
+                       f"{_m(itic['n_violations'])} outside the ITIC envelope")
             # A count of events says nothing about whether equipment would have
             # ridden them through.  Depth and duration are what the ITIC curve
             # is actually plotted against.
             w = itic.get("worst")
             if w:
-                it_meas += (f"  |  Worst: {w['value_v']:.1f} V "
-                            f"({w['pct_nominal']:.0f}% of nominal) for "
-                            f"{w['duration_ms']:.0f} ms")
+                it_meas += (f"  |  Worst: {_m(w['value_v'], '.1f', ' V')} "
+                            f"({_m(w['pct_nominal'], '.0f', '%')} of nominal) "
+                            f"for {_m(w['duration_ms'], '.0f', ' ms')}")
                 if w.get("phase"):
                     it_meas += f" on {_phase_label(w['phase'])}"
         add_row("Voltage sags/swells within ITIC voltage tolerance curve",
@@ -1440,10 +1450,10 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     if v_thd["available"]:
         # Lead with the percentile the standard actually judges on; the maximum
         # follows as context, flagged when it is a spike rather than a level.
-        meas = (f"P95 {v_thd.get('p95_thd_pct', v_thd['max_thd_pct']):.2f}%  "
+        meas = (f"P95 {_m(v_thd.get('p95_thd_pct', v_thd['max_thd_pct']), '.2f', '%')}  "
                 f"(limit {v_thd['limit_pct']:.1f}%)  /  "
-                f"Mean {v_thd['mean_thd_pct']:.2f}%  /  "
-                f"Max {v_thd['max_thd_pct']:.2f}%")
+                f"Mean {_m(v_thd['mean_thd_pct'], '.2f', '%')}  /  "
+                f"Max {_m(v_thd['max_thd_pct'], '.2f', '%')}")
         if v_thd.get("max_is_outlier"):
             meas += " (isolated spike)"
         add_row("Voltage THD < 8.0% (IEEE 519-2022 P95, secondary)", meas,
@@ -1462,7 +1472,9 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             cls = "  [most restrictive class assumed — conservative]"
         else:
             cls = ""
-        meas   = f"Max {c_thd['max_thd_pct']:.2f}%  /  Mean {c_thd['mean_thd_pct']:.2f}%  (limit {lim:.1f}%{cls})"
+        meas   = (f"Max {_m(c_thd['max_thd_pct'], '.2f', '%')}  /  "
+                  f"Mean {_m(c_thd['mean_thd_pct'], '.2f', '%')}  "
+                  f"(limit {lim:.1f}%{cls})")
         add_row(f"Current {metric} within IEEE 519-2022 Table 2", meas,
                 pf["thd_current"], sev.get("thd_current"), group="current")
     else:
@@ -1479,14 +1491,15 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         # Spell out IL the first time it appears -- "% of IL" is IEEE shorthand
         # for percent of maximum demand load current and is not self-evident to
         # everyone the report goes to.
-        il_note = (f", IL = {ih['il_amps']:.0f} A max demand current"
+        il_note = (f", IL = {_m(ih['il_amps'], '.0f', ' A')} max demand current"
                    if ih.get("il_amps") else " (IL = max demand current)")
         if mo and mpct is not None and mlim:
-            tight = (f"tightest: H{mo[0]} phase {mo[1].upper()} at {mpct:.2f}% of IL "
-                     f"vs {mlim:.1f}% limit ({mpct / mlim * 100:.0f}% of it)")
+            tight = (f"tightest: H{mo[0]} phase {mo[1].upper()} at "
+                     f"{_m(mpct, '.2f', '%')} of IL "
+                     f"vs {mlim:.1f}% limit ({_m(mpct / mlim * 100, '.0f', '%')} of it)")
         else:
             wo = ih.get("worst_order")
-            tight = (f"worst: H{wo[0]} at {ih['worst_pct_of_il']:.2f}% of IL"
+            tight = (f"worst: H{wo[0]} at {_m(ih['worst_pct_of_il'], '.2f', '%')} of IL"
                      if wo else "")
         head = ("All current harmonic orders within limits" if ih["overall_pass"]
                 else "One or more current harmonic orders exceed limit")
@@ -1507,7 +1520,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
                  if ivh["overall_pass"]
                  else "One or more voltage harmonic orders exceed 5% limit")
         meas = (f"{vhead}  (worst: H{vwo[0]} phase {vwo[1].upper()} at "
-                f"{ivh['worst_pct_nom']:.2f}% of nominal voltage)"
+                f"{_m(ivh['worst_pct_nom'], '.2f', '%')} of nominal voltage)"
                 if vwo else vhead)
         add_row("Individual voltage harmonics within IEEE 519-2022 Table 1 (5% of nominal)", meas,
                 pf.get("individual_voltage_harmonics"),
@@ -1518,7 +1531,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
 
     # Statistical compliance (IEEE 519-2022 Clause 5)
     if hs.get("available"):
-        period_note = f"{hs['period_days']:.1f}-day recording"
+        period_note = f"{_m(hs['period_days'], '.1f')}-day recording"
         if hs["overall_pass"]:
             hs_meas = f"P95 ≤ 1.0× and P99 ≤ 1.5× limits for all orders ({period_note})"
         else:
@@ -1530,8 +1543,8 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         if b:
             label = "TDD" if b["order"] == "thd" else f"H{b['order']}"
             hs_meas += (f"  |  Tightest: {label} phase {b['phase'].upper()} "
-                        f"P95 {b['p95']:.2f}% vs {b['limit']:.2f}% limit "
-                        f"({b['ratio'] * 100:.0f}% of it)")
+                        f"P95 {_m(b['p95'], '.2f', '%')} vs {b['limit']:.2f}% "
+                        f"limit ({_m(b['ratio'] * 100, '.0f', '%')} of it)")
         # Already a percentile test, so persistence is baked in; grade on the
         # verdict and note when the recording was too short to be a true week.
         add_row(
@@ -1550,7 +1563,9 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     # so the row must not claim NEMA MG1 on a single-phase service where that
     # definition does not apply.
     if imb["available"]:
-        meas = f"Max {imb['max_imbalance_pct']:.2f}%  /  Mean {imb['mean_imbalance_pct']:.2f}%  (limit {imb['limit_pct']:.1f}%)"
+        meas = (f"Max {_m(imb['max_imbalance_pct'], '.2f', '%')}  /  "
+                f"Mean {_m(imb['mean_imbalance_pct'], '.2f', '%')}  "
+                f"(limit {imb['limit_pct']:.1f}%)")
         if imb.get("metric") == "nema_mg1":
             imb_label = "Voltage imbalance < 3% (ANSI C84.1 / NEMA MG1)"
         else:
@@ -1572,12 +1587,15 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         ci_label = "Current imbalance < 10% (NEMA MG1)"
     if ci["available"] and ci.get("limit_pct") is None:
         add_row("Leg current difference (reported, no limit applies)",
-                f"Max {ci['max_imbalance_pct']:.2f}%  /  "
-                f"Mean {ci['mean_imbalance_pct']:.2f}%  |  measurement, not a "
-                f"violation — no limit is set for a two-leg service",
+                f"Max {_m(ci['max_imbalance_pct'], '.2f', '%')}  /  "
+                f"Mean {_m(ci['mean_imbalance_pct'], '.2f', '%')}  |  "
+                f"measurement, not a violation — no limit is set for a "
+                f"two-leg service",
                 None, group="current")
     elif ci["available"]:
-        meas = f"Max {ci['max_imbalance_pct']:.2f}%  /  Mean {ci['mean_imbalance_pct']:.2f}%  (limit {ci['limit_pct']:.1f}%)"
+        meas = (f"Max {_m(ci['max_imbalance_pct'], '.2f', '%')}  /  "
+                f"Mean {_m(ci['mean_imbalance_pct'], '.2f', '%')}  "
+                f"(limit {ci['limit_pct']:.1f}%)")
         add_row(ci_label, meas, pf["current_imbalance"],
                 sev.get("current_imbalance"), group="current")
     else:
@@ -1593,10 +1611,10 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         phases = ", ".join(fl.get("phases_read", []))
         worst = fl.get("worst_phase")
         measured = (
-            f"Pst max {pst_max:.2f} (limit {fl['pst_limit']:.2f})"
+            f"Pst max {_m(pst_max, '.2f')} (limit {fl['pst_limit']:.2f})"
             if pst_max is not None else "Pst n/a"
         ) + "  /  " + (
-            f"Plt max {plt_max:.2f} (limit {fl['plt_limit']:.2f})"
+            f"Plt max {_m(plt_max, '.2f')} (limit {fl['plt_limit']:.2f})"
             if plt_max is not None else "Plt n/a"
         ) + f"  — worst phase {worst} of {phases}"
         add_row(
@@ -1616,11 +1634,12 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     llv = report.get("voltage_ll_compliance") or {}
     if llv.get("available"):
         worst = max(llv["pairs"].values(), key=lambda p: p["pct_out_of_bounds"])
-        meas = (f"Range {min(p['min_v'] for p in llv['pairs'].values()):.1f}–"
-                f"{max(p['max_v'] for p in llv['pairs'].values()):.1f} V "
+        meas = (f"Range {_m(min(p['min_v'] for p in llv['pairs'].values()), '.1f')}–"
+                f"{_m(max(p['max_v'] for p in llv['pairs'].values()), '.1f', ' V')} "
                 f"(allowed {llv['range_v'][0]:.0f}–{llv['range_v'][1]:.0f} V)")
         if worst["pct_out_of_bounds"] > 0:
-            meas += f"  |  worst pair {worst['pct_out_of_bounds']:.2f}% out of range"
+            meas += (f"  |  worst pair "
+                     f"{_m(worst['pct_out_of_bounds'], '.2f', '%')} out of range")
         add_row(f"Line-to-line voltage within ANSI C84.1 Range A "
                 f"({llv['nominal_v']:.0f} V nominal)", meas, llv.get("overall_pass"),
                 sev.get("voltage_line_to_line"), group="voltage")
@@ -1630,7 +1649,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
 
     frq = report.get("frequency") or {}
     if frq.get("available"):
-        meas = (f"{frq['min_hz']:.3f}–{frq['max_hz']:.3f} Hz  "
+        meas = (f"{_m(frq['min_hz'], '.3f')}–{_m(frq['max_hz'], '.3f', ' Hz')}  "
                 f"(allowed {frq['range_hz'][0]:.2f}–{frq['range_hz'][1]:.2f} Hz)")
         add_row(f"System frequency within ±{(frq['range_hz'][1] - frq['nominal_hz']):.1f} Hz "
                 f"of {frq['nominal_hz']:.0f} Hz", meas, frq.get("overall_pass"),
