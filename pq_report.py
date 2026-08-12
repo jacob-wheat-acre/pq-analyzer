@@ -1061,6 +1061,58 @@ def _add_toc(doc) -> None:
     doc.add_page_break()
 
 
+def _integrity_summary(dq: dict, fs: dict) -> str:
+    """The header table's version: enough to judge the report, not to debug it.
+
+    The full diagnosis still has to exist somewhere, because a customer's .pqd
+    cannot be sent anywhere and a failure that does not carry its own evidence
+    cannot be diagnosed at all. It does not have to sit in the header, where a
+    paragraph of byte offsets and zlib state buries the six rows the reader
+    came for. Scope, what it costs, and what to do; the evidence is in
+    Appendix B.
+    """
+    parts = []
+
+    n_bad   = dq.get("unreadable_observations") or 0
+    n_total = dq.get("total_observations") or 0
+    missing = dq.get("missing_bytes") or 0
+
+    if n_bad:
+        # "1 of 87 observation records ... was skipped": the noun agrees with
+        # the 87, the verb with the 1.
+        scope = (f"{n_bad} of {n_total} observation records" if n_total else
+                 f"{n_bad} observation record{'' if n_bad == 1 else 's'}")
+        line = (f"{scope} could not be decoded and "
+                f"{'was' if n_bad == 1 else 'were'} skipped")
+        if n_total and n_bad < n_total:
+            n_good = n_total - n_bad
+            line += ("; the other one reads cleanly and covers the "
+                     "recording period above" if n_good == 1 else
+                     f"; the other {n_good} read cleanly and cover the "
+                     "recording period above")
+        parts.append(line + ".")
+
+        # Which record was lost decides which checks are affected -- losing the
+        # max/min observation removes the peak and minimum voltage check, and
+        # no count conveys that. The names are short; the reasons are not.
+        names = [d.get("name", "") for d in (dq.get("unreadable_detail") or [])]
+        names = [n for n in names if n]
+        if names:
+            parts.append("Skipped: " + "; ".join(f"“{n}”" for n in names) + ".")
+
+    if missing:
+        parts.append(
+            f"The file is {'also ' if n_bad else ''}{missing:,} bytes shorter "
+            "than its own record headers declare, so it was cut short.")
+
+    parts.append(
+        "Counts, minimums and maximums may understate what the meter saw. "
+        "Re-export from the meter and re-run before relying on these results; "
+        "the full diagnosis is in Appendix B.")
+
+    return "INCOMPLETE — " + " ".join(parts)
+
+
 def _integrity_note(dq: dict, fs: dict) -> str:
     """Explain a damaged source file to someone who has never heard of PQDIF.
 
@@ -1078,9 +1130,11 @@ def _integrity_note(dq: dict, fs: dict) -> str:
     if n_bad:
         # Name the unit before counting it — "observation record" is PQDIF
         # jargon that means nothing to a field engineer reading the report.
-        scope = f"{n_bad} of {n_total}" if n_total else f"{n_bad}"
+        scope = (f"{n_bad} of {n_total} observation records" if n_total else
+                 f"{n_bad} observation record{'' if n_bad == 1 else 's'}")
         parts.append(
-            f"{scope} observation records could not be decoded and were skipped. "
+            f"{scope} could not be decoded and "
+            f"{'was' if n_bad == 1 else 'were'} skipped. "
             "An observation record is one block of measurements the meter wrote "
             "to the file — typically one channel group over one span of time."
         )
@@ -1170,11 +1224,12 @@ def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, 
     ]
     # An incomplete source file belongs in the report header, not only in a log:
     # the findings below are drawn from partial data and a reader has to know.
+    # The header carries the summary; Appendix B carries the evidence.
     _dq = fs.get("data_quality") or {}
     if _dq.get("missing_bytes") or _dq.get("unreadable_observations"):
         rows_data.append((
             "Source file integrity",
-            _integrity_note(_dq, fs),
+            _integrity_summary(_dq, fs),
         ))
     info_tbl = doc.add_table(rows=len(rows_data), cols=2)
     info_tbl.style = 'Table Grid'
@@ -2331,7 +2386,7 @@ def _word_recording_overview(doc, report, outdir=None, stem="") -> None:
         "meter did not record is shaded and the trace is broken across it, so a "
         "gap cannot be mistaken for a flat reading."
         + ("  This file was incomplete when read — see Source file integrity in "
-           "the header table above."
+           "the header table above, and Appendix B for what could not be read."
            if (dq.get("missing_bytes") or dq.get("unreadable_observations"))
            else ""))
     note = _session_note(fs)
@@ -4359,6 +4414,15 @@ def _word_appendix(doc, report, thresh, df) -> None:
     entries: List[Tuple[str, str]] = []
     fs       = report["file_summary"]
     interval = f"{fs.get('interval_minutes', 5):g}"
+
+    # First, because it conditions everything below it: a reader weighing any
+    # finding needs to know the file it came from was incomplete before they
+    # weigh it. The header says so in three lines; this is where the evidence
+    # that makes the failure diagnosable without the .pqd lives.
+    _dq = fs.get("data_quality") or {}
+    if _dq.get("missing_bytes") or _dq.get("unreadable_observations"):
+        entries.append(("Source file integrity — what could not be read",
+                        _integrity_note(_dq, fs)))
 
     entries.append(("Measurement basis",
         f"Results are computed from {interval}-minute interval averages recorded by "

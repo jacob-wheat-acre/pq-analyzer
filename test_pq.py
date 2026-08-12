@@ -4465,6 +4465,55 @@ class TestRecordThatWillNotInflate:
         assert "Evidence: declared_body=" in note
         assert "partial_inflate=" in note
 
+    def test_the_header_summarises_and_the_appendix_carries_the_evidence(self):
+        # The evidence has to reach the document, but it does not have to sit
+        # in the header table, where it buries the rows the reader came for.
+        from pq_report import _integrity_summary, _integrity_note
+        dq = {
+            "unreadable_observations": 1, "total_observations": 87,
+            "missing_bytes": 0,
+            "unreadable_detail": [{
+                "offset": 41010644, "name": "Interval max/min",
+                "reason": ("record at 41010644 declared record-level zlib "
+                           "compression but did not decompress. Evidence: "
+                           "declared_body=0 partial_inflate=0."),
+            }],
+        }
+        head = _integrity_summary(dq, {})
+        full = _integrity_note(dq, {})
+
+        # Scope, cost and where to look -- and nothing a parser author needs.
+        assert "1 of 87" in head
+        assert "may understate" in head
+        assert "Appendix B" in head
+        assert "Evidence:" not in head
+        assert "declared_body" not in head
+        assert len(head) < len(full) / 2
+
+        # And the evidence is still in the document, one section further down.
+        assert "declared_body=0" in full
+
+    def test_one_skipped_record_is_singular(self):
+        # "1 of 87 ... were skipped" reached a real report before this.
+        from pq_report import _integrity_summary
+        dq = {"unreadable_observations": 1, "total_observations": 87,
+              "missing_bytes": 0, "unreadable_detail": []}
+        head = _integrity_summary(dq, {})
+        assert "records could not be decoded and was skipped" in head
+        assert "were skipped" not in head
+        assert "the other 86 read cleanly" in head
+
+    def test_a_clean_file_gets_no_integrity_row_at_all(self):
+        docx = pytest.importorskip("docx")
+        from pq_report import _word_site_info_table
+        doc = docx.Document()
+        fs = {"start_time": "a", "end_time": "b", "duration_hours": 1.0,
+              "sample_count": 12, "topology": "3-phase", "data_quality": {
+                  "missing_bytes": 0, "unreadable_observations": 0}}
+        _word_site_info_table(doc, "Site", "stem", "", "", "", "", fs, 277.0, 480)
+        labels = [r.cells[0].text for r in doc.tables[0].rows]
+        assert "Source file integrity" not in labels
+
     def test_an_intact_file_needs_none_of_it(self, tmp_path):
         f = pqdif.PQDIFFile(self.SRC)
         assert f.observations and f.unreadable_observations == []
