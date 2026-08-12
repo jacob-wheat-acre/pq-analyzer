@@ -103,7 +103,7 @@ pq-analyzer directory.
 
 | Check | Standard | Notes |
 |---|---|---|
-| Voltage compliance | ANSI C84.1-2020 | Range A / Range B; peak/min if maxmin record present |
+| Voltage compliance | ANSI C84.1-2016 | Range A / Range B / outside both, on interval averages. Table 1 service voltage, both groups: 120–600 V (±5% / −8.33%/+5.83%) and 2.4–34.5 kV (97.5–105% / 95–105.8%). Within-interval extremes reported, and graded as events against ITIC |
 | THD / TDD | IEEE 519-2022 | Basic average check |
 | Statistical harmonic compliance | IEEE 519-2022 Clause 5 | P95/P99 weekly; daily VST P99 |
 | Per-order harmonic spectrum | IEEE 519-2022 Table 1 & 2 | Requires per-order meter channels |

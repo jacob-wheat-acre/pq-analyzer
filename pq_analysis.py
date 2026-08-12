@@ -10,6 +10,10 @@ import pandas as pd
 from pq_constants import (
     measured as _m,
     measured_pct as _mp,
+    ansi_bands,
+    ansi_band_basis,
+    VOLTAGE_BAND_LABEL,
+    VOLTAGE_BAND_ORDER,
     SEVERITY_LABEL,
     SEVERITY_ORDER,
     SEVERITY_SEVERE_MARGIN,
@@ -425,13 +429,23 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
     if abs(snapped - nominal) / nominal <= 0.02:
         nominal = float(snapped)
 
-    vmin = nominal * (1 - thresh.volt_tolerance)
-    vmax = nominal * (1 + thresh.volt_tolerance)
+    bands = ansi_bands(nominal)
+    if not bands["range_a_evaluated"]:
+        return {"available": False, "error": bands["range_b_note"],
+                "pairs": {}, "total_pct_out_of_bounds": None}
+    vmin, vmax = bands["a_min"], bands["a_max"]
     result: dict = {
         "available":     True,
         "error":         None,
         "nominal_v":     nominal,
         "range_v":       (vmin, vmax),
+        "range_b_v":     ((bands["b_min"], bands["b_max"])
+                          if bands["range_b_evaluated"] else None),
+        "range_b_evaluated": bands["range_b_evaluated"],
+        "range_b_note":  bands["range_b_note"],
+        "band_basis":    ansi_band_basis(bands),
+        "nominal_group": bands["group"],
+        "basis":         "interval average",
         "configuration": configuration,
         "ln_ll_ratio":   round(ratio, 3),
         "pairs":         {},
@@ -441,24 +455,50 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
     all_violations = pd.Series(False, index=df.index)
     for col in ll_cols:
         s = df[col].dropna()
+        # Reported, not judged on -- see check_voltage_compliance.
         smin = df[f"{col}_min"].reindex(s.index).fillna(s)  if f"{col}_min"  in df.columns else s
         smax = df[f"{col}_peak"].reindex(s.index).fillna(s) if f"{col}_peak" in df.columns else s
-        under, over = smin < vmin, smax > vmax
+        under, over = s < vmin, s > vmax
         viol = under | over
+        if bands["range_b_evaluated"]:
+            out_b = (s < bands["b_min"]) | (s > bands["b_max"])
+        else:
+            out_b = pd.Series(False, index=s.index)
+        in_b = viol & ~out_b
+
+        if out_b.any():
+            band = "outside_b"
+        elif not viol.any():
+            band = "range_a"
+        else:
+            band = "range_b" if bands["range_b_evaluated"] else "outside_a"
+
         all_violations.loc[viol.index[viol]] = True
         result["pairs"][LL_COLS[col]] = {
             "column":            col,
             "pct_out_of_bounds": float(viol.mean() * 100),
             "pct_under":         float(under.mean() * 100),
             "pct_over":          float(over.mean() * 100),
-            "min_v":             float(smin.min()),
-            "max_v":             float(smax.max()),
+            "pct_range_b":       float(in_b.mean() * 100),
+            "pct_outside_b":     float(out_b.mean() * 100),
+            "band":              band,
+            "min_v":             float(s.min()),
+            "max_v":             float(s.max()),
             "mean_v":            float(s.mean()),
+            "min_interval_v":    float(smin.min()),
+            "max_interval_v":    float(smax.max()),
+            "used_interval_extremes": smin is not s,
         }
 
     result["violation_timestamps"] = df.index[all_violations]
     result["total_pct_out_of_bounds"] = float(all_violations.mean() * 100)
     result["overall_pass"] = result["total_pct_out_of_bounds"] == 0
+    result["band"] = max((p["band"] for p in result["pairs"].values()),
+                         key=VOLTAGE_BAND_ORDER.index)
+    result["total_pct_range_b"] = max(
+        p["pct_range_b"] for p in result["pairs"].values())
+    result["total_pct_outside_b"] = max(
+        p["pct_outside_b"] for p in result["pairs"].values())
     return result
 
 
@@ -591,7 +631,21 @@ def check_voltage_compliance(
 ) -> dict:
     """ANSI C84.1 voltage compliance check.
 
-    Returns per-phase statistics and the union of all violation timestamps.
+    The verdict is taken from the interval average, and each interval is placed
+    in Range A, in Range B, or outside both.
+
+    C84.1 rates *sustained* service voltage.  A dip lasting a few cycles inside
+    a 30-second interval is a sag: IEEE 1159 grades it on depth and duration
+    against the ITIC envelope, which this tool already does separately.  Judging
+    Range A on the meter's within-interval extremes imported those events into
+    the steady-state test, so a single 116 ms sag both failed C84.1 and was
+    counted a second time as an ITIC violation -- one event, two findings, and
+    the C84.1 one attributed to a standard that does not cover it.
+
+    The extremes are still reported.  They are the most useful thing in the file
+    for seeing that an event happened at all, and dropping them would lose that.
+    They are returned under their own keys, as within-interval figures, and they
+    do not decide compliance.
     """
     v_cols = ["voltage_a", "voltage_b", "voltage_c"]
     if not any(c in df.columns for c in v_cols):
@@ -603,13 +657,31 @@ def check_voltage_compliance(
             "violation_timestamps":   pd.DatetimeIndex([]),
         }
 
-    vmin = thresh.nominal_voltage * (1 - thresh.volt_tolerance)
-    vmax = thresh.nominal_voltage * (1 + thresh.volt_tolerance)
+    bands = ansi_bands(thresh.nominal_voltage)
+    if not bands["range_a_evaluated"]:
+        # Above 34.5 kV Table 1 hands off to another standard. Reporting this as
+        # unavailable, with the reason, is the only honest answer -- a pass
+        # against a band the standard does not define is worse than no result.
+        return {
+            "available":              False,
+            "error":                  bands["range_b_note"],
+            "phases":                 {},
+            "total_pct_out_of_bounds": None,
+            "violation_timestamps":   pd.DatetimeIndex([]),
+        }
+    vmin, vmax = bands["a_min"], bands["a_max"]
     result = {
         "available":              True,
         "error":                  None,
         "nominal_v":              thresh.nominal_voltage,
         "range_v":                (vmin, vmax),
+        "range_b_v":              ((bands["b_min"], bands["b_max"])
+                                   if bands["range_b_evaluated"] else None),
+        "range_b_evaluated":      bands["range_b_evaluated"],
+        "range_b_note":           bands["range_b_note"],
+        "band_basis":             ansi_band_basis(bands),
+        "nominal_group":          bands["group"],
+        "basis":                  "interval average",
         "phases":                 {},
         "phases_missing_data":    [],
         "violation_timestamps":   pd.DatetimeIndex([]),
@@ -626,19 +698,49 @@ def check_voltage_compliance(
             # "compliant"). Track it so the report can say so explicitly.
             result["phases_missing_data"].append(col)
             continue
+        # Within-interval extremes: reported, never the basis of the verdict.
         smin = df[f"{col}_min"].reindex(s.index).fillna(s)  if f"{col}_min"  in df.columns else s
         smax = df[f"{col}_peak"].reindex(s.index).fillna(s) if f"{col}_peak" in df.columns else s
-        under = smin < vmin
-        over  = smax > vmax
+
+        under = s < vmin
+        over  = s > vmax
         viol  = under | over
+        if bands["range_b_evaluated"]:
+            under_b = s < bands["b_min"]
+            over_b  = s > bands["b_max"]
+        else:
+            under_b = over_b = pd.Series(False, index=s.index)
+        out_b = under_b | over_b
+        # Range B is the band *between* the two, so an interval counts to it
+        # only where it left Range A without leaving Range B as well.
+        in_b = viol & ~out_b
+
+        if out_b.any():
+            band = "outside_b"
+        elif not viol.any():
+            band = "range_a"
+        else:
+            band = "range_b" if bands["range_b_evaluated"] else "outside_a"
+
         all_violations.loc[viol.index[viol]] = True
         result["phases"][col] = {
             "pct_out_of_bounds": float(viol.mean() * 100),
             "pct_under":         float(under.mean() * 100),
             "pct_over":          float(over.mean() * 100),
-            "min_v":             float(smin.min()),
-            "max_v":             float(smax.max()),
+            "pct_range_b":       float(in_b.mean() * 100),
+            "pct_outside_b":     float(out_b.mean() * 100),
+            # Split the same way against the Range B edges, so a cell reporting
+            # an outside-B share can break it down against the band it named
+            # rather than against Range A's.
+            "pct_under_b":       float(under_b.mean() * 100),
+            "pct_over_b":        float(over_b.mean() * 100),
+            "band":              band,
+            "min_v":             float(s.min()),
+            "max_v":             float(s.max()),
             "mean_v":            float(s.mean()),
+            # The meter's within-interval extremes, for context only.
+            "min_interval_v":    float(smin.min()),
+            "max_interval_v":    float(smax.max()),
             "used_interval_extremes": smin is not s,
         }
 
@@ -653,6 +755,14 @@ def check_voltage_compliance(
 
     result["violation_timestamps"] = df.index[all_violations]
     result["total_pct_out_of_bounds"] = float(all_violations.mean() * 100)
+    # The service is graded on its worst phase: a supply that holds Range A on
+    # two legs and leaves it on the third has still left it.
+    result["band"] = max((p["band"] for p in result["phases"].values()),
+                         key=VOLTAGE_BAND_ORDER.index)
+    result["total_pct_range_b"] = max(
+        p["pct_range_b"] for p in result["phases"].values())
+    result["total_pct_outside_b"] = max(
+        p["pct_outside_b"] for p in result["phases"].values())
     return result
 
 

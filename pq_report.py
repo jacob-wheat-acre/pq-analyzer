@@ -13,9 +13,12 @@ from pq_constants import (
     MEASURED_OPEN,
     SEVERITY_LABEL,
     SEVERITY_ORDER,
+    SEVERITY_SIGNIFICANT_PERSISTENCE,
     measured as _m,
     measured_pct as _mp,
     pct_text as _pct,
+    VOLTAGE_BAND_LABEL,
+    VOLTAGE_BAND_ORDER,
     strip_marks,
     is_single_phase_208,
     ll_factor,
@@ -486,13 +489,19 @@ def print_report(report: dict) -> None:
     else:
         _any_extremes = any(s.get("used_interval_extremes") for s in vc["phases"].values())
         for ph, s in vc["phases"].items():
-            sym = "PASS" if s["pct_out_of_bounds"] == 0 else "FAIL"
+            sym = {"range_a": "PASS", "range_b": "RANGE B"}.get(s["band"], "FAIL")
             print(f"  {ph:12s}: {s['min_v']:6.1f} / {s['mean_v']:6.1f} / {s['max_v']:6.1f} V  "
                   f"  {s['pct_out_of_bounds']:5.2f}% OOB  [{sym}]")
-        print(f"  Allowed range: {vc['range_v'][0]:.1f} – {vc['range_v'][1]:.1f} V  "
-              f"(nominal {vc['nominal_v']} V ± {(vc['range_v'][1]/vc['nominal_v']-1)*100:.0f}%)")
+        grp = ("2.4–34.5 kV group" if vc.get("nominal_group") == "over_600v"
+               else "120–600 V group")
+        print(f"  Range A: {vc['range_v'][0]:.1f} – {vc['range_v'][1]:.1f} V  "
+              f"(nominal {vc['nominal_v']:.1f} V, C84.1 Table 1 {grp})")
+        if vc.get("range_b_v"):
+            print(f"  Range B: {vc['range_b_v'][0]:.1f} – {vc['range_b_v'][1]:.1f} V")
+        print("  (verdict from interval averages — C84.1 rates sustained voltage)")
         if _any_extremes:
-            print("  (min/max from the interval max-min record; captures within-window excursions)")
+            print("  (within-interval max/min also read; sags and swells are graded "
+                  "against ITIC)")
 
     # ── Line-to-line voltage ──────────────────────────────────────────────────
     llv = report.get("voltage_ll_compliance") or {"available": False}
@@ -1244,6 +1253,152 @@ def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, 
     doc.add_paragraph()
 
 
+#: The standard cell for the steady-state voltage row. It names the basis as
+#: well as the range: an engineer checking the row against the meter's own
+#: max/min display has to be able to see, from the row, that the two are
+#: answering different questions.
+_C841_STANDARD = ("Steady-state voltage within ANSI C84.1-2016 Range A "
+                  "(service voltage, interval averages)")
+
+
+def _c841_row_title(res: dict) -> str:
+    """Row title, naming the Table 1 group where it is not the familiar one.
+
+    The two groups share their upper limits and differ only below nominal, so a
+    primary service judged at 97.5% next to a row labelled the same way as every
+    secondary report reads as an error in the tool rather than as the standard.
+    """
+    if res.get("nominal_group") == "over_600v":
+        return (_C841_STANDARD[:-1] + ", 2.4–34.5 kV group: "
+                "Range A 97.5–105% of nominal)")
+    return _C841_STANDARD
+
+#: Compliance-column wording for each voltage band. Range A is the line the
+#: standard asks the utility to hold, so leaving it is never rendered as a pass;
+#: "Range B" says which side of it the service landed on without borrowing the
+#: word Exceeded, which the reader would take to mean outside C84.1 altogether.
+_VOLTAGE_BAND_VERDICT = {
+    "range_a":   "Within",
+    "range_b":   "Range B",
+    "outside_a": "Exceeded",
+    "outside_b": "Exceeded",
+}
+
+
+def _grade_voltage_band(res: dict, missing: Optional[List[str]] = None) -> dict:
+    """Severity for a band-classified voltage result.
+
+    C84.1 does not present its two ranges as degrees of one limit, so this does
+    not grade on a margin against one. Range B is a band the supply is permitted
+    to enter, on the condition that the excursions are "limited in extent,
+    frequency and duration" and are corrected within a reasonable time. That
+    condition is the grade: entering Range B briefly is a minor finding, sitting
+    in it is the thing the standard asks to be fixed, and leaving Range B is
+    outside what C84.1 contemplates at all.
+    """
+    notes = ([f"no usable data on {', '.join(_phase_label(m) for m in missing)}"]
+             if missing else [])
+    band = res.get("band", "range_a")
+    if band == "range_a":
+        return grade_finding(True, confidence_notes=notes or None)
+
+    pct_b   = res.get("total_pct_range_b", 0.0) or 0.0
+    pct_out = res.get("total_pct_outside_b", 0.0) or 0.0
+    sustained = SEVERITY_SIGNIFICANT_PERSISTENCE
+
+    if band == "outside_b":
+        sev_band = "severe" if pct_out >= sustained else "significant"
+        reason = (f"{_pct(pct_out, '.1f')} of the recording outside Range B "
+                  f"({res['range_b_v'][0]:.1f}–{res['range_b_v'][1]:.1f} V)")
+    elif band == "range_b":
+        sev_band = "significant" if pct_b >= sustained else "minor"
+        reason = (f"{_pct(pct_b, '.1f')} of the recording in Range B; C84.1 asks "
+                  "that Range B excursions be limited in extent, frequency and "
+                  "duration and corrected within a reasonable time")
+    else:
+        # Range B was not evaluated, so how far past Range A this went is not
+        # something the tool can say. Grading it on persistence alone is the
+        # honest ceiling, and the reason says why it stops there.
+        sev_band = "significant" if (res.get("total_pct_out_of_bounds") or 0.0) >= sustained else "minor"
+        reason = (f"{_pct(res.get('total_pct_out_of_bounds') or 0.0, '.1f')} of "
+                  "the recording outside Range A; Range B not evaluated at this "
+                  "nominal, so the depth past Range A is not graded")
+
+    downgraded = False
+    if notes and sev_band != "minor":
+        sev_band = SEVERITY_ORDER[SEVERITY_ORDER.index(sev_band) - 1]
+        downgraded = True
+        reason += "; " + "; ".join(notes) + " (severity reduced one band)"
+    elif notes:
+        reason += "; " + "; ".join(notes)
+
+    return {"band": sev_band, "label": SEVERITY_LABEL[sev_band],
+            "reason": reason, "margin": None, "downgraded": downgraded}
+
+
+def _voltage_band_cell(st: dict, res: dict, lead: str) -> str:
+    """The Measured cell for one band-classified voltage result.
+
+    Shared by the line-to-neutral and line-to-line rows so the two cannot drift
+    into describing the same classification differently.
+
+    The readings quoted are interval averages, because that is what the verdict
+    rests on. The meter's within-interval extremes follow on their own clause,
+    named as such: a cell that opened with 258.6 V and closed with "all
+    intervals in Range A" would read as a contradiction, and the reader would be
+    right to distrust it -- the two numbers answer different questions.
+    """
+    rng  = res["range_v"]
+    band = st["band"]
+
+    if band == "range_a":
+        band_note = "All intervals in Range A"
+    else:
+        # Quote the edge that was actually crossed, and split the share against
+        # that same edge. An interval outside Range B described as "below
+        # 263.1 V" invites the reader to check it against the Range A limit and
+        # conclude the classification is one band out; a low/high split taken
+        # from Range A under an outside-B headline does the same thing to the
+        # arithmetic, since the two shares do not add up to the one quoted.
+        outside_b = band == "outside_b" and res.get("range_b_v")
+        edge = res["range_b_v"] if outside_b else rng
+        lo_pct = st["pct_under_b"] if outside_b else st["pct_under"]
+        hi_pct = st["pct_over_b"]  if outside_b else st["pct_over"]
+        if lo_pct and hi_pct:
+            direction = (f"{_mp(lo_pct, '.1f')} low / {_mp(hi_pct, '.1f')} high")
+        elif lo_pct:
+            direction = f"all below {edge[0]:.1f} V"
+        else:
+            direction = f"all above {edge[1]:.1f} V"
+        if band == "outside_b":
+            share = _mp(st["pct_outside_b"], '.1f')
+            band_note = f"{share} of intervals outside Range B, {direction}"
+        elif band == "range_b":
+            share = _mp(st["pct_range_b"], '.1f')
+            band_note = f"{share} of intervals in Range B, {direction}"
+        else:
+            share = _mp(st["pct_out_of_bounds"], '.1f')
+            band_note = f"{share} of intervals outside Range A, {direction}"
+
+    limits = f"Range A {rng[0]:.1f}–{rng[1]:.1f} V"
+    if res.get("range_b_v"):
+        limits += f"  ·  Range B {res['range_b_v'][0]:.1f}–{res['range_b_v'][1]:.1f} V"
+
+    cell = (f"{lead}{_m(st['min_v'], '.1f')}–{_m(st['max_v'], '.1f', ' V')} "
+            f"(mean {_m(st['mean_v'], '.1f')})  |  {band_note}  |  {limits}")
+
+    # Only worth saying where the extremes actually left the band the averages
+    # stayed inside -- that is the case a reader would otherwise mistake for a
+    # missed violation, and it is the one pointing at the events section.
+    if st.get("used_interval_extremes"):
+        lo, hi = st.get("min_interval_v"), st.get("max_interval_v")
+        if lo is not None and hi is not None and (lo < rng[0] or hi > rng[1]):
+            cell += (f"  |  Within-interval extremes {_m(lo, '.1f')}–"
+                     f"{_m(hi, '.1f', ' V')}, graded as events against ITIC, "
+                     "not against C84.1")
+    return cell
+
+
 def _word_compliance_table(doc, report, thresh, df) -> None:
     pf   = report["pass_fail"]
     volt = report["voltage_compliance"]
@@ -1283,16 +1438,21 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     # can take in "the voltage picture" or "the current picture" at once.
     buffered: List[tuple] = []
 
-    def add_row(standard, measured, passes, severity=None, group="other"):
+    def add_row(standard, measured, passes, severity=None, group="other",
+                verdict=None):
         """One finding: the compliance fact, then how much it matters.
 
         Callers that pass no severity fall back to grading on pass/fail alone,
         which yields Compliant / Minor / Not assessed — never a red row without
         a margin to justify it.
-        """
-        buffered.append((group, standard, measured, passes, severity))
 
-    def _emit(standard, measured, passes, severity):
+        ``verdict`` overrides the Compliance word for the findings whose
+        standard is not binary — C84.1 has two named ranges, and collapsing
+        Range B into "Exceeded" would lose the distinction the standard draws.
+        """
+        buffered.append((group, standard, measured, passes, severity, verdict))
+
+    def _emit(standard, measured, passes, severity, verdict=None):
         row   = tbl.add_row()
         cells = row.cells
         cells[0].paragraphs[0].add_run(standard).font.size = Pt(10)
@@ -1303,7 +1463,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
 
         # Compliance column — the standard's own binary verdict, unshaded so it
         # reads as a fact rather than an alarm.
-        r = cells[2].paragraphs[0].add_run(_pf_sym(passes))
+        r = cells[2].paragraphs[0].add_run(verdict or _pf_sym(passes))
         r.bold = True
         r.font.size = Pt(10)
         if passes is False:
@@ -1393,35 +1553,24 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         # printed range_v -- the *allowed* band -- under the bare label "Range",
         # so the only voltage in the cell was the limit dressed as a measurement,
         # and "worst phase" was never followed by which phase or what it read.
-        worst_col, worst_st = max(phases.items(),
-                                  key=lambda kv: kv[1]["pct_out_of_bounds"])
-        worst_oob = worst_st["pct_out_of_bounds"]
-        # Say which direction it went, since low and high voltage have opposite
-        # causes and opposite fixes.
-        if worst_oob == 0:
-            band_note = "All intervals in band"
-        else:
-            if worst_st["pct_under"] and worst_st["pct_over"]:
-                excursion = (f"{_m(worst_st['pct_under'], '.1f', '%')} under / "
-                             f"{_m(worst_st['pct_over'], '.1f', '%')} over")
-            elif worst_st["pct_under"]:
-                excursion = f"all below {rng[0]:.1f} V"
-            else:
-                excursion = f"all above {rng[1]:.1f} V"
-            band_note = (f"{_m(worst_oob, '.1f', '%')} of intervals out of "
-                         f"band, {excursion}")
-
-        meas = (f"Worst phase {_phase_label(worst_col)}: "
-                f"{_m(worst_st['min_v'], '.1f')}–"
-                f"{_m(worst_st['max_v'], '.1f', ' V')} "
-                f"(mean {_m(worst_st['mean_v'], '.1f')})  |  {band_note}  |  "
-                f"Allowed {rng[0]:.1f}–{rng[1]:.1f} V{missing_note}")
+        # Ranked on the band reached first: a phase that leaves Range B for one
+        # interval is a worse finding than one sitting in Range B for a tenth of
+        # the recording, and sorting on share alone would print the wrong phase.
+        worst_col, worst_st = max(
+            phases.items(),
+            key=lambda kv: (VOLTAGE_BAND_ORDER.index(kv[1]["band"]),
+                            kv[1]["pct_out_of_bounds"]))
+        meas = _voltage_band_cell(
+            worst_st, volt, f"Worst phase {_phase_label(worst_col)}: ") + missing_note
+        if volt.get("range_b_note"):
+            meas += f"  |  {volt['range_b_note']}"
         # Voltage severity is driven by how much of the recording sat out of
         # band; the excursion depth now shows in the Measured column.
-        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", meas,
-                pf["voltage"], sev.get("voltage"), group="voltage")
+        add_row(_c841_row_title(volt), meas, pf["voltage"], sev.get("voltage"),
+                group="voltage",
+                verdict=_VOLTAGE_BAND_VERDICT.get(worst_st["band"]))
     else:
-        add_row("Steady-state voltage within ANSI C84.1-2016 Range A (±5%)", volt.get("error", "No data"), None, group="voltage")
+        add_row(_C841_STANDARD, volt.get("error", "No data"), None, group="voltage")
 
     # Voltage transients / ITIC
     itic = report.get("itic", {})
@@ -1635,16 +1784,18 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     # the table showed.
     llv = report.get("voltage_ll_compliance") or {}
     if llv.get("available"):
-        worst = max(llv["pairs"].values(), key=lambda p: p["pct_out_of_bounds"])
-        meas = (f"Range {_m(min(p['min_v'] for p in llv['pairs'].values()), '.1f')}–"
-                f"{_m(max(p['max_v'] for p in llv['pairs'].values()), '.1f', ' V')} "
-                f"(allowed {llv['range_v'][0]:.0f}–{llv['range_v'][1]:.0f} V)")
-        if worst["pct_out_of_bounds"] > 0:
-            meas += (f"  |  worst pair "
-                     f"{_m(worst['pct_out_of_bounds'], '.2f', '%')} out of range")
+        worst_pair, worst = max(
+            llv["pairs"].items(),
+            key=lambda kv: (VOLTAGE_BAND_ORDER.index(kv[1]["band"]),
+                            kv[1]["pct_out_of_bounds"]))
+        meas = _voltage_band_cell(worst, llv, f"Worst pair {worst_pair}: ")
+        if llv.get("range_b_note"):
+            meas += f"  |  {llv['range_b_note']}"
         add_row(f"Line-to-line voltage within ANSI C84.1 Range A "
-                f"({llv['nominal_v']:.0f} V nominal)", meas, llv.get("overall_pass"),
-                sev.get("voltage_line_to_line"), group="voltage")
+                f"({llv['nominal_v']:.0f} V nominal)",
+                meas, llv.get("overall_pass"),
+                sev.get("voltage_line_to_line"), group="voltage",
+                verdict=_VOLTAGE_BAND_VERDICT.get(worst["band"]))
     else:
         add_row("Line-to-line voltage within ANSI C84.1 Range A",
                 llv.get("error", "Not evaluated"), None, group="voltage")
@@ -1694,8 +1845,8 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             continue
         rows.sort(key=lambda r: _rank(key, r[1]))
         _emit_group_heading(heading)
-        for _, standard, measured, passes, severity in rows:
-            _emit(standard, measured, passes, severity)
+        for _, standard, measured, passes, severity, verdict in rows:
+            _emit(standard, measured, passes, severity, verdict)
 
     doc.add_paragraph()
 
@@ -2208,13 +2359,8 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
             persistence_pct=c_thd.get("pct_exceeding"), confidence_notes=notes)
 
     if volt.get("available"):
-        missing = volt.get("phases_missing_data") or []
-        worst_oob = max(v["pct_out_of_bounds"] for v in volt["phases"].values())
-        sev["voltage"] = grade_finding(
-            pf.get("voltage"), persistence_pct=worst_oob,
-            confidence_notes=([f"no usable data on "
-                               f"{', '.join(_phase_label(m) for m in missing)}"]
-                              if missing else None))
+        sev["voltage"] = _grade_voltage_band(
+            volt, volt.get("phases_missing_data") or [])
 
     if pfr.get("available") and thresh.customer_class != "r":
         sev["power_factor"] = grade_finding(
@@ -2266,9 +2412,7 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
         sev.update(_flicker_severities(fl, report))
 
     if llv.get("available"):
-        worst = max(llv["pairs"].values(), key=lambda p: p["pct_out_of_bounds"])
-        sev["voltage_line_to_line"] = grade_finding(
-            llv.get("overall_pass"), persistence_pct=worst["pct_out_of_bounds"])
+        sev["voltage_line_to_line"] = _grade_voltage_band(llv)
 
     if frq.get("available"):
         sev["frequency"] = grade_finding(
@@ -2586,8 +2730,31 @@ def _word_voltage(doc, report, outdir=None, stem="") -> Optional[str]:
                 "The compliance result below reflects only the phase(s) with valid data."
             )
         all_pass = all(v["pct_out_of_bounds"] == 0 for v in volt["phases"].values())
-        _used_ext = any(v.get("used_interval_extremes") for v in volt["phases"].values())
-        _ext_note = " Extremes reflect within-interval min/max from the meter's max-min record." if _used_ext else ""
+        # State the basis once, at the top, rather than appending a caveat to
+        # every phase. What the verdict rests on is a property of the check, not
+        # of phase B.
+        _basis = ("These are interval averages. ANSI C84.1 rates sustained "
+                  "service voltage, so the compliance result below is taken "
+                  "from them")
+        if any(v.get("used_interval_extremes") for v in volt["phases"].values()):
+            _basis += (", and the meter's within-interval minima and maxima are "
+                       "quoted separately where they left the band. Excursions "
+                       "shorter than one interval are sags or swells and are "
+                       "graded on depth and duration against the ITIC envelope "
+                       "in Voltage Events, not against C84.1")
+        _body(doc, _basis + ".")
+        if volt.get("range_b_note"):
+            _body(doc, volt["range_b_note"])
+
+        def _extremes_clause(v) -> str:
+            if not v.get("used_interval_extremes"):
+                return ""
+            lo, hi = v.get("min_interval_v"), v.get("max_interval_v")
+            if lo is None or hi is None or (lo >= rng[0] and hi <= rng[1]):
+                return ""
+            return (f" Within-interval extremes reached {_m(lo, '.1f')}–"
+                    f"{_m(hi, '.1f', ' V')}; see Voltage Events.")
+
         if all_pass:
             vals = {ph: v for ph, v in volt["phases"].items()}
             phase_str = "  ".join(
@@ -2597,7 +2764,8 @@ def _word_voltage(doc, report, outdir=None, stem="") -> Optional[str]:
             )
             _body(doc,
                 f"Voltage was within ANSI C84.1 Range A ({rng[0]:.1f}–{rng[1]:.1f} V) "
-                f"for the entire recording period. {phase_str}.{_ext_note}"
+                f"for the entire recording period. {phase_str}."
+                + "".join(_extremes_clause(v) for v in vals.values())
             )
         else:
             for ph, v in volt["phases"].items():
@@ -2607,30 +2775,48 @@ def _word_voltage(doc, report, outdir=None, stem="") -> Optional[str]:
                     _body(doc,
                         f"Phase {_phase_label(ph)}: within ANSI C84.1 Range A ({rng[0]:.1f}–{rng[1]:.1f} V) "
                         f"for the entire recording. Min {_m(v['min_v'], '.1f', ' V')}, mean {_m(v['mean_v'], '.1f', ' V')}, "
-                        f"max {_m(v['max_v'], '.1f', ' V')}.{_ext_note}"
+                        f"max {_m(v['max_v'], '.1f', ' V')}.{_extremes_clause(v)}"
                     )
                 else:
                     if pct_over > 0 and pct_under > 0:
                         direction = (
-                            f"{_m(pct_over, '.2f', '%')} of intervals above the "
+                            f"{_mp(pct_over, '.2f')} of intervals above the "
                             f"upper limit ({rng[1]:.1f} V) and "
-                            f"{_m(pct_under, '.2f', '%')} below the lower limit "
+                            f"{_mp(pct_under, '.2f')} below the lower limit "
                             f"({rng[0]:.1f} V)"
                         )
                     elif pct_over > 0:
-                        direction = (f"{_m(pct_over, '.2f', '%')} of intervals above "
+                        direction = (f"{_mp(pct_over, '.2f')} of intervals above "
                                      f"the upper limit ({rng[1]:.1f} V)")
                     else:
-                        direction = (f"{_m(pct_under, '.2f', '%')} of intervals below "
+                        direction = (f"{_mp(pct_under, '.2f')} of intervals below "
                                      f"the lower limit ({rng[0]:.1f} V)")
+                    # Which band it reached is the finding, so it is named here
+                    # rather than left for the reader to work out from the share.
+                    band_clause = ""
+                    if v["band"] == "range_b" and volt.get("range_b_v"):
+                        band_clause = (
+                            f" These stayed within Range B "
+                            f"({volt['range_b_v'][0]:.1f}–{volt['range_b_v'][1]:.1f} V), "
+                            "which C84.1 permits provided the excursions are "
+                            "limited in extent, frequency and duration and are "
+                            "corrected within a reasonable time.")
+                    elif v["band"] == "outside_b" and volt.get("range_b_v"):
+                        band_clause = (
+                            f" {_mp(v['pct_outside_b'], '.2f')} of intervals were "
+                            f"outside Range B as well "
+                            f"({volt['range_b_v'][0]:.1f}–{volt['range_b_v'][1]:.1f} V), "
+                            "which is beyond what C84.1 contemplates for a "
+                            "service voltage.")
                     _body(doc,
                         f"Phase {_phase_label(ph)}: {direction}. "
                         f"Min {_m(v['min_v'], '.1f', ' V')}, mean {_m(v['mean_v'], '.1f', ' V')}, max {_m(v['max_v'], '.1f', ' V')} "
-                        f"(ANSI C84.1 Range A: {rng[0]:.1f}–{rng[1]:.1f} V).{_ext_note}"
+                        f"(ANSI C84.1 Range A: {rng[0]:.1f}–{rng[1]:.1f} V)."
+                        f"{band_clause}{_extremes_clause(v)}"
                     )
     _embed_plot(doc, outdir, stem, "voltage.png",
-                "Phase voltages against ANSI C84.1 Range A limits; "
-                "out-of-range periods are shaded.")
+                "Phase voltages against the ANSI C84.1 Range A and Range B "
+                "limits; out-of-range periods are shaded.")
     doc.add_paragraph()
     return None
 
@@ -4457,12 +4643,34 @@ def _word_appendix(doc, report, thresh, df) -> None:
           "within-interval behavior."))
 
     volt = report["voltage_compliance"]
-    if volt.get("available") and any(v.get("used_interval_extremes")
-                                     for v in volt["phases"].values()):
-        entries.append(("Voltage extremes",
-            "Reported voltage minima and maxima use the meter's within-interval "
-            "extreme records rather than interval averages, capturing excursions "
-            "shorter than the recording interval."))
+    if volt.get("available"):
+        entry = (
+            "ANSI C84.1 compliance is evaluated on interval averages. The "
+            "standard rates sustained service voltage; an excursion shorter "
+            "than one recording interval is a sag or a swell, which IEEE 1159 "
+            "and the ITIC envelope grade on depth and duration and which this "
+            "report evaluates there. Grading C84.1 on within-interval extremes "
+            "would count one such event twice, once against a standard that "
+            "does not cover it.")
+        if any(v.get("used_interval_extremes") for v in volt["phases"].values()):
+            entry += (" The meter's within-interval extreme records are read "
+                      "and reported alongside the averages, and are labelled "
+                      "as within-interval wherever they appear.")
+        entries.append(("Voltage compliance basis", entry))
+
+        rng_b = volt.get("range_b_v")
+        entries.append(("ANSI C84.1 voltage ranges",
+            (volt.get("band_basis") or "")
+            + " Range A is the band the supply is expected to hold under normal "
+            f"conditions ({volt['range_v'][0]:.1f}–{volt['range_v'][1]:.1f} V "
+            "line-to-neutral here). "
+            + (f"Range B ({rng_b[0]:.1f}–{rng_b[1]:.1f} V) is wider on the low "
+               "side than the high side, and covers voltages that result from "
+               "practical design and operating conditions; C84.1 asks that "
+               "excursions into it be limited in extent, frequency and duration "
+               "and be corrected within a reasonable time. Readings are "
+               "classified into Range A, Range B, or outside both."
+               if rng_b else (volt.get("range_b_note") or ""))))
 
     thd = report["thd_compliance"]
     if thd.get("tdd_info"):

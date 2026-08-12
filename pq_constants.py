@@ -137,6 +137,135 @@ def strip_marks(text: str) -> str:
     return text.replace(MEASURED_OPEN, "").replace(MEASURED_CLOSE, "")
 
 
+# ── ANSI C84.1 voltage ranges ────────────────────────────────────────────────
+# C84.1-2016 Table 1 states the ranges for service voltage (measured at the
+# point of delivery, which is where this meter sits) and separately for
+# utilization voltage (at the equipment terminals, after the customer's own
+# drop). This tool measures at the meter, so the service voltage column is the
+# applicable one. Table 1 splits it into two groups, and they do NOT share a
+# lower limit:
+#
+#                       Range B min   Range A min   Range A max   Range B max
+#   120 V – 600 V          91.67 %       95.0 %        105 %        105.83 %
+#   2.4 kV – 34.5 kV       95.0 %        97.5 %        105 %        105.8 %
+#
+# The low-voltage figures are stated in the table as volts on a 120 V base
+# (Range A 114-126, Range B 110-127) and scale exactly to its published rows:
+# 208 -> 197/218 and 191/220, 240 -> 228/252 and 220/254, 480 -> 456/504 and
+# 440/508. The over-600 V figures are stated as percentages.
+#
+# Two asymmetries matter, and both are deliberate:
+#
+#   * Range B is wider below nominal than above it. The standard tolerates the
+#     drop of a long or heavily loaded feeder further than it tolerates the
+#     overvoltage that shortens equipment life.
+#   * The over-600 V group is TIGHTER on the low side, not looser -- Range A
+#     bottoms out at 97.5 % rather than 95 %. A primary-metered customer still
+#     has their own transformation between this meter and their equipment, and
+#     the standard reserves that headroom for the drop through it. Applying the
+#     low-voltage -5 % to a 13.2 kV service puts the limit 330 V below where
+#     C84.1 sets it, which passes a real undervoltage.
+RANGE_A_UNDER = 114.0 / 120.0   # 0.95
+RANGE_A_OVER  = 126.0 / 120.0   # 1.05
+RANGE_B_UNDER = 110.0 / 120.0   # 0.91667
+RANGE_B_OVER  = 127.0 / 120.0   # 1.05833
+
+RANGE_A_UNDER_MV = 0.975
+RANGE_A_OVER_MV  = 1.05
+RANGE_B_UNDER_MV = 0.95
+RANGE_B_OVER_MV  = 1.058
+
+#: Where Table 1 changes groups. Compared against whatever nominal is handed in,
+#: which is the line-to-neutral figure for the per-phase check and the
+#: line-to-line figure for the L-L check. That works for every system this tool
+#: supports because the two groups do not overlap on either basis: the largest
+#: low-voltage system is 600 V L-L (346 V L-N) and the smallest medium-voltage
+#: one is 2400 V L-L (1386 V L-N).
+MV_NOMINAL_FLOOR_V = 600.0
+
+#: Table 1 stops at 34.5 kV; above that is transmission and a different standard.
+#: Compared line-to-line, so a 34.5 kV system is inside it on both bases.
+MV_NOMINAL_CEILING_V = 34500.0
+
+
+def ansi_bands(nominal_v: float) -> dict:
+    """The C84.1 service-voltage ranges for one nominal.
+
+    Returns both bands in volts, the Table 1 group they came from, and
+    ``range_b_evaluated``.  Callers must not fall back to the Range A band when
+    a band is unavailable: "we did not evaluate this" and "this passed" are
+    different answers, and the report has to be able to say which one it holds.
+    """
+    nominal_v = float(nominal_v)
+    if nominal_v > MV_NOMINAL_CEILING_V:
+        # Above 34.5 kV C84.1 hands off to another standard. Returning the
+        # medium-voltage band here would be inventing a limit for a system the
+        # table does not cover.
+        return {
+            "nominal_v":         nominal_v,
+            "group":             "out_of_scope",
+            "a_min":             None,
+            "a_max":             None,
+            "b_min":             None,
+            "b_max":             None,
+            "range_a_evaluated": False,
+            "range_b_evaluated": False,
+            "range_b_note": (
+                f"ANSI C84.1-2016 Table 1 does not cover {nominal_v:,.0f} V: it "
+                "runs to 34.5 kV, above which voltage ratings are set by another "
+                "standard. No C84.1 range is evaluated for this service."),
+        }
+
+    mv = nominal_v > MV_NOMINAL_FLOOR_V
+    a_lo, a_hi, b_lo, b_hi = (
+        (RANGE_A_UNDER_MV, RANGE_A_OVER_MV, RANGE_B_UNDER_MV, RANGE_B_OVER_MV)
+        if mv else
+        (RANGE_A_UNDER, RANGE_A_OVER, RANGE_B_UNDER, RANGE_B_OVER))
+    return {
+        "nominal_v":         nominal_v,
+        "group":             "over_600v" if mv else "under_600v",
+        "a_min":             nominal_v * a_lo,
+        "a_max":             nominal_v * a_hi,
+        "b_min":             nominal_v * b_lo,
+        "b_max":             nominal_v * b_hi,
+        "range_a_evaluated": True,
+        "range_b_evaluated": True,
+        "range_b_note":      "",
+    }
+
+
+def ansi_band_basis(bands: dict) -> str:
+    """One line naming which Table 1 group a set of bands came from.
+
+    Worth printing because the two groups differ only in their lower limits, so
+    a reader checking a primary service's 97.5 % floor against the ±5 % they
+    know from secondary work would otherwise think the tool had it wrong.
+    """
+    if bands.get("group") == "over_600v":
+        return ("ANSI C84.1-2016 Table 1, service voltage, 2.4–34.5 kV group: "
+                "Range A 97.5–105% of nominal, Range B 95–105.8%. The lower "
+                "limits are tighter than the 120–600 V group's because a "
+                "primary-metered customer's own transformation still lies "
+                "between this meter and their equipment.")
+    if bands.get("group") == "under_600v":
+        return ("ANSI C84.1-2016 Table 1, service voltage, 120–600 V group: "
+                "Range A ±5% of nominal, Range B −8.33%/+5.83%.")
+    return bands.get("range_b_note", "")
+
+
+#: The states a steady-state voltage reading can be in, worst last. "outside_a"
+#: is the honest answer where Range B was not evaluated: the reading left Range
+#: A, and how far past it went is not something this tool can grade.
+VOLTAGE_BAND_ORDER = ["range_a", "range_b", "outside_a", "outside_b"]
+
+VOLTAGE_BAND_LABEL = {
+    "range_a":   "Within Range A",
+    "range_b":   "Range B",
+    "outside_a": "Outside Range A",
+    "outside_b": "Outside Range B",
+}
+
+
 # ── Finding severity ─────────────────────────────────────────────────────────
 # Compliance is binary because the standards are: a value is inside the limit or
 # it is not, and that determination stays quotable.  Severity is a second,

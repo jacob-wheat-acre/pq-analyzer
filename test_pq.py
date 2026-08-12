@@ -3903,6 +3903,217 @@ def _sample_documents(outdir):
     return [Path(p) for p in paths if p is not None]
 
 
+class TestANSIVoltageRanges:
+    """C84.1 has two named ranges and rates sustained voltage, not events.
+
+    The tool previously carried one symmetric band and judged it on the meter's
+    within-interval extremes, so a sag both failed a steady-state standard that
+    does not cover it and was counted again against ITIC.
+    """
+
+    NOMINAL = 277.0
+
+    def _frame(self, avg, interval_min=None, n=1000):
+        import pandas as pd
+        idx = pd.date_range("2026-01-01", periods=n, freq="30s")
+        df = pd.DataFrame({"voltage_a": pd.Series(avg, index=idx)})
+        if interval_min is not None:
+            df["voltage_a_min"] = pd.Series(interval_min, index=idx)
+            df["voltage_a_peak"] = pd.Series(avg, index=idx)
+        return df
+
+    def _thresh(self, **kw):
+        return Thresholds(nominal_voltage=self.NOMINAL, **kw)
+
+    # ── The bands themselves ─────────────────────────────────────────────────
+    @pytest.mark.parametrize("nominal,a_min,a_max,b_min,b_max", [
+        # ANSI C84.1-2016 Table 1, service voltage. The standard prints these
+        # rounded to whole volts, so 208 lands a few tenths off its published
+        # 197/218 and 191/220 — everything else reproduces exactly.
+        (120, 114.0, 126.0, 110.0, 127.0),
+        (240, 228.0, 252.0, 220.0, 254.0),
+        (480, 456.0, 504.0, 440.0, 508.0),
+    ])
+    def test_the_bands_match_the_published_table(self, nominal, a_min, a_max,
+                                                 b_min, b_max):
+        from pq_constants import ansi_bands
+        b = ansi_bands(nominal)
+        assert b["a_min"] == pytest.approx(a_min, abs=0.05)
+        assert b["a_max"] == pytest.approx(a_max, abs=0.05)
+        assert b["b_min"] == pytest.approx(b_min, abs=0.05)
+        assert b["b_max"] == pytest.approx(b_max, abs=0.05)
+
+    def test_range_b_is_not_symmetric(self):
+        """The low side is wider, and a symmetric band would misjudge both ends."""
+        from pq_constants import ansi_bands
+        b = ansi_bands(120)
+        assert b["b_min"] == pytest.approx(110.0)
+        assert b["b_max"] == pytest.approx(127.0)
+        assert (120 - b["b_min"]) > (b["b_max"] - 120)
+
+    @pytest.mark.parametrize("nominal", [2400, 4160, 13200, 13800, 34500])
+    def test_over_600_v_uses_its_own_table_1_group(self, nominal):
+        """C84.1 gives systems over 600 V their own row, tighter below nominal.
+
+        A primary-metered customer still has their own transformation between
+        this meter and their equipment, and the standard reserves that headroom
+        for the drop through it. The −5% that applies on a secondary service
+        would put the limit 2.5% of nominal below where C84.1 sets it — on a
+        13.2 kV service, 330 V of undervoltage that would read as a pass.
+        """
+        from pq_constants import ansi_bands
+        b = ansi_bands(nominal)
+        assert b["group"] == "over_600v"
+        assert b["a_min"] == pytest.approx(nominal * 0.975)
+        assert b["a_max"] == pytest.approx(nominal * 1.05)
+        assert b["b_min"] == pytest.approx(nominal * 0.95)
+        assert b["b_max"] == pytest.approx(nominal * 1.058)
+        assert b["range_b_evaluated"] is True
+
+    def test_the_two_groups_differ_only_below_nominal(self):
+        from pq_constants import ansi_bands
+        lv, mv = ansi_bands(480.0), ansi_bands(13200.0)
+        assert lv["group"] == "under_600v" and mv["group"] == "over_600v"
+        # Same ceilings, tighter floors.
+        assert lv["a_max"] / 480.0 == pytest.approx(mv["a_max"] / 13200.0)
+        assert (mv["a_min"] / 13200.0) > (lv["a_min"] / 480.0)
+        assert (mv["b_min"] / 13200.0) > (lv["b_min"] / 480.0)
+
+    def test_the_grouping_holds_on_both_bases(self):
+        """The threshold is compared against whatever nominal it is handed.
+
+        That works because the groups do not overlap line-to-neutral either:
+        600 V L-L is 346 V L-N and 2400 V L-L is 1386 V L-N.
+        """
+        from pq_constants import ansi_bands
+        assert ansi_bands(600.0)["group"] == "under_600v"      # 600 V L-L
+        assert ansi_bands(346.4)["group"] == "under_600v"      # its L-N
+        assert ansi_bands(2400.0)["group"] == "over_600v"      # 2.4 kV L-L
+        assert ansi_bands(1385.6)["group"] == "over_600v"      # its L-N
+
+    def test_above_34_5_kv_no_range_is_claimed(self):
+        """Table 1 stops there; a band invented past it would still print as one."""
+        from pq_constants import ansi_bands
+        b = ansi_bands(69000.0)
+        assert b["group"] == "out_of_scope"
+        assert b["range_a_evaluated"] is False
+        assert b["a_min"] is None and b["b_min"] is None
+        assert "does not cover" in b["range_b_note"]
+
+    def test_an_out_of_scope_nominal_reports_unavailable_with_the_reason(self):
+        import pandas as pd
+        idx = pd.date_range("2026-01-01", periods=50, freq="30s")
+        df = pd.DataFrame({"voltage_a": pd.Series(39800.0, index=idx)})
+        res = check_voltage_compliance(df, Thresholds(nominal_voltage=39837.0))
+        assert res["available"] is False
+        assert "does not cover" in res["error"]
+
+    # ── What decides the verdict ─────────────────────────────────────────────
+    def test_a_sag_inside_one_interval_does_not_fail_c841(self):
+        """The Queensburg case: 2 of 5,344 interval minima dipped, means held.
+
+        C84.1 rates sustained voltage. Failing it on a within-interval minimum
+        both misapplies the standard and double-counts the event, which is
+        already graded on depth and duration against ITIC.
+        """
+        import pandas as pd
+        avg  = pd.Series(282.0, index=range(1000))
+        mins = avg.copy(); mins.iloc[500] = 258.6
+        df = self._frame(avg.values, mins.values)
+        res = check_voltage_compliance(df, self._thresh())
+        st  = res["phases"]["voltage_a"]
+        assert st["band"] == "range_a"
+        assert st["pct_out_of_bounds"] == 0.0
+        # The excursion is not discarded — it is reported, under its own key.
+        assert st["min_interval_v"] == pytest.approx(258.6)
+        assert st["used_interval_extremes"] is True
+
+    def test_a_sustained_excursion_still_fails(self):
+        """Dropping the extremes must not make the check blind to real undervoltage."""
+        import pandas as pd
+        avg = pd.Series(282.0, index=range(1000))
+        avg.iloc[:400] = 258.0
+        res = check_voltage_compliance(self._frame(avg.values), self._thresh())
+        st  = res["phases"]["voltage_a"]
+        assert st["band"] == "range_b"
+        assert st["pct_out_of_bounds"] == pytest.approx(40.0)
+
+    # ── The three-state verdict ──────────────────────────────────────────────
+    def test_an_excursion_inside_range_b_is_named_as_range_b(self):
+        import pandas as pd
+        avg = pd.Series(282.0, index=range(1000))
+        avg.iloc[500] = 258.0           # below Range A, inside Range B
+        res = check_voltage_compliance(self._frame(avg.values), self._thresh())
+        st  = res["phases"]["voltage_a"]
+        assert st["band"] == "range_b"
+        assert st["pct_range_b"] == pytest.approx(0.1)
+        assert st["pct_outside_b"] == 0.0
+
+    def test_leaving_range_b_is_a_different_finding(self):
+        import pandas as pd
+        avg = pd.Series(282.0, index=range(1000))
+        avg.iloc[500] = 240.0           # below Range B as well
+        res = check_voltage_compliance(self._frame(avg.values), self._thresh())
+        st  = res["phases"]["voltage_a"]
+        assert st["band"] == "outside_b"
+        assert st["pct_outside_b"] == pytest.approx(0.1)
+
+    def test_sustained_range_b_outranks_a_brief_one(self):
+        """C84.1 permits Range B only if excursions are limited in duration."""
+        import pandas as pd
+        from pq_report import _grade_voltage_band
+        avg = pd.Series(282.0, index=range(1000))
+
+        brief = avg.copy(); brief.iloc[500] = 258.0
+        held  = avg.copy(); held.iloc[:400] = 258.0
+        g_brief = _grade_voltage_band(
+            check_voltage_compliance(self._frame(brief.values), self._thresh()))
+        g_held = _grade_voltage_band(
+            check_voltage_compliance(self._frame(held.values), self._thresh()))
+        assert g_brief["band"] == "minor"
+        assert g_held["band"] == "significant"
+        assert "corrected within a reasonable time" in strip_marks(g_held["reason"])
+
+    def test_a_compliant_service_grades_as_compliant(self):
+        import pandas as pd
+        from pq_report import _grade_voltage_band
+        avg = pd.Series(282.0, index=range(1000))
+        g = _grade_voltage_band(
+            check_voltage_compliance(self._frame(avg.values), self._thresh()))
+        assert g["band"] == "compliant"
+
+    # ── The Measured cell ────────────────────────────────────────────────────
+    def test_the_cell_never_contradicts_its_own_verdict(self):
+        """A cell opening on 258.6 V and closing on "in Range A" reads as wrong.
+
+        The two numbers answer different questions, so the extreme is quoted
+        under its own clause naming where it *is* graded.
+        """
+        import pandas as pd
+        from pq_report import _voltage_band_cell
+        avg  = pd.Series(282.0, index=range(1000))
+        mins = avg.copy(); mins.iloc[500] = 258.6
+        res = check_voltage_compliance(
+            self._frame(avg.values, mins.values), self._thresh())
+        cell = strip_marks(
+            _voltage_band_cell(res["phases"]["voltage_a"], res, "Phase A: "))
+        assert "All intervals in Range A" in cell
+        assert "Within-interval extremes 258.6" in cell
+        assert "ITIC" in cell
+
+    def test_an_outside_b_cell_quotes_the_range_b_edge(self):
+        """Citing the Range A limit there reads as a classification one band out."""
+        import pandas as pd
+        from pq_report import _voltage_band_cell
+        avg = pd.Series(282.0, index=range(1000))
+        avg.iloc[500] = 240.0
+        res = check_voltage_compliance(self._frame(avg.values), self._thresh())
+        cell = strip_marks(
+            _voltage_band_cell(res["phases"]["voltage_a"], res, "Phase A: "))
+        assert "outside Range B" in cell
+        assert "all below 253.9 V" in cell
+
+
 class TestSeverityGrading:
     """Severity is a second axis beside compliance, not a replacement for it.
 

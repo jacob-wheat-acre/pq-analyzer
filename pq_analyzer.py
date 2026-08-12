@@ -106,7 +106,13 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 STANDARDS APPLIED
-  Voltage       ANSI C84.1 Range A  (nominal ± volt-tol, default ±5%)
+  Voltage       ANSI C84.1-2016 service voltage, on interval averages: Range A,
+                Range B, or outside both. Table 1 has two groups —
+                  120–600 V     Range A ±5%,        Range B −8.33%/+5.83%
+                  2.4–34.5 kV   Range A 97.5–105%,  Range B 95–105.8%
+                The over-600 V group is tighter below nominal, reserving that
+                headroom for the drop through the customer's own transformation.
+                Sags and swells are graded against ITIC, not against C84.1.
   Current THD   IEEE 519-2022 TDD when --isc is provided; raw interval THD
                 fallback otherwise (light-load intervals < 10% of peak demand
                 are automatically excluded to prevent divide-by-zero blowup)

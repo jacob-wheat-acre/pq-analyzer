@@ -15,6 +15,7 @@ from matplotlib.patches import Patch
 
 from pq_constants import (
     Thresholds,
+    ansi_bands,
     _h519_limit,
     _itic_upper_v,
     _itic_lower_v,
@@ -215,8 +216,8 @@ def plot_overview(
             # The allowed band, in gray rather than a status hue: on this chart
             # the colors carry phase identity, and a red limit line beside an
             # orange phase trace would read as one more series.
-            vmin = thresh.nominal_voltage * (1 - thresh.volt_tolerance)
-            vmax = thresh.nominal_voltage * (1 + thresh.volt_tolerance)
+            _b   = ansi_bands(thresh.nominal_voltage)
+            vmin, vmax = _b["a_min"], _b["a_max"]
             ax.axhspan(vmin, vmax, color="#333333", alpha=0.06, linewidth=0,
                        zorder=0, label=f"Allowed range ({vmin:.0f}–{vmax:.0f} V)")
             ax.axhline(thresh.nominal_voltage, color="gray", ls=":", lw=0.8, alpha=0.6)
@@ -285,10 +286,23 @@ def plot_voltage(
         ax.plot(df.index, df[col], color=colors.get(col, "gray"),
                 lw=0.8, label=labels.get(col, col))
 
-    vmin = thresh.nominal_voltage * (1 - thresh.volt_tolerance)
-    vmax = thresh.nominal_voltage * (1 + thresh.volt_tolerance)
-    ax.axhline(vmin, color="red",    ls="--", lw=1.0, label=f"ANSI lower ({vmin:.1f} V)")
-    ax.axhline(vmax, color="orange", ls="--", lw=1.0, label=f"ANSI upper ({vmax:.1f} V)")
+    # The bands come from the result rather than being recomputed here, so the
+    # line drawn across the chart is the same limit the verdict was taken
+    # against and cannot drift from it.
+    bands = ansi_bands(thresh.nominal_voltage)
+    vmin = volt_result.get("range_v", (bands["a_min"], bands["a_max"]))[0]
+    vmax = volt_result.get("range_v", (bands["a_min"], bands["a_max"]))[1]
+    rng_b = volt_result.get("range_b_v") or (
+        (bands["b_min"], bands["b_max"]) if bands["range_b_evaluated"] else None)
+    if rng_b:
+        # Range B as a band rather than two more dashed lines: the chart already
+        # carries three traces and two Range A limits, and what the reader needs
+        # from Range B is the region, not its exact edges.
+        ax.axhspan(rng_b[0], vmin, color="orange", alpha=0.07)
+        ax.axhspan(vmax, rng_b[1], color="orange", alpha=0.07,
+                   label=f"ANSI Range B ({rng_b[0]:.0f}–{rng_b[1]:.0f} V)")
+    ax.axhline(vmin, color="red",    ls="--", lw=1.0, label=f"Range A lower ({vmin:.1f} V)")
+    ax.axhline(vmax, color="orange", ls="--", lw=1.0, label=f"Range A upper ({vmax:.1f} V)")
     ax.axhline(thresh.nominal_voltage, color="gray", ls=":", lw=0.8, alpha=0.6)
 
     viol_ts = volt_result.get("violation_timestamps", pd.DatetimeIndex([]))
@@ -646,8 +660,8 @@ def plot_neutral_health(
             color=_PH_A, lw=0.8, label="L1-N (voltage_a)")
     ax.plot(aligned.index, aligned["voltage_b"],
             color=_PH_B, lw=0.8, label="L2-N (voltage_b)")
-    vmin = nom * (1 - thresh.volt_tolerance)
-    vmax = nom * (1 + thresh.volt_tolerance)
+    _b = ansi_bands(nom)
+    vmin, vmax = _b["a_min"], _b["a_max"]
     ax.axhline(vmin, color="red", ls="--", lw=0.8, alpha=0.7, label=f"ANSI lower ({vmin:.1f} V)")
     ax.axhline(vmax, color="red", ls="--", lw=0.8, alpha=0.7, label=f"ANSI upper ({vmax:.1f} V)")
     ax.set_ylabel("Voltage (V)")

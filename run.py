@@ -1617,10 +1617,13 @@ class PQApp(tk.Tk):
             "?newsearch=true&queryText=IEEE+1250-2011",
         )
 
-        txt.insert("end", "  ANSI C84.1-2020 — Electric Power Systems Voltage Ratings\n", "h2")
+        txt.insert("end", "  ANSI C84.1-2016 — Electric Power Systems Voltage Ratings\n", "h2")
         txt.insert("end",
                    "  Defines Range A (normal operating band, ±5% of nominal) and Range B\n"
-                   "  (occasional excursions).  120 V system: Range A = 114–126 V.\n"
+                   "  (for voltages arising from practical design and operating\n"
+                   "  conditions, to be corrected within a reasonable time).\n"
+                   "  120 V system, service voltage: Range A = 114–126 V, Range B = 110–127 V.\n"
+                   "  Over 600 V (2.4–34.5 kV): Range A = 97.5–105%, Range B = 95–105.8%.\n"
                    "  Published by NEMA — not available on IEEE Xplore.\n", "body")
         txt.insert("end", "  Available at ", "note")
         _add_link("webstore.ansi.org ↗",
@@ -1860,12 +1863,25 @@ class PQApp(tk.Tk):
         concept(
             "ANSI C84.1 Voltage Bands",
             "Range A: steady-state service voltage should remain within ±5% of nominal\n"
-            "(e.g., 114–126 V on a 120 V system).  Utilities are expected to supply\n"
-            "within Range A under normal conditions.\n"
+            "(114–126 V on a 120 V system; 456–504 V on a 480 V system).  Utilities are\n"
+            "expected to supply within Range A under normal conditions.\n"
             "\n"
-            "Range B: occasional short-duration excursions outside Range A are tolerated\n"
-            "during abnormal system conditions.  Sustained Range B voltage requires a\n"
-            "corrective action plan.",
+            "Range B: 110–127 V on a 120 V base — −8.33% below nominal but only +5.83%\n"
+            "above it.  It covers voltages that result from practical design and\n"
+            "operating conditions.  C84.1 asks that excursions into Range B be limited in\n"
+            "extent, frequency and duration, and corrected within a reasonable time, so a\n"
+            "sustained Range B voltage is a finding even though it is not outside the\n"
+            "standard.\n"
+            "\n"
+            "Systems over 600 V (2.4–34.5 kV) get their own row, and its lower limits are\n"
+            "tighter: Range A 97.5–105%, Range B 95–105.8%.  The upper limits are the\n"
+            "same.  The extra 2.5% on the low side is reserved for the drop through the\n"
+            "customer's own transformation, which sits below a primary meter.\n"
+            "\n"
+            "Both are *service* voltage, measured at the point of delivery, which is where\n"
+            "this meter sits.  C84.1 states a second, wider set for utilization voltage at\n"
+            "the equipment terminals; that one allows for the customer's wiring drop and\n"
+            "is not what this tool applies.",
         )
 
         concept(
@@ -2105,15 +2121,31 @@ class PQApp(tk.Tk):
 
         concept(
             "Voltage Compliance — ANSI C84.1",
-            "Reports what percentage of 5-minute intervals fall inside Range A (±5% of\n"
-            "nominal), Range B (±8.3%), or outside both bands.  When the meter's max-min\n"
-            "max-min record is available, peak and minimum voltage within each interval\n"
-            "are used to detect momentary exceedances that the interval average would mask.\n"
+            "Reports what percentage of recording intervals fall inside Range A, inside\n"
+            "Range B, or outside both.  On a 120 V base the service-voltage ranges are\n"
+            "114–126 V (Range A, ±5%) and 110–127 V (Range B, −8.33%/+5.83%); both scale\n"
+            "with the nominal.  Range B is not symmetric — the standard tolerates the\n"
+            "drop of a long or loaded feeder further than it tolerates overvoltage.\n"
+            "\n"
+            "The verdict is taken from the interval average.  C84.1 rates sustained\n"
+            "service voltage: an excursion shorter than one interval is a sag or swell,\n"
+            "and those are graded on depth and duration against the ITIC envelope under\n"
+            "Voltage Events.  Where the meter's max-min record exists, the within-interval\n"
+            "extremes are still read and reported beside the averages, labelled as such.\n"
             "\n"
             "Split-phase services (120/240 V, no voltage_c channel) are automatically\n"
             "detected and voltage_a / voltage_b are evaluated independently against 120 V\n"
             "bands.  Three-phase services evaluate all three phases against the nominal\n"
-            "L-N voltage derived from the entered nominal value.",
+            "L-N voltage derived from the entered nominal value.  A primary-metered\n"
+            "service takes its nominal from the Primary voltage field instead: nothing in\n"
+            "the meter file names the primary voltage, so it is entered, not inferred.\n"
+            "\n"
+            "Above 600 V, C84.1 Table 1 uses a separate group, and it is TIGHTER below\n"
+            "nominal, not looser: Range A is 97.5–105% and Range B is 95–105.8%.  A\n"
+            "primary-metered customer still has their own transformation between the\n"
+            "meter and their equipment, and the standard reserves that headroom for the\n"
+            "drop through it.  Table 1 stops at 34.5 kV; above that no C84.1 range is\n"
+            "claimed.",
         )
 
         concept(
