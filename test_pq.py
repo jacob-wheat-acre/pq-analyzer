@@ -6123,7 +6123,7 @@ def signature_letter(tmp_path_factory):
     doc = docx.Document(str(path))
     start = next(i for i, p in enumerate(doc.paragraphs)
                  if p.text.strip() == _SIG_NAME)
-    return doc, doc.paragraphs[start:start + 5]
+    return doc, doc.paragraphs[start:start + 4]
 
 
 class TestSignatureBlock:
@@ -6163,11 +6163,7 @@ class TestSignatureBlock:
         assert r.font.size.pt == 10.0
         assert r.font.color is None or r.font.color.type is None
 
-    def test_line_4_is_blank(self, signature_letter):
-        _, lines = signature_letter
-        assert lines[3].text.strip() == ""
-
-    def test_line_5_is_a_live_mailto_link_in_outlook_teal(self, signature_letter):
+    def test_line_4_is_a_live_mailto_link_in_outlook_teal(self, signature_letter):
         """Styled like a link and behaves like one.
 
         A teal underlined run that does nothing when clicked is a small broken
@@ -6175,7 +6171,7 @@ class TestSignatureBlock:
         """
         from docx.oxml.ns import qn
         doc, lines = signature_letter
-        hyperlinks = lines[4]._p.findall(qn("w:hyperlink"))
+        hyperlinks = lines[3]._p.findall(qn("w:hyperlink"))
         assert hyperlinks, "the email address is not a hyperlink"
         run = hyperlinks[0].find(qn("w:r"))
         rpr = run.find(qn("w:rPr"))
@@ -6215,3 +6211,10 @@ class TestSignatureBlock:
         today = datetime.date.today()
         expected = f"{today:%B} {today.day}, {today.year}"
         assert expected in "\n".join(p.text for p in doc.paragraphs)
+
+    def test_there_is_no_blank_line_in_the_block(self, signature_letter):
+        """The four lines are contiguous — the address follows the title."""
+        _, lines = signature_letter
+        assert all(l.text.strip() or l._p.findall(
+            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}hyperlink")
+            for l in lines), "the signature block has a blank line in it"

@@ -1075,7 +1075,6 @@ def _signature_block(doc, engineer_name: str, engineer_title: str,
         Jacob Whitaker              bold, 11 pt, black
         Xcel Energy                 bold, 10 pt, brand red
         Manager, Electric Area Engineering    10 pt, black
-                                    (blank)
         jacob.b.whitaker@…          10 pt, Outlook link teal, live mailto
 
     Each line is its own paragraph with the space before and after removed, so
@@ -1109,7 +1108,6 @@ def _signature_block(doc, engineer_name: str, engineer_title: str,
     if engineer_title:
         line(engineer_title, size_pt=10)
     if engineer_email:
-        line("", size_pt=10)          # the blank line the format calls for
         p = doc.add_paragraph()
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
