@@ -182,7 +182,7 @@ _DERIVED_VARS = {"_isc_auto_var", "_details_open"}
 #: between sites would mean retyping one's own name and email each time, and
 #: a field left blank by accident goes out on a customer document.
 _STICKY_VARS = {"_eng_name_var", "_eng_title_var",
-                "_eng_phone_var", "_eng_email_var"}
+                "_eng_email_var"}
 
 
 def _resolve_secondary_v(svc_type: str, nominal_v: float) -> int:
@@ -700,12 +700,10 @@ class PQApp(tk.Tk):
 
         self._eng_name_var  = tk.StringVar()
         self._eng_title_var = tk.StringVar()
-        self._eng_phone_var = tk.StringVar()
         self._eng_email_var = tk.StringVar()
 
         _detail_row("Name",  self._eng_name_var,  "(e.g. Jacob Whitaker)")
         _detail_row("Title", self._eng_title_var, "(default: Electric Area Engineer)")
-        _detail_row("Phone", self._eng_phone_var, "(e.g. 303-555-0100)")
         _detail_row("Email", self._eng_email_var, "(e.g. jwhitaker@xcelenergy.com)")
 
         tk.Frame(self._details_frame, bg=_BG, height=6).pack()  # bottom padding
@@ -793,7 +791,7 @@ class PQApp(tk.Tk):
     def _clear_all(self):
         """Reset the service entries to the values they had when the window opened.
 
-        The engineer's own name, title, phone and email are left alone: they
+        The engineer's own name, title and email are left alone: they
         describe who is running the tool rather than which service was
         measured, and they go out on a customer document, where a field
         blanked by an unrelated button is worse than one left stale.
@@ -809,8 +807,8 @@ class PQApp(tk.Tk):
                 f"This resets {len(dirty)} entr"
                 f"{'y' if len(dirty) == 1 else 'ies'} — including the file, "
                 "the transformer and conductor pickers, and the site details "
-                "— back to their defaults.\n\nYour engineer name, title, phone "
-                "and email are kept.\n\nClear the rest?"):
+                "— back to their defaults.\n\nYour engineer name, title and "
+                "email are kept.\n\nClear the rest?"):
             return
 
         for name, default in self._input_defaults.items():
@@ -1318,7 +1316,6 @@ class PQApp(tk.Tk):
             "substation":     self._subst_var.get().strip(),
             "engineer":       self._eng_name_var.get().strip(),
             "engineer_title": self._eng_title_var.get().strip(),
-            "engineer_phone": self._eng_phone_var.get().strip(),
             "engineer_email": self._eng_email_var.get().strip(),
             "xfmr_key":       xfmr_key,
             "kva":            kva,
@@ -1523,14 +1520,12 @@ class PQApp(tk.Tk):
             site_name=params["site"] or stem,
             site_address=params["address"],
             engineer_name=params["engineer"],
-            engineer_contact="",
             outdir=outdir,
             stem=stem,
             meter_id=params["meter_id"],
             feeder=params["feeder"],
             substation=params["substation"],
             engineer_title=params["engineer_title"],
-            engineer_phone=params["engineer_phone"],
             engineer_email=params["engineer_email"],
         )
 
@@ -1543,7 +1538,6 @@ class PQApp(tk.Tk):
             outdir=outdir,
             stem=stem,
             engineer_title=params["engineer_title"],
-            engineer_phone=params["engineer_phone"],
             engineer_email=params["engineer_email"],
         )
         if letter:

@@ -48,6 +48,7 @@ try:
     from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.opc.constants import RELATIONSHIP_TYPE as _DOCX_REL
     _DOCX_AVAILABLE = True
 except ImportError:
     _DOCX_AVAILABLE = False
@@ -1016,6 +1017,104 @@ def _embed_plot(doc, outdir: Optional[Path], stem: str, name: str,
         r.font.size = Pt(8)
         r.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
     return True
+
+
+#: Outlook's hyperlink colour. The signature is read beside emails from the
+#: same person, so the address is styled the way their mail client styles one.
+_LINK_TEAL = RGBColor(0x46, 0x78, 0x86) if _DOCX_AVAILABLE else None
+
+
+def _add_hyperlink(paragraph, url: str, text: str, *,
+                   size_pt: float = 10, color=None, bold: bool = False) -> None:
+    """Append a real hyperlink to ``paragraph``.
+
+    python-docx has no API for this: a link is a w:hyperlink element pointing at
+    an external relationship on the document part, so both have to be built by
+    hand. Worth the code rather than styling plain text to look like a link --
+    the address in a customer letter is there to be clicked, and a blue-and-
+    underlined run that does nothing when clicked is a small broken promise.
+    """
+    part  = paragraph.part
+    r_id  = part.relate_to(url, _DOCX_REL.HYPERLINK, is_external=True)
+    link  = OxmlElement("w:hyperlink")
+    link.set(qn("r:id"), r_id)
+
+    run  = OxmlElement("w:r")
+    rPr  = OxmlElement("w:rPr")
+    font = OxmlElement("w:rFonts")
+    for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+        font.set(qn(attr), _BASE_FONT)
+    rPr.append(font)
+    if bold:
+        rPr.append(OxmlElement("w:b"))
+    sz = OxmlElement("w:sz")                      # half-points
+    sz.set(qn("w:val"), str(int(size_pt * 2)))
+    rPr.append(sz)
+    if color is not None:
+        c = OxmlElement("w:color")
+        c.set(qn("w:val"), str(color))
+        rPr.append(c)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    rPr.append(underline)
+    run.append(rPr)
+
+    t = OxmlElement("w:t")
+    t.text = text
+    run.append(t)
+    link.append(run)
+    paragraph._p.append(link)
+
+
+def _signature_block(doc, engineer_name: str, engineer_title: str,
+                     engineer_email: str = "") -> None:
+    """The sign-off, identical wherever a document is signed.
+
+    Four lines, in the house format:
+
+        Jacob Whitaker              bold, 11 pt, black
+        Xcel Energy                 bold, 10 pt, brand red
+        Manager, Electric Area Engineering    10 pt, black
+                                    (blank)
+        jacob.b.whitaker@…          10 pt, Outlook link teal, live mailto
+
+    Each line is its own paragraph with the space before and after removed, so
+    the block reads as one address rather than four stacked paragraphs -- Word's
+    Normal style puts 8 pt between paragraphs, which is what made the old
+    sign-off sprawl.
+
+    No telephone number. That is a policy decision, not an omission: the letter
+    invites a reply instead.
+    """
+    def line(text, *, size_pt, bold=False, color=None):
+        p = doc.add_paragraph()
+        pf = p.paragraph_format
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(0)
+        run = p.add_run(text)
+        run.bold = bold
+        run.font.size = Pt(size_pt)
+        if color is not None:
+            run.font.color.rgb = color
+        _set_font(run)
+        return p
+
+    # Black is left unset rather than set to 000000. It is already the default,
+    # and a document whose only explicit colours are the ones that mean
+    # something stays checkable -- there is a test asserting the letter paints
+    # from the brand palette and nothing else, and an explicit black is a
+    # colour that means nothing arriving in front of it.
+    line(engineer_name or "[Engineer Name]", size_pt=11, bold=True)
+    line("Xcel Energy", size_pt=10, bold=True, color=_XE_RED)
+    if engineer_title:
+        line(engineer_title, size_pt=10)
+    if engineer_email:
+        line("", size_pt=10)          # the blank line the format calls for
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        _add_hyperlink(p, f"mailto:{engineer_email}", engineer_email,
+                       size_pt=10, color=_LINK_TEAL)
 
 
 def _add_page_field(paragraph, size_pt: float = 8) -> None:
@@ -4852,23 +4951,11 @@ def _word_appendix(doc, report, thresh, df) -> None:
     doc.add_paragraph()
 
 
-def _word_signoff(doc, engineer_name, engineer_title, engineer_phone, engineer_email,
-                  engineer_contact) -> None:
-    doc.add_paragraph("Sincerely,")
-    doc.add_paragraph()
-    p = doc.add_paragraph()
-    _bold(p, engineer_name or "[Engineer Name]")
-    title_line = engineer_title or "Electric Area Engineer"
-    doc.add_paragraph(title_line)
-    doc.add_paragraph("Xcel Energy — PSCo Area Engineering")
-    # Phone / email — show individually if provided, fall back to combined contact string
-    if engineer_phone or engineer_email:
-        if engineer_phone:
-            doc.add_paragraph(f"Phone: {engineer_phone}")
-        if engineer_email:
-            doc.add_paragraph(f"Email: {engineer_email}")
-    elif engineer_contact:
-        doc.add_paragraph(engineer_contact)
+# The engineering report has no sign-off: it is not addressed to anyone, and
+# who prepared it is a "Prepared by" row in the header table. The signature
+# block that used to live here was unreachable, carried a phone number, and
+# used a format nothing else in the tool used -- three ways for it to be wrong
+# by the time anyone wired it back up. _signature_block is the one sign-off.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4881,7 +4968,6 @@ def generate_word_report(
     site_name: str,
     site_address: str,
     engineer_name: str,
-    engineer_contact: str,
     outdir: Path,
     stem: str,
     *,
@@ -4890,7 +4976,6 @@ def generate_word_report(
     feeder: str = "",
     substation: str = "",
     engineer_title: str = "",
-    engineer_phone: str = "",
     engineer_email: str = "",
 ) -> Optional[Path]:
     """Generate a Word (.docx) power quality response letter matching the PSC template."""
@@ -5730,7 +5815,6 @@ def generate_customer_letter(
     stem: str,
     *,
     engineer_title: str = "",
-    engineer_phone: str = "",
     engineer_email: str = "",
 ) -> Optional[Path]:
     """Write the customer document for this service class.
@@ -5777,6 +5861,15 @@ def generate_customer_letter(
     sub = doc.add_paragraph()
     _normal(sub, f"What we measured at {vocab['site']}, and what it means",
             size_pt=11)
+
+    # The date belongs at the top, where a letter's date goes. It used to sit
+    # under the signature, which is not the house sign-off format -- and a
+    # customer letter that carries no date at all is a filing problem for
+    # whoever keeps it. Written out rather than 2026-08-13: this is the one
+    # date in the document a reader reads as prose, and %-d is not portable.
+    _today = datetime.date.today()
+    dt = doc.add_paragraph()
+    _normal(dt, f"{_today:%B} {_today.day}, {_today.year}", size_pt=10)
 
     intro = doc.add_table(rows=3, cols=2)
     intro.style = "Table Grid"
@@ -6047,22 +6140,19 @@ def generate_customer_letter(
         "The engineer who reviewed your measurements is "
         + (", ".join(contact_bits) if contact_bits else "listed below")
         + ". "
-        + ("Telephone " + engineer_phone + ". " if engineer_phone else "")
-        + ("Email " + engineer_email + ". " if engineer_email else "")
-        + "You can reply to this letter with any questions.")
+        # No telephone number anywhere in the letter. The address in the
+        # sign-off below is the route, and it is a live link.
+        + ("Their email address is below, and you "
+           if engineer_email else "You ")
+        + "can reply to this letter with any questions.")
     _body(doc,
         "The measurements behind this letter were recorded and reviewed in detail. "
         "If you engage an electrician and they would find the underlying "
         "measurements useful, ask the engineer named above and they can discuss "
         "them directly.")
 
-    sign = doc.add_paragraph()
-    _normal(sign, engineer_name or "[Engineer Name]", size_pt=11)
-    if engineer_title:
-        t = doc.add_paragraph()
-        _normal(t, engineer_title, size_pt=10)
-    d = doc.add_paragraph()
-    _normal(d, str(datetime.date.today()), size_pt=10)
+    doc.add_paragraph()
+    _signature_block(doc, engineer_name, engineer_title, engineer_email)
 
     Path(outdir).mkdir(parents=True, exist_ok=True)
     try:

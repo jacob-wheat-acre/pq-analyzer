@@ -2600,14 +2600,12 @@ class TestClearAll:
         monkeypatch.setattr(run.messagebox, "askyesno", lambda *a, **k: True)
         self._fill(gui_app)
         gui_app._eng_title_var.set("Electric Area Engineer")
-        gui_app._eng_phone_var.set("303-555-0100")
         gui_app._eng_email_var.set("a@example.com")
 
         gui_app._clear_all()
 
         assert gui_app._eng_name_var.get() == "A. Engineer"
         assert gui_app._eng_title_var.get() == "Electric Area Engineer"
-        assert gui_app._eng_phone_var.get() == "303-555-0100"
         assert gui_app._eng_email_var.get() == "a@example.com"
         # ...while the service they were entered against is gone.
         assert gui_app._site_var.get() == ""
@@ -2804,7 +2802,7 @@ class TestAFileHoldingSeveralSessions:
         plot_overview(ds, th, outdir=tmp_path, stem="two")
         doc = docx.Document(str(generate_word_report(
             report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
-            engineer_name="E", engineer_contact="", outdir=tmp_path, stem="two")))
+            engineer_name="E", outdir=tmp_path, stem="two")))
         text = "\n".join(p.text for p in doc.paragraphs)
         assert "More than one session in this file" in text
         assert "session 1 of 2" in text
@@ -2868,7 +2866,7 @@ class TestAFileHoldingSeveralSessions:
         plot_overview(ds, th, outdir=tmp_path, stem="one")
         doc = docx.Document(str(generate_word_report(
             report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
-            engineer_name="E", engineer_contact="", outdir=tmp_path, stem="one")))
+            engineer_name="E", outdir=tmp_path, stem="one")))
         text = "\n".join(p.text for p in doc.paragraphs)
         assert "More than one session" not in text
 
@@ -3896,7 +3894,7 @@ def _sample_documents(outdir):
         stem = source.stem
         paths.append(generate_word_report(
             report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
-            engineer_name="E", engineer_contact="", outdir=outdir, stem=stem))
+            engineer_name="E", outdir=outdir, stem=stem))
         paths.append(generate_customer_letter(
             rep, th, "1 Test St", "Eng", outdir, stem))
     assert paths, "no sample recordings available to style-check"
@@ -4963,7 +4961,7 @@ class TestChannelAppendix:
         rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
         path = generate_word_report(
             report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
-            engineer_name="E", engineer_contact="", outdir=out, stem="ch")
+            engineer_name="E", outdir=out, stem="ch")
         return docx.Document(str(path))
 
     @staticmethod
@@ -5160,7 +5158,7 @@ class TestRecordingOverview:
 
         rpt = docx.Document(str(generate_word_report(
             report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
-            engineer_name="E", engineer_contact="", outdir=tmp_path, stem="ov")))
+            engineer_name="E", outdir=tmp_path, stem="ov")))
         heads = [p.text for p in rpt.paragraphs if p.text.strip()]
         assert "Recording Overview" in heads
         assert heads.index("Recording Overview") < heads.index(
@@ -5400,7 +5398,7 @@ class TestCustomerLetter:
         generate_word_report(
             report=rep, thresh=th, ds=ds, outdir=tmp_path, stem="t",
             site_name="Site", site_address="1 Test St",
-            engineer_name="A. Engineer", engineer_contact="",
+            engineer_name="A. Engineer",
             engineer_title="Electric Area Engineer")
         written = _glob.glob(str(tmp_path / "*_internal_engineering_report.docx"))
         assert written, "the internal report is named as such on disk"
@@ -5817,7 +5815,7 @@ class TestEngineeringReportReview:
         rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
         path = generate_word_report(
             report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
-            engineer_name="E", engineer_contact="", outdir=out, stem="sg")
+            engineer_name="E", outdir=out, stem="sg")
         return Document(str(path))
 
     @staticmethod
@@ -6088,3 +6086,132 @@ class TestLetterITICCurve:
         th = Thresholds(nominal_voltage=277.0, customer_class="sg")
         again = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, stem)
         assert "Every dip and surge we recorded" not in self._text(again)
+
+
+#: The signature block is built once and inspected by several tests; a
+#: module-scoped fixture keeps it to one letter rather than eight.
+_SIG_NAME  = "Jacob Whitaker"
+_SIG_TITLE = "Manager, Electric Area Engineering"
+_SIG_EMAIL = "jacob.b.whitaker@xcelenergy.com"
+
+
+@pytest.fixture(scope="module")
+def signature_letter(tmp_path_factory):
+    import docx
+    import pq_analysis as An
+    from pq_report import generate_report, generate_customer_letter
+    out = tmp_path_factory.mktemp("sig")
+    ds = extract_dataset(MockAdapter(duration_hours=6.0, nominal=277.0),
+                         ChannelMapper())
+    th = Thresholds(nominal_voltage=277.0, customer_class="sg")
+    df = ds.df
+    ev = An.detect_events(ds, th)
+    rep = generate_report(
+        ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+        An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+        An.check_current_imbalance(df, th), An.check_demand(df, th),
+        An.check_individual_harmonics(df, th),
+        An.check_individual_voltage_harmonics(df, th),
+        An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+        An.check_harmonic_statistics(df, th), ev, th,
+        neutral_health_result=An.check_neutral_health(ds, th),
+        itic_result=An.check_itic(ev, th), flicker_result=An.check_flicker(df, th))
+    rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+    path = generate_customer_letter(
+        rep, th, "1 Test St", _SIG_NAME, out, "sig",
+        engineer_title=_SIG_TITLE, engineer_email=_SIG_EMAIL)
+    doc = docx.Document(str(path))
+    start = next(i for i, p in enumerate(doc.paragraphs)
+                 if p.text.strip() == _SIG_NAME)
+    return doc, doc.paragraphs[start:start + 5]
+
+
+class TestSignatureBlock:
+    """The sign-off has a house format, and it is the same wherever it appears.
+
+    Four lines, no telephone number. Each property here was specified rather
+    than chosen, so each is asserted rather than eyeballed.
+    """
+
+    def test_line_1_is_the_name_bold_11pt(self, signature_letter):
+        _, lines = signature_letter
+        r = lines[0].runs[0]
+        assert r.text == _SIG_NAME
+        assert r.bold is True
+        assert r.font.name == "Arial"
+        assert r.font.size.pt == 11.0
+        # Black is the default; setting it explicitly would add a colour that
+        # means nothing to a document checked for painting only from the palette.
+        assert r.font.color is None or r.font.color.type is None
+
+    def test_line_2_is_the_company_in_brand_red(self, signature_letter):
+        from pq_report import _XE_RED
+        _, lines = signature_letter
+        r = lines[1].runs[0]
+        assert r.text == "Xcel Energy"
+        assert r.bold is True
+        assert r.font.name == "Arial"
+        assert r.font.size.pt == 10.0
+        assert r.font.color.rgb == _XE_RED
+
+    def test_line_3_is_the_title_not_bold(self, signature_letter):
+        _, lines = signature_letter
+        r = lines[2].runs[0]
+        assert r.text == _SIG_TITLE
+        assert not r.bold
+        assert r.font.name == "Arial"
+        assert r.font.size.pt == 10.0
+        assert r.font.color is None or r.font.color.type is None
+
+    def test_line_4_is_blank(self, signature_letter):
+        _, lines = signature_letter
+        assert lines[3].text.strip() == ""
+
+    def test_line_5_is_a_live_mailto_link_in_outlook_teal(self, signature_letter):
+        """Styled like a link and behaves like one.
+
+        A teal underlined run that does nothing when clicked is a small broken
+        promise in a document whose whole point is to invite a reply.
+        """
+        from docx.oxml.ns import qn
+        doc, lines = signature_letter
+        hyperlinks = lines[4]._p.findall(qn("w:hyperlink"))
+        assert hyperlinks, "the email address is not a hyperlink"
+        run = hyperlinks[0].find(qn("w:r"))
+        rpr = run.find(qn("w:rPr"))
+        assert run.find(qn("w:t")).text == _SIG_EMAIL
+        assert rpr.find(qn("w:rFonts")).get(qn("w:ascii")) == "Arial"
+        assert int(rpr.find(qn("w:sz")).get(qn("w:val"))) == 20      # half-points
+        assert rpr.find(qn("w:color")).get(qn("w:val")).upper() == "467886"
+        assert rpr.find(qn("w:b")) is None, "the address is not bold"
+        rel = doc.part.rels[hyperlinks[0].get(qn("r:id"))]
+        assert rel.target_ref == f"mailto:{_SIG_EMAIL}"
+
+    def test_no_telephone_number_anywhere(self, signature_letter):
+        """Policy: we do not give out phone numbers."""
+        doc, _ = signature_letter
+        text = "\n".join(p.text for p in doc.paragraphs)
+        for word in ("Phone", "Telephone", "phone"):
+            assert word not in text
+
+    def test_the_tool_no_longer_collects_a_phone_number(self):
+        """A field feeding nothing is worse than no field.
+
+        Removed from the GUI form and the CLI as well as the documents, so a
+        number cannot be typed into a box that quietly discards it.
+        """
+        import inspect
+        import pq_report
+        for fn in (pq_report.generate_customer_letter,
+                   pq_report.generate_word_report):
+            assert "engineer_phone" not in inspect.signature(fn).parameters
+        assert "_eng_phone_var" not in (Path(__file__).parent / "run.py").read_text()
+        assert "--engineer-phone" not in (Path(__file__).parent / "pq_analyzer.py").read_text()
+
+    def test_the_letter_is_dated(self, signature_letter):
+        """It moved to the top, where a letter's date goes — but it is still there."""
+        import datetime
+        doc, _ = signature_letter
+        today = datetime.date.today()
+        expected = f"{today:%B} {today.day}, {today.year}"
+        assert expected in "\n".join(p.text for p in doc.paragraphs)

@@ -268,9 +268,7 @@ EXAMPLES
     p.add_argument("--substation",     default=None, help="Substation name for the report header")
     p.add_argument("--engineer",       default=None, help="Engineer name for the report sign-off")
     p.add_argument("--engineer-title", default=None, help="Engineer title (default: Electric Area Engineer)")
-    p.add_argument("--engineer-phone", default=None, help="Engineer phone number for sign-off")
     p.add_argument("--engineer-email", default=None, help="Engineer email address for sign-off")
-    p.add_argument("--engineer-contact", default=None, help="Legacy combined phone/email for sign-off")
     p.add_argument("--customer-class", default="sg",
                    choices=["r", "c", "sg", "pg"],
                    help="PSCo tariff schedule: r=Residential, c=Small Comm., sg=C&I Secondary, pg=C&I Primary")
@@ -495,14 +493,12 @@ def main():
             site_name=args.site_name or stem,
             site_address=args.site_address or "",
             engineer_name=args.engineer or "",
-            engineer_contact=args.engineer_contact or "",
             outdir=outdir,
             stem=stem,
             meter_id=args.meter_id or "",
             feeder=args.feeder or "",
             substation=args.substation or "",
             engineer_title=args.engineer_title or "",
-            engineer_phone=args.engineer_phone or "",
             engineer_email=args.engineer_email or "",
         )
         # Second, separate document: the plain-language letter for the customer.
@@ -515,7 +511,6 @@ def main():
             outdir=outdir,
             stem=stem,
             engineer_title=args.engineer_title or "",
-            engineer_phone=args.engineer_phone or "",
             engineer_email=args.engineer_email or "",
         )
 
