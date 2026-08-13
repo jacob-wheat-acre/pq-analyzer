@@ -5956,3 +5956,36 @@ class TestWindowsIcon:
         import run
         assert hasattr(run, "_claim_windows_taskbar_identity")
         run._claim_windows_taskbar_identity()   # no-op off Windows, never raises
+
+    def test_the_shortcut_installer_sets_an_icon_location(self):
+        """Without IconLocation, Windows draws the target's icon.
+
+        The target is "PQ Analyzer.bat", so the shortcut came out wearing the
+        generic gears every .bat file gets.
+        """
+        src = (Path(__file__).parent / "install_shortcut.py").read_text()
+        assert "IconLocation" in src, \
+            "install_shortcut.py must set the shortcut's IconLocation"
+        assert "icon.ico" in src
+
+    def test_the_installer_asks_the_shell_where_the_desktop_is(self):
+        """~/Desktop is the wrong answer on a machine with OneDrive.
+
+        Redirection moves the Desktop to ~/OneDrive/Desktop and usually leaves
+        the old folder behind, so a shortcut written to the literal path lands
+        somewhere the user never looks, and the installer reports success.
+        """
+        src = (Path(__file__).parent / "install_shortcut.py").read_text()
+        assert "SHGetFolderPathW" in src, \
+            "the Windows desktop path must come from the shell, not from ~/Desktop"
+
+    def test_the_bat_delegates_instead_of_reimplementing(self):
+        """Two installers drifted: one set the icon, the other found the Desktop.
+
+        Whichever the user ran, they got half of it. The .bat is a wrapper now,
+        and must not grow its own copy of the shortcut logic back.
+        """
+        bat = (Path(__file__).parent / "install_shortcut.bat").read_text()
+        assert "install_shortcut.py" in bat, ".bat should call the Python installer"
+        assert "CreateShortcut" not in bat, \
+            "the .bat is reimplementing the shortcut logic again"

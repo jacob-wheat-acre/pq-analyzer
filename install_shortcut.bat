@@ -1,14 +1,41 @@
 @echo off
 :: Creates a "PQ Analyzer" shortcut on the current user's Desktop.
-:: Uses the Windows API to find the real Desktop path, which handles
-:: OneDrive folder redirection common on corporate machines.
 :: Run this once after copying the pq-analyzer folder to the machine.
+::
+:: This file used to build the shortcut itself, in a line of inline PowerShell
+:: that had drifted apart from install_shortcut.py: the .py set the shortcut's
+:: icon but looked for the Desktop at ~/Desktop, which OneDrive redirection
+:: moves; this .bat found the real Desktop but set no icon at all, so the
+:: shortcut it made showed the generic .bat gears. Whichever one you ran, you
+:: got half of it. There is one implementation now, and this is a wrapper.
 
 setlocal
+cd /d "%~dp0"
 
-set "TOOL_DIR=%~dp0"
-set "BAT_FILE=%TOOL_DIR%PQ Analyzer.bat"
+where pythonw >nul 2>&1
+if %errorlevel% == 0 (
+    python "%~dp0install_shortcut.py"
+    goto done
+)
+where python >nul 2>&1
+if %errorlevel% == 0 (
+    python "%~dp0install_shortcut.py"
+    goto done
+)
+where py >nul 2>&1
+if %errorlevel% == 0 (
+    py "%~dp0install_shortcut.py"
+    goto done
+)
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$d = [Environment]::GetFolderPath('Desktop'); $lnk = Join-Path $d 'PQ Analyzer.lnk'; $ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut($lnk); $sc.TargetPath = '%BAT_FILE%'; $sc.WorkingDirectory = '%TOOL_DIR%'; $sc.Description = 'PQ Analyzer - Power Quality Analysis Tool'; $sc.Save(); if (Test-Path $lnk) { Write-Host ''; Write-Host ' Shortcut created on your Desktop: PQ Analyzer'; Write-Host ' Double-click it any time to launch the tool.'; Write-Host '' } else { Write-Host ''; Write-Host ' Could not create shortcut. You can still launch the tool by'; Write-Host ' double-clicking PQ Analyzer.bat in the pq-analyzer folder.'; Write-Host '' }"
+echo Python was not found on this PC.
+echo.
+echo Try running:  py --version
+echo If that works, Python is installed but not on the system PATH --
+echo ask IT to add it.
+echo.
+echo If Python is not installed, request it through Xcel Software Center
+echo ^(link on the intranet homepage^).  See GIT_GUIDE.md section 1.
 
+:done
 pause

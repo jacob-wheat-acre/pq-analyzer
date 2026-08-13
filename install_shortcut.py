@@ -103,44 +103,102 @@ def install_mac():
 
 # ── Windows ───────────────────────────────────────────────────────────────────
 
+def windows_desktop() -> Path:
+    """The Desktop this user actually sees.
+
+    Not ``~/Desktop``. On a corporate machine OneDrive redirects the Desktop
+    shell folder to ``~/OneDrive/Desktop`` and usually leaves the old
+    ``~/Desktop`` in place, so writing a shortcut to the literal path puts it
+    somewhere the user will never look while reporting success. Ask the shell
+    where the folder is instead of assuming.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        CSIDL_DESKTOPDIRECTORY = 0x0010
+        buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+        # SHGetFolderPathW follows redirection; the constant is the per-user
+        # Desktop directory rather than the virtual desktop namespace.
+        if ctypes.windll.shell32.SHGetFolderPathW(
+                None, CSIDL_DESKTOPDIRECTORY, None, 0, buf) == 0 and buf.value:
+            return Path(buf.value)
+    except Exception:
+        pass
+    return Path.home() / "Desktop"
+
+
 def install_windows():
-    shortcut = DESKTOP / "PQ Analyzer.lnk"
+    import subprocess
+
+    desktop  = windows_desktop()
+    shortcut = desktop / "PQ Analyzer.lnk"
     bat      = TOOL_DIR / "PQ Analyzer.bat"
     ico      = TOOL_DIR / "icon.ico"
 
     if not ico.exists():
-        print(f"\n  Warning: {ico.name} is missing, so the shortcut will get a "
+        print(f"\n  {ico.name} is missing, so the shortcut would get the "
               "default icon.\n  Run:  python3 make_icon.py\n")
+        return
+
+    # Replace rather than update. A .lnk that already carries a bad icon path
+    # keeps its cached bitmap through a rewrite of the same file, and the
+    # symptom that follows -- "I re-ran the installer and nothing changed" --
+    # is indistinguishable from the installer not having worked.
+    if shortcut.exists():
+        try:
+            shortcut.unlink()
+        except OSError as exc:
+            print(f"\n  Could not replace the old shortcut: {exc}\n")
 
     ps = (
         "$ws = New-Object -ComObject WScript.Shell; "
         f"$sc = $ws.CreateShortcut('{shortcut}'); "
         f"$sc.TargetPath = '{bat}'; "
         f"$sc.WorkingDirectory = '{TOOL_DIR}'; "
-        # ",0" names the icon's index within the file. WScript defaults to 0
-        # without it, but the explicit form is what Windows documents and it
-        # costs nothing to be unambiguous in a multi-size .ico.
+        # ",0" names the icon's index within the file. Without an IconLocation
+        # at all, Windows draws the target's icon -- and the target is a .bat,
+        # whose icon is the generic gears.
         f"$sc.IconLocation = '{ico},0'; "
-        "$sc.Description = 'PQ Analyzer — Power Quality Analysis Tool'; "
-        "$sc.Save()"
+        "$sc.Description = 'PQ Analyzer - Power Quality Analysis Tool'; "
+        "$sc.Save(); "
+        # Read it back. Save() reports nothing when the shell quietly declines
+        # a value, and an unset icon is exactly the failure this is fixing.
+        f"$c = $ws.CreateShortcut('{shortcut}'); "
+        "Write-Output ('ICON=' + $c.IconLocation)"
     )
-    import subprocess
     result = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
         capture_output=True, text=True,
     )
-    if shortcut.exists():
-        print(f"\n  Shortcut created: {shortcut}\n")
-        # Windows caches shortcut icons per path. A shortcut that previously
-        # pointed at a broken .ico keeps showing the fallback even once the
-        # file is fixed, which reads as "the fix did not work".
-        print("  If the shortcut still shows the Python icon, Windows is "
-              "serving a cached\n  copy. Clear it with:\n")
-        print("      ie4uinit.exe -show\n")
-        print("  or sign out and back in.\n")
-    else:
+
+    if not shortcut.exists():
         print(f"\n  Could not create shortcut: {result.stderr.strip()}")
-        print(f"  You can still launch by double-clicking 'PQ Analyzer.bat'\n")
+        print("  You can still launch by double-clicking 'PQ Analyzer.bat'\n")
+        return
+
+    print(f"\n  Shortcut created: {shortcut}")
+    readback = next((l.split("=", 1)[1].strip()
+                     for l in result.stdout.splitlines() if l.startswith("ICON=")),
+                    "")
+    if readback and readback.lower().startswith(str(ico).lower()):
+        print(f"  Icon: {readback}")
+    else:
+        print(f"  Warning: the shortcut's icon did not stick "
+              f"(reads back as {readback or 'empty'}).")
+        print("  Right-click the shortcut -> Properties -> Change Icon, and "
+              f"point it at:\n    {ico}")
+
+    # Tell the shell its icon cache is stale. Without this the desktop keeps
+    # drawing the previous icon until something else happens to invalidate it.
+    try:
+        import ctypes
+        SHCNE_ASSOCCHANGED, SHCNF_IDLIST = 0x08000000, 0x0000
+        ctypes.windll.shell32.SHChangeNotify(
+            SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None)
+    except Exception:
+        pass
+    print("\n  If the desktop still shows the old icon, the shell is serving a "
+          "cached copy:\n      ie4uinit.exe -show\n  or sign out and back in.\n")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
