@@ -5124,6 +5124,7 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "owns_transformer": True,
         "fix_agent": "your electrical engineer or contractor",
         "detail": "full",
+        "itic_curve": True,
     },
 }
 

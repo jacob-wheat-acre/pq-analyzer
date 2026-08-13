@@ -6037,8 +6037,10 @@ class TestLetterITICCurve:
         return [n for n in zipfile.ZipFile(str(path)).namelist()
                 if n.startswith("word/media/")]
 
-    def test_sg_gets_the_curve(self, tmp_path):
-        rep, path = self._letter(tmp_path, "sg", 277.0)
+    @pytest.mark.parametrize("cls,nominal", [("sg", 277.0), ("pg", 7621.0)])
+    def test_the_terse_classes_get_the_curve(self, cls, nominal, tmp_path):
+        """Both readers run a facility and both hand this to a contractor."""
+        rep, path = self._letter(tmp_path, cls, nominal)
         assert rep["itic"]["n_events"], "mock recording produced no events to plot"
         text = self._text(path)
         assert "Every dip and surge we recorded" in text
