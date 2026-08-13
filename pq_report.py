@@ -5114,6 +5114,7 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "owns_transformer": False,
         "fix_agent": "your electrical contractor or maintenance team",
         "detail": "full",
+        "itic_curve": True,
     },
     "pg": {
         "site": "your facility",
@@ -5132,6 +5133,13 @@ _LETTER_REGISTER: Dict[str, dict] = {
 #: will ask what else was looked at. A homeowner cannot, so they do not get it.
 for _key, _reg in _LETTER_REGISTER.items():
     _reg.setdefault("detail", "brief")
+
+#: Whether the letter shows the ITIC curve itself rather than only the verdict
+#: taken from it. Off by default: it is a log-scaled scatter plot, and a reader
+#: who is not going to read it is being shown something they did not ask for,
+#: which costs the trust the rest of the letter is spending carefully.
+for _key, _reg in _LETTER_REGISTER.items():
+    _reg.setdefault("itic_curve", False)
 
 #: Service classes that get the plain-language letter, and what to call the
 #: site. Every class does; the depth is what differs, per _LETTER_REGISTER.
@@ -5911,6 +5919,77 @@ def generate_customer_letter(
             q.paragraph_format.left_indent = Cm(0.6)
             _bold(q, label, size_pt=10)
             _normal(q, cond[key], size_pt=10)
+
+    # ── The dips and surges, plotted ──────────────────────────────────────
+    # "What we checked" already names the ITIC curve as the standard these
+    # events were judged against, which leaves the reader referred to a curve
+    # they cannot see and asked to take the verdict on trust. A facility with
+    # maintenance staff can read the chart, and is likely to hand this letter
+    # to a contractor who will want it. The register decides, not the data:
+    # the same chart in front of a homeowner is a log-scaled scatter plot
+    # nobody asked for.
+    itic_letter = report.get("itic") or {}
+    # n_events is checked as well as the image: pq_output keeps the previous
+    # run's plots under the same stem, and a chart of last month's events under
+    # this month's heading is worse than no chart.
+    if (register.get("itic_curve") and itic_letter.get("available")
+            and itic_letter.get("n_events")):
+        img = _plot_path(outdir, stem, "itic_curve.png")
+        if img is not None and img.exists():
+            doc.add_paragraph()
+            _section_heading(doc, "Every dip and surge we recorded", level=1)
+            n_ev  = itic_letter.get("n_events", 0)
+            n_bad = itic_letter.get("n_violations", 0)
+            _body(doc,
+                "The chart below plots each brief voltage dip and surge from the "
+                "recording the way equipment manufacturers describe what their "
+                "equipment will tolerate. Along the bottom is how long an event "
+                "lasted, from a thousandth of a second at the left out to a "
+                "hundred seconds at the right. Up the side is how far the "
+                "voltage moved, as a percentage of normal.")
+            _body(doc,
+                "The green band is the range electronic equipment is built to "
+                "ride through without misoperating. Anything inside it should "
+                "have passed unnoticed. Points in the red bands went deeper or "
+                "lasted longer than that, and those are the ones worth matching "
+                "against equipment that tripped, reset or dropped out.")
+            # Written out per count rather than with an inline plural: "Of the 1
+            # event recorded, all fall inside" is the kind of sentence that
+            # makes a reader wonder what else was generated rather than written.
+            if n_ev == 1:
+                _body(doc,
+                    "One event was recorded. It falls "
+                    + ("inside the green band, so it is unlikely to explain "
+                       "equipment that has been misbehaving."
+                       if not n_bad else
+                       "outside the green band, so it is worth comparing its "
+                       "time against anything that stopped working."))
+            else:
+                if n_bad:
+                    one  = n_bad == 1
+                    tail = (f"{_m(n_bad)} of them {'falls' if one else 'fall'} "
+                            "outside the green band. Comparing "
+                            f"{'its time' if one else 'their times'} against "
+                            "anything that stopped working is the fastest way to "
+                            f"tell whether {'it is' if one else 'they are'} behind "
+                            "a problem you have been seeing.")
+                else:
+                    tail = ("all of them fall inside the green band, so none is "
+                            "likely to explain equipment that has been "
+                            "misbehaving.")
+                _body(doc, f"Of the {_m(n_ev)} events recorded, {tail}")
+            # No attribution: the chart says what reached the service, and a
+            # motor start inside the facility and a fault on a neighbouring
+            # feeder land in the same place on it.
+            _body(doc,
+                "A dip can begin on our system or inside the facility — a large "
+                "motor starting is a common cause of one either way. The chart "
+                "shows what reached your service, not where it started.")
+            _embed_plot(doc, outdir, stem, "itic_curve.png",
+                        caption="Each recorded dip and surge, by how far the "
+                                "voltage moved and how long it lasted.",
+                        width_cm=14.0)
+            doc.add_paragraph()
 
     # ── Safety ────────────────────────────────────────────────────────────
     doc.add_paragraph()

@@ -5989,3 +5989,100 @@ class TestWindowsIcon:
         assert "install_shortcut.py" in bat, ".bat should call the Python installer"
         assert "CreateShortcut" not in bat, \
             "the .bat is reimplementing the shortcut logic again"
+
+
+class TestLetterITICCurve:
+    """Schedule SG gets the ITIC curve itself, not only the verdict from it.
+
+    "What we checked" already names the ITIC curve as the standard the dips
+    were judged against, which leaves the reader referred to a curve they
+    cannot see. A facility with maintenance staff can read it and is likely to
+    hand the letter to a contractor who will want it.
+    """
+
+    def _letter(self, tmp_path, cls, nominal):
+        import pq_analysis as An
+        from pq_report import generate_report, generate_customer_letter
+        from pq_plots import plot_itic, plot_overview
+        ds = extract_dataset(MockAdapter(duration_hours=6.0, nominal=nominal),
+                             ChannelMapper())
+        th = Thresholds(nominal_voltage=nominal, customer_class=cls)
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        stem = f"itic_{cls}"
+        plot_overview(ds, th, outdir=tmp_path, stem=stem)
+        plot_itic(ev["events"], th, outdir=tmp_path, stem=stem)
+        path = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, stem)
+        return rep, path
+
+    def _text(self, path):
+        import docx
+        d = docx.Document(str(path))
+        return "\n".join(p.text for p in d.paragraphs)
+
+    def _images(self, path):
+        import zipfile
+        return [n for n in zipfile.ZipFile(str(path)).namelist()
+                if n.startswith("word/media/")]
+
+    def test_sg_gets_the_curve(self, tmp_path):
+        rep, path = self._letter(tmp_path, "sg", 277.0)
+        assert rep["itic"]["n_events"], "mock recording produced no events to plot"
+        text = self._text(path)
+        assert "Every dip and surge we recorded" in text
+        # The overview chart plus the ITIC chart.
+        assert len(self._images(path)) == 2
+
+    @pytest.mark.parametrize("cls,nominal", [("r", 120.0), ("c", 120.0)])
+    def test_the_explanatory_classes_do_not_get_it(self, cls, nominal, tmp_path):
+        """A log-scaled scatter plot is not what a homeowner asked for."""
+        _, path = self._letter(tmp_path, cls, nominal)
+        assert "Every dip and surge we recorded" not in self._text(path)
+        assert len(self._images(path)) == 1
+
+    def test_the_chart_is_explained_before_it_is_shown(self, tmp_path):
+        """The letter rule: no number without what it means and what follows.
+
+        A curve the reader cannot decode is the same failure in picture form,
+        so the bands are named in words.
+        """
+        _, path = self._letter(tmp_path, "sg", 277.0)
+        text = self._text(path)
+        for phrase in ("green band", "how long an event", "percentage of normal"):
+            assert phrase in text, f"missing plain-language key: {phrase}"
+
+    def test_the_chart_makes_no_attribution(self, tmp_path):
+        """Sags reach the meter from either side; the letter must not pick one."""
+        _, path = self._letter(tmp_path, "sg", 277.0)
+        text = self._text(path)
+        assert "not where it started" in text
+        assert "begin on our system or inside the facility" in text
+
+    def test_a_stale_plot_cannot_resurrect_the_section(self, tmp_path):
+        """pq_output keeps the previous run's plots under the same stem.
+
+        A chart of last month's events under this month's heading is worse
+        than no chart, so the count is checked as well as the file.
+        """
+        import pq_analysis as An
+        from pq_report import generate_report, generate_customer_letter
+        rep, path = self._letter(tmp_path, "sg", 277.0)
+        stem = "itic_sg"
+        assert (tmp_path / f"{stem}_itic_curve.png").exists()
+        # Same folder, same stem, but this run detected nothing.
+        rep["itic"] = {"available": True, "n_events": 0, "n_violations": 0}
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg")
+        again = generate_customer_letter(rep, th, "1 Test St", "Eng", tmp_path, stem)
+        assert "Every dip and surge we recorded" not in self._text(again)
