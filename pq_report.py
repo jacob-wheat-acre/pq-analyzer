@@ -467,7 +467,12 @@ def generate_report(
                                       if harm_result.get("available") else None,
             "individual_voltage_harmonics": volt_harm_result.get("overall_pass", None)
                                       if volt_harm_result.get("available") else None,
-            "power_factor":           pf_result["pct_below_limit"] == 0
+            # A power factor that could not be assessed -- every interval
+            # exporting, or none of them loaded enough for the ratio to mean
+            # anything -- is None. Not a pass, and emphatically not a fail.
+            "power_factor":           (pf_result["pct_below_limit"] == 0
+                                       if pf_result.get("pct_below_limit") is not None
+                                       else None)
                                       if pf_result["available"] else None,
             "voltage_imbalance":      volt_imb_result["pct_exceeding"] == 0
                                       if volt_imb_result["available"] else None,
@@ -702,9 +707,17 @@ def print_report(report: dict) -> None:
     if not pfr["available"]:
         print(f"  {pfr['error']}")
     else:
-        sym = "PASS" if pfr["pct_below_limit"] == 0 else "FAIL"
-        print(f"  Min={pfr['min_pf']:.4f}  Mean={pfr['mean_pf']:.4f}  "
-              f"Limit={pfr['limit']:.2f}  Below limit={pfr['pct_below_limit']:.2f}%  [{sym}]")
+        if pfr.get("pct_below_limit") is None:
+            print(f"  Min={pfr['min_pf']:.4f}  Mean={pfr['mean_pf']:.4f}  "
+                  f"Limit={pfr['limit']:.2f}  [NOT ASSESSED]")
+            print(f"  {pfr.get('scope_note', '')}")
+        else:
+            sym = "PASS" if pfr["pct_below_limit"] == 0 else "FAIL"
+            print(f"  Min={pfr['min_pf']:.4f}  Mean={pfr['mean_pf']:.4f}  "
+                  f"Limit={pfr['limit']:.2f}  Below limit={pfr['pct_below_limit']:.2f}%  [{sym}]")
+        if pfr.get("convention") == "leading":
+            print(f"  Power factor is signed leading/lagging; "
+                  f"{pfr.get('pct_leading', 0):.1f}% of assessed intervals leading.")
 
     # ── Voltage imbalance ─────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -1412,8 +1425,82 @@ def _integrity_note(dq: dict, fs: dict) -> str:
     return "INCOMPLETE — " + " ".join(parts)
 
 
+def analysis_mode_summary(report: dict, thresh) -> List[str]:
+    """The settings that decide what the numbers mean, in one line each.
+
+    Two different services can produce the same figures and opposite verdicts
+    depending on these, and nothing on the page said which was active. An
+    engineer looking at a power factor finding on a plant needs to know whether
+    it was assessed as a load before deciding the tool is broken.
+    """
+    roles = {"load": "Load only", "mixed": "Load + generation in parallel",
+             "generation": "Generation only (no load)"}
+    role = getattr(thresh, "service_role", "load")
+    bits = [f"Power flow: {roles.get(role, role)}"]
+
+    std = report.get("current_standard") or {}
+    if std.get("standard") == "1547":
+        bits.append("Current distortion: IEEE 1547-2018 Clause 7.3 (TRD vs rated current)")
+    elif not std.get("determined", True):
+        bits.append("Current distortion: IEEE 519 applied, but the governing "
+                    "standard is undetermined — see the harmonics section")
+    else:
+        bits.append("Current distortion: IEEE 519-2022 (TDD vs IL)")
+
+    tdd = (report.get("thd_compliance") or {}).get("tdd_info") or {}
+    basis = {
+        "billing":         "IL: from billing (12-month maximum demands)",
+        "rated_output":    "IL: plant rated output",
+        "measured_export": "IL: largest export measured (no rating entered)",
+        "measured_demand": "IL: recording peak (no billing figure entered)",
+    }.get(tdd.get("il_basis"))
+    if basis:
+        bits.append(basis)
+
+    if role != "load":
+        cat = getattr(thresh, "der_category", None)
+        bits.append(f"IEEE 1547 category: {cat}" if cat
+                    else "IEEE 1547 category: not entered — ride-through not assessed")
+
+    pfr = report.get("power_factor") or {}
+    if pfr.get("available") and pfr.get("pct_below_limit") is None:
+        bits.append("Power factor: not assessed (see note in that section)")
+    elif pfr.get("convention") == "direction":
+        bits.append("Power factor: meter signs it by direction of flow; "
+                    "graded on magnitude over importing intervals")
+
+    bits.append(f"Customer class: Schedule {thresh.customer_class.upper()}")
+    return bits
+
+
+def _set_document_footer(doc, report: dict, thresh) -> None:
+    """Stamp the active mode on every page.
+
+    A report is read a page at a time and forwarded a page at a time, so the
+    settings that decide what its numbers mean belong where they cannot be
+    separated from them.
+    """
+    role = getattr(thresh, "service_role", "load")
+    std = (report.get("current_standard") or {}).get("standard", "519")
+    label = {"load": "load", "mixed": "load + generation",
+             "generation": "generation only"}.get(role, role)
+    text = (f"Analysis mode: {label}  |  Schedule "
+            f"{thresh.customer_class.upper()}  |  current distortion per "
+            f"IEEE {'1547-2018' if std == '1547' else '519-2022'}"
+            f"  |  pq-analyzer v{__version__}")
+    for section in doc.sections:
+        para = section.footer.paragraphs[0] if section.footer.paragraphs \
+            else section.footer.add_paragraph()
+        para.text = text
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in para.runs:
+            run.font.size = Pt(7.5)
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+
 def _word_site_info_table(doc, site_name, stem, site_address,
-                          fs, nominal_v, nominal_ll, prepared_by="") -> None:
+                          fs, nominal_v, nominal_ll, prepared_by="",
+                          analysis_mode=None) -> None:
     rows_data = [
         ("Customer / Site", site_name or stem),
     ]
@@ -1423,6 +1510,8 @@ def _word_site_info_table(doc, site_name, stem, site_address,
         rows_data.append(("Prepared by", prepared_by))
     if site_address:
         rows_data.append(("Address", site_address))
+    if analysis_mode:
+        rows_data.append(("Analysis mode", "\n".join(analysis_mode)))
     rows_data += [
         ("Recording period", f"{fs['start_time']}  →  {fs['end_time']}"),
         ("Duration",         f"{fs['duration_hours']:.2f} hours  |  {fs['sample_count']:,} intervals"),
@@ -2190,7 +2279,8 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
 
     pfr = report["power_factor"]
     if (pf.get("power_factor") is False and thresh.customer_class != "r"
-            and pfr.get("available")):
+            and pfr.get("available")
+            and pfr.get("pct_below_limit") is not None):
         items.append((0,
             f"Power factor fell below the {pfr['limit']:.2f} tariff requirement during "
             f"{_pct(pfr['pct_below_limit'])} of the recording "
@@ -2574,7 +2664,8 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
         sev["voltage"] = _grade_voltage_band(
             volt, volt.get("phases_missing_data") or [])
 
-    if pfr.get("available") and thresh.customer_class != "r":
+    if (pfr.get("available") and thresh.customer_class != "r"
+            and pfr.get("pct_below_limit") is not None):
         sev["power_factor"] = grade_finding(
             pf.get("power_factor"), measured=pfr.get("mean_pf"),
             limit=pfr.get("limit"), persistence_pct=pfr.get("pct_below_limit"),
@@ -2870,6 +2961,24 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
     if not pfr["available"]:
         return "Power Factor"
     _section_heading(doc, "Power Factor", level=2)
+
+    # Where the displacement could not be graded -- every interval exporting,
+    # or none of them loaded enough for a ratio to mean anything -- the
+    # measurement is reported and the tariff comparison is not made. Falling
+    # through to the class branches below would compare None against a limit.
+    if pfr.get("pct_below_limit") is None:
+        _body(doc,
+            f"Measured mean displacement power factor was "
+            f"{_m(pfr['mean_pf'], '.3f')} (minimum {_m(pfr['min_pf'], '.3f')}), "
+            f"reported as measured. " + (pfr.get("scope_note") or ""))
+        if pfr.get("convention") == "direction":
+            _body(doc,
+                "This meter signs power factor by the direction of real power, "
+                "so the negative values in the record are exporting intervals "
+                "rather than low power factor. The figures above are "
+                "magnitudes.")
+        return "Power Factor"
+
     if pfr["available"]:
         direction = "lagging" if pfr["mean_pf"] > 0 else "leading"
         is_residential = thresh.customer_class == "r"
@@ -5192,7 +5301,9 @@ def generate_word_report(
                           prepared_by=", ".join(
                               b for b in (engineer_name,
                                           engineer_title or "Electric Area Engineer")
-                              if b) if engineer_name else "")
+                              if b) if engineer_name else "",
+                          analysis_mode=analysis_mode_summary(report, thresh))
+    _set_document_footer(doc, report, thresh)
 
     opening = doc.add_paragraph()
     opening.add_run(
@@ -5923,7 +6034,8 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     # and can often trace the other to specific equipment.
     if vocab["is_business"]:
         register = vocab["register"]
-        if pfr.get("available") and pfr.get("pct_below_limit", 0) > 0:
+        if (pfr.get("available") and pfr.get("pct_below_limit") is not None
+                and pfr["pct_below_limit"] > 0):
             if register.get("generating"):
                 # A load PF clause is the wrong instrument here. The plant is
                 # not drawing reactive power to serve a load; it is exporting
@@ -6266,7 +6378,16 @@ def generate_customer_letter(
         fp = section.footer.paragraphs[0]
         fp.clear()
         fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r = fp.add_run("Xcel Energy — Power Quality Review  |  page ")
+        # On a service with generation the footer says how it was assessed.
+        # The mode changes what several findings mean, and an engineer
+        # reviewing the letter should not have to infer it from the wording.
+        # Ordinary load services say nothing: it is the default, and telling a
+        # customer their service was assessed as a load adds only noise.
+        mode_note = {
+            "mixed":      "assessed as load + generation  |  ",
+            "generation": "assessed as a generating facility  |  ",
+        }.get(getattr(thresh, "service_role", "load"), "")
+        r = fp.add_run(f"Xcel Energy — Power Quality Review  |  {mode_note}page ")
         r.font.size = Pt(8)
         r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
         _add_page_field(fp)

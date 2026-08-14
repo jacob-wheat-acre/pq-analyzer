@@ -1110,8 +1110,11 @@ def make_producer_array() -> tuple[list[str], list[np.ndarray]]:
     # Export throughout; the small positive term overnight is the auxiliaries.
     kw   = -195_000.0 * day + 600.0 + _noise(n, 300.0)
     kvar = np.full(n, 2_000.0) + _noise(n, 100.0)
-    pf   = np.clip(np.abs(kw) / np.sqrt(kw**2 + kvar**2) + _noise(n, 0.003),
-                   0.8, 1.0)
+    # Signed by the direction of real power, which is what a real meter does
+    # and what read as a power factor violation on every exporting interval
+    # while the check compared the signed value against 0.90.
+    pf   = np.sign(kw) * np.clip(
+        np.abs(kw) / np.sqrt(kw**2 + kvar**2) + _noise(n, 0.003), 0.8, 1.0)
 
     thd_van = np.clip(2.9 + 0.9 * day + _noise(n, 0.2), 0.5, 7.9)
     thd_vbn = np.clip(2.8 + 0.9 * day + _noise(n, 0.2), 0.5, 7.9)

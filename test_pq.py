@@ -2105,6 +2105,244 @@ class TestGenerationIL:
         assert td["il_amps"] < 300.0
 
 
+def _build_report(pqd, cls, nominal, **thresh_kw):
+    """A full report for a fixture, the way the CLI builds one."""
+    import pq_analysis as An
+    from pq_report import generate_report
+    from pathlib import Path
+    source = Path(__file__).parent / "test_data" / f"{pqd}.pqd"
+    ds = extract_dataset(ProntoAdapter(str(source)), ChannelMapper())
+    th = Thresholds(nominal_voltage=nominal, customer_class=cls, **thresh_kw)
+    df = ds.df
+    ev = An.detect_events(ds, th)
+    rep = generate_report(
+        ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+        An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+        An.check_current_imbalance(df, th), An.check_demand(df, th),
+        An.check_individual_harmonics(df, th),
+        An.check_individual_voltage_harmonics(df, th),
+        An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+        An.check_harmonic_statistics(df, th), ev, th,
+        neutral_health_result=An.check_neutral_health(ds, th),
+        itic_result=An.check_itic(ev, th),
+        flicker_result=An.check_flicker(df, th))
+    rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+    return ds, rep, th
+
+
+#: Every fixture with the role it is meant to be analysed under. Both
+#: documents are built for each, because the suite has twice now been fully
+#: green while the CLI crashed on a path no test constructed -- a generating
+#: service, and then a meter that signs power factor by direction.
+_DOCUMENT_MATRIX = [
+    ("test_residential",         "r",  120.0,   {}),
+    ("test_commercial_small",    "c",  120.0,   {}),
+    ("test_commercial_large",    "sg", 277.0,   {"isc_amps": 40000.0}),
+    ("test_commercial_imbalanced", "sg", 277.0, {"isc_amps": 40000.0}),
+    ("test_commercial_primary",  "pg", 13200.0, {"isc_amps": 5000.0}),
+    ("test_solar_net_metered",   "sg", 277.0,
+     {"isc_amps": 40000.0, "service_role": "mixed", "rated_ac_kw": 150.0,
+      "annual_avg_load_kw": 1200.0}),
+    ("test_producer_array",      "sg", 277.0,
+     {"isc_amps": 40000.0, "service_role": "generation", "rated_ac_kw": 250.0,
+      "annual_avg_load_kw": 2.0, "der_category": "II"}),
+]
+
+
+class TestBothDocumentsBuildForEveryFixture:
+    """The end-to-end guard the unit tests kept missing.
+
+    Twice now the whole suite has passed while `pq_analyzer.py --report`
+    raised: once on a generating service, and once on a meter that signs power
+    factor by direction, which left a None where a percentage was formatted.
+    Unit tests covered both checks; nothing assembled the documents.
+    """
+
+    @pytest.mark.parametrize("pqd,cls,nominal,extra", _DOCUMENT_MATRIX,
+                             ids=[m[0] for m in _DOCUMENT_MATRIX])
+    def test_the_documents_assemble(self, pqd, cls, nominal, extra, tmp_path):
+        docx = pytest.importorskip("docx")
+        from pq_report import generate_word_report, generate_customer_letter
+        ds, rep, th = _build_report(pqd, cls, nominal, **extra)
+        internal = generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", outdir=tmp_path, stem=pqd)
+        letter = generate_customer_letter(rep, th, "1 Test St", "Eng",
+                                          tmp_path, pqd)
+        for path in (internal, letter):
+            assert path is not None and Path(path).exists(), pqd
+            doc = docx.Document(str(path))
+            # A document that assembled but says nothing is still a failure.
+            assert sum(len(p.text) for p in doc.paragraphs) > 500, pqd
+
+
+class TestAnalysisModeIsVisible:
+    """Which mode produced these numbers, stated on the documents.
+
+    The same recording can produce opposite verdicts depending on the power
+    flow setting and the standard it selects, and nothing on the page said
+    which was active -- so a power factor finding on a plant read as either a
+    broken report or the wrong mode, with no way to tell them apart.
+    """
+
+    def test_the_header_table_lists_the_settings_that_change_the_answer(self):
+        from pq_report import analysis_mode_summary
+        _ds, rep, th = _build_report(
+            "test_producer_array", "sg", 277.0, isc_amps=40000.0,
+            service_role="generation", rated_ac_kw=250.0,
+            annual_avg_load_kw=2.0, der_category="II")
+        bits = " | ".join(analysis_mode_summary(rep, th))
+        assert "Generation only" in bits
+        assert "1547" in bits                 # the standard actually applied
+        assert "IL:" in bits                  # and where IL came from
+        assert "category: II" in bits
+        assert "Schedule SG" in bits
+
+    def test_a_missing_category_is_named_rather_than_left_blank(self):
+        from pq_report import analysis_mode_summary
+        _ds, rep, th = _build_report(
+            "test_producer_array", "sg", 277.0, isc_amps=40000.0,
+            service_role="generation", rated_ac_kw=250.0,
+            annual_avg_load_kw=2.0)
+        assert any("not entered" in b for b in analysis_mode_summary(rep, th))
+
+    def test_a_load_service_says_load(self):
+        from pq_report import analysis_mode_summary
+        _ds, rep, th = _build_report("test_commercial_large", "sg", 277.0,
+                                     isc_amps=40000.0)
+        bits = " | ".join(analysis_mode_summary(rep, th))
+        assert "Load only" in bits and "519" in bits
+
+    def test_the_internal_footer_carries_the_mode_on_every_page(self, tmp_path):
+        docx = pytest.importorskip("docx")
+        from pq_report import generate_word_report
+        ds, rep, th = _build_report(
+            "test_producer_array", "sg", 277.0, isc_amps=40000.0,
+            service_role="generation", rated_ac_kw=250.0,
+            annual_avg_load_kw=2.0, der_category="II")
+        path = generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", outdir=tmp_path, stem="t")
+        footer = docx.Document(str(path)).sections[0].footer.paragraphs[0].text
+        assert "generation only" in footer
+        assert "1547" in footer
+
+    def test_the_letter_marks_generation_and_leaves_load_letters_alone(self, tmp_path):
+        # A customer with an ordinary service does not need to be told their
+        # service was assessed as a load; it is the default and adds noise.
+        docx = pytest.importorskip("docx")
+        from pq_report import generate_customer_letter
+
+        def footer_of(pqd, cls, nominal, **extra):
+            _ds, rep, th = _build_report(pqd, cls, nominal, **extra)
+            p = generate_customer_letter(rep, th, "1 St", "Eng", tmp_path, pqd)
+            para = docx.Document(str(p)).sections[0].footer.paragraphs[0]
+            return "".join(r.text for r in para.runs)
+
+        gen = footer_of("test_producer_array", "sg", 277.0, isc_amps=40000.0,
+                        service_role="generation", rated_ac_kw=250.0,
+                        annual_avg_load_kw=2.0, der_category="II")
+        assert "generating facility" in gen
+        load = footer_of("test_commercial_large", "sg", 277.0, isc_amps=40000.0)
+        assert "assessed as" not in load
+
+
+class TestPowerFactorSignConvention:
+    """A signed power factor channel read as a violation on every export.
+
+    Meters sign power factor by one of two conventions and do not say which:
+    by the direction of real power, or by leading against lagging. Comparing
+    the signed value against 0.90 made every exporting interval on a
+    generating service a violation at -0.95.
+    """
+
+    @staticmethod
+    def _df(pf, kw, kvar=2000.0):
+        import pandas as pd
+        n = len(pf)
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame({
+            "power_factor":   pf,
+            "power_real":     kw,
+            "power_reactive": [kvar] * n,
+        }, index=idx)
+
+    def test_a_direction_signed_meter_is_not_read_as_a_violation(self):
+        from pq_analysis import check_power_factor
+        # Exporting at a healthy 0.95 displacement, reported as -0.95.
+        df = self._df([-0.95] * 20 + [0.95] * 20,
+                      [-50_000.0] * 20 + [50_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="mixed"))
+        assert r["convention"] == "direction"
+        assert r["pct_below_limit"] == 0.0
+        assert r["min_pf"] > 0                # magnitudes, not signed values
+
+    def test_the_same_data_read_as_a_load_still_grades_on_magnitude(self):
+        # Even without the generation flag, -0.95 is a 0.95 displacement. The
+        # sign is direction information, not a low power factor.
+        from pq_analysis import check_power_factor
+        df = self._df([-0.95] * 20 + [0.95] * 20,
+                      [-50_000.0] * 20 + [50_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg"))
+        assert r["pct_below_limit"] == 0.0
+
+    def test_a_leading_signed_meter_is_reported_as_leading(self):
+        # Negative power factor while real power stays positive is not an
+        # export; it is a leading power factor, and R73 asks for lagging.
+        from pq_analysis import check_power_factor
+        df = self._df([-0.95] * 20 + [0.95] * 20, [50_000.0] * 40)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg"))
+        assert r["convention"] == "leading"
+        assert r["pct_leading"] == pytest.approx(50.0, abs=1.0)
+
+    def test_the_tariff_clause_is_applied_over_importing_intervals_only(self):
+        from pq_analysis import check_power_factor
+        # Poor displacement while exporting, healthy while importing. The
+        # tariff clauses describe what a load presents at the point of
+        # delivery, so the export must not create a violation.
+        df = self._df([-0.70] * 20 + [0.97] * 20,
+                      [-50_000.0] * 20 + [50_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="generation"))
+        assert r["pct_below_limit"] == 0.0
+        assert "importing intervals only" in r["scope_note"]
+        assert r["export_mean_pf"] == pytest.approx(0.70, abs=0.01)
+
+    def test_a_service_that_only_exports_gets_no_compliance_finding(self):
+        from pq_analysis import check_power_factor
+        df = self._df([-0.85] * 20, [-50_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="generation"))
+        assert r["assessed"] is False
+        assert r["pct_below_limit"] is None
+
+    def test_power_factor_is_gated_on_load_like_every_other_ratio(self):
+        from pq_analysis import check_power_factor
+        # A plant's overnight auxiliary load: 600 W against 2 kVAR is a real
+        # 0.29 displacement and a meaningless finding.
+        df = self._df([0.29] * 20 + [0.97] * 20, [600.0] * 20 + [90_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg"))
+        assert r["pct_below_limit"] == 0.0    # the idle intervals are excluded
+
+    def test_the_real_fixture_no_longer_reports_a_violation(self):
+        from pq_analysis import check_power_factor
+        _ds, rep, th = _build_report(
+            "test_producer_array", "sg", 277.0, isc_amps=40000.0,
+            service_role="generation", rated_ac_kw=250.0,
+            annual_avg_load_kw=2.0, der_category="II")
+        pfr = rep["power_factor"]
+        assert pfr["convention"] == "direction"
+        assert pfr["pct_below_limit"] is None
+        assert rep["pass_fail"]["power_factor"] is None   # not a fail
+
+
 class TestBillingDemandPhaseSpread:
     """PSCo Sheet R123, reported as a cost rather than as a compliance finding.
 

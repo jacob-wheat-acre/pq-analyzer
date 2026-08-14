@@ -1434,6 +1434,28 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
 
 
 def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """Displacement power factor, graded on magnitude rather than on the sign.
+
+    Meters sign power factor by one of two conventions and do not say which:
+    some sign it by the direction of real power, so an exporting interval
+    reports -0.95; others sign it by leading against lagging.  Comparing the
+    signed value against a 0.90 limit read every exporting interval on a
+    generating service as a violation at -0.95, which is how this surfaced.
+
+    The magnitude is the displacement either way, so that is what is graded.
+    Which convention the meter used is worked out from whether the sign tracks
+    real power, rather than assumed, and is reported: under the direction
+    convention a negative value is an export and says nothing about
+    displacement, while under the leading convention it is a real and
+    different condition from the lagging one the tariff clauses are written
+    about.
+
+    On a service that exports, the tariff assessment is confined to the
+    importing intervals.  Sheets R73 and R121 are about the power factor a
+    load presents at the point of delivery; what an inverter is commanded to
+    hold while exporting is set by the interconnection agreement instead, and
+    is reported separately rather than measured against a load clause.
+    """
     if "power_factor" not in df.columns:
         return {
             "available":            False,
@@ -1441,17 +1463,117 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
             "pct_below_limit":      None,
             "violation_timestamps": pd.DatetimeIndex([]),
         }
-    pf = df["power_factor"].dropna()
-    low = pf < thresh.power_factor_limit
-    return {
+    pf_raw = df["power_factor"].dropna()
+    if pf_raw.empty:
+        return {
+            "available":            False,
+            "error":                "Power factor channel is empty.",
+            "pct_below_limit":      None,
+            "violation_timestamps": pd.DatetimeIndex([]),
+        }
+
+    magnitude = pf_raw.abs()
+    negative = pf_raw < 0
+
+    # Which convention the meter is using, from the data rather than a guess.
+    convention, exporting = "unsigned", None
+    if "power_real" in df.columns:
+        p = df["power_real"].reindex(pf_raw.index)
+        exporting = p < 0
+        meaningful = p.notna() & (p.abs() > 0)
+        if negative.any() and meaningful.any():
+            agree = (negative[meaningful] == exporting[meaningful])
+            convention = ("direction" if agree.mean() >= 0.9 else "leading")
+        elif negative.any():
+            convention = "leading"
+    elif negative.any():
+        convention = "leading"
+
+    # The population the tariff clauses actually speak to.
+    scope = pd.Series(True, index=pf_raw.index)
+    scope_note = None
+    if exports_power(thresh) and exporting is not None and exporting.any():
+        scope = ~exporting.fillna(False)
+        scope_note = (
+            "Assessed over the importing intervals only. The tariff power "
+            "factor clauses describe the power factor a load presents at the "
+            "point of delivery; what the plant holds while exporting is set by "
+            "the interconnection agreement."
+        )
+        if not scope.any():
+            return {
+                "available":            True,
+                "error":                None,
+                "limit":                thresh.power_factor_limit,
+                "assessed":             False,
+                "convention":           convention,
+                "min_pf":               float(magnitude.min()),
+                "mean_pf":              float(magnitude.mean()),
+                "pct_below_limit":      None,
+                "scope_note": (
+                    "This service exported for the whole recording, so there "
+                    "is no importing interval for the tariff power factor "
+                    "clauses to apply to. The displacement measured while "
+                    "exporting is reported without a compliance finding."),
+                "violation_timestamps": pd.DatetimeIndex([]),
+            }
+
+    # Power factor is a ratio, so it needs the same light-load gate as every
+    # other ratio here. At 600 W of overnight auxiliary load against 2 kVAR of
+    # magnetising current, the displacement is real arithmetic and a
+    # meaningless finding: nothing is being wasted and no correction is worth
+    # installing. Ungated, a plant's SCADA cabinet reads as a tariff breach.
+    load_gate = None
+    if "power_real" in df.columns and "power_reactive" in df.columns:
+        s_va = np.sqrt(df["power_real"] ** 2 + df["power_reactive"] ** 2)
+    elif "power_real" in df.columns:
+        s_va = df["power_real"].abs()
+    else:
+        s_va = None
+    if s_va is not None:
+        s_va = s_va.reindex(pf_raw.index)
+        peak = float(s_va.abs().max() or 0.0)
+        if peak > 0:
+            load_gate = s_va.abs() >= peak * _PF_LOAD_FLOOR_FRACTION
+            scope = scope & load_gate.fillna(False)
+
+    graded = magnitude[scope]
+    if graded.empty:
+        return {
+            "available":            True,
+            "error":                None,
+            "assessed":             False,
+            "limit":                thresh.power_factor_limit,
+            "convention":           convention,
+            "min_pf":               float(magnitude.min()),
+            "mean_pf":              float(magnitude.mean()),
+            "pct_below_limit":      None,
+            "scope_note": (
+                "No interval carried enough load for its power factor to mean "
+                "anything. Displacement at a small fraction of peak demand is "
+                "arithmetic rather than a finding."),
+            "violation_timestamps": pd.DatetimeIndex([]),
+        }
+    low = graded < thresh.power_factor_limit
+    result = {
         "available":            True,
         "error":                None,
+        "assessed":             True,
         "limit":                thresh.power_factor_limit,
-        "min_pf":               float(pf.min()),
-        "mean_pf":              float(pf.mean()),
+        "convention":           convention,
+        "min_pf":               float(graded.min()),
+        "mean_pf":              float(graded.mean()),
         "pct_below_limit":      float(low.mean() * 100),
-        "violation_timestamps": pf.index[low],
+        "violation_timestamps": graded.index[low],
     }
+    if scope_note:
+        result["scope_note"] = scope_note
+        result["export_mean_pf"] = round(float(magnitude[~scope].mean()), 3)
+    if convention == "leading":
+        # Worth surfacing: R73 asks for 0.90 *lagging*, and a leading power
+        # factor is a different condition with a different cause.
+        result["pct_leading"] = round(float(negative[scope].mean() * 100), 1)
+    return result
 
 
 def check_trd(df: pd.DataFrame, thresh: Thresholds) -> dict:
@@ -4352,6 +4474,13 @@ def check_itic(event_result: dict, thresh: Thresholds) -> dict:
         "worst":        violations[0] if violations else None,
         "violations":   violations[:20],
     }
+
+
+#: Power factor is only meaningful on a loaded interval. Below this share of
+#: peak apparent power the ratio is dominated by whatever small reactive
+#: component is always there, and reads as a breach on a service that is
+#: simply idle. Matches the 10% used to gate the harmonic spectrum.
+_PF_LOAD_FLOOR_FRACTION = 0.10
 
 
 #: PSCo Sheet R123: the spread between the highest and lowest phase at which
