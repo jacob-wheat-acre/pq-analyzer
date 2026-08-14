@@ -568,7 +568,7 @@ class PQApp(tk.Tk):
                                font=_FONT_UI)
         rated_entry.pack(side="left")
 
-        tk.Label(nm_frame, text="Avg load kW", bg=_BG, fg=_LABEL_FG,
+        tk.Label(nm_frame, text="Non-gen load kW", bg=_BG, fg=_LABEL_FG,
                  font=_FONT_UI).pack(side="left", padx=(10, 4))
         self._avg_load_var = tk.StringVar(value="")
         avg_entry = tk.Entry(nm_frame, textvariable=self._avg_load_var, width=8,
@@ -577,7 +577,7 @@ class PQApp(tk.Tk):
 
         rated_hint = tk.Label(
             nm_frame,
-            text="(the two decide 519 vs 1547 — see ? Help)",
+            text="(load only, before generation offsets it — the two decide 519 vs 1547; see ? Help)",
             bg=_BG, fg="#888888", font=_FONT_UI_S)
         rated_hint.pack(side="left", padx=(8, 0))
 
@@ -2141,7 +2141,16 @@ class PQApp(tk.Tk):
             "Both quantities in that test come from records, not from the recording:\n"
             "a nameplate and a year of billing.  Enter them in the Power flow row.\n"
             "Without them the tool says the standard is undetermined rather than\n"
-            "guessing, because the two answers are not close together.",
+            "guessing, because the two answers are not close together.\n"
+            "\n"
+            "\"Annual average load demand\" is what the site consumes, before its own\n"
+            "generation offsets any of it.  It is not the net at the meter and it is\n"
+            "not an average of |current| — on a service that generates, the net runs\n"
+            "below the load all day and negative for part of it.  Feed the net in and\n"
+            "the denominator shrinks, which pushes sites over the 10% line and into\n"
+            "the wrong standard.  The form calls it \"Non-gen load kW\" for that\n"
+            "reason.  Where the array is behind the same meter as the load, the load\n"
+            "figure is the billed consumption plus whatever the array supplied to it.",
         )
 
         concept(

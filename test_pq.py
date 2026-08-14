@@ -2092,6 +2092,117 @@ class TestGenerationIL:
         assert td["il_amps"] < 300.0
 
 
+class TestTheLetterToAProducer:
+    """A plant is not a customer with unusual load, and reads nothing like one.
+
+    Nobody at a producer's array has noticed the lights flickering, because
+    there are no lights. What they have is a plant that trips, curtails or
+    underproduces, and SCADA to check a claim against -- so the letter is
+    written to be verifiable rather than evocative. Addressing them in the load
+    register reads as a form letter sent to the wrong site, which costs the
+    trust every other sentence is spending.
+    """
+
+    @staticmethod
+    def _report(role="generation", customer_class="sg"):
+        import pq_analysis as An
+        from pq_report import generate_report
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        th = Thresholds(nominal_voltage=277.0, customer_class=customer_class,
+                        service_role=role, isc_amps=40000.0, rated_ac_kw=250.0,
+                        annual_avg_load_kw=2.0)
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th),
+            An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th),
+        )
+        return rep, th
+
+    def test_the_register_follows_the_role_not_the_class(self):
+        # A producer keeps whichever schedule it takes service under, so the
+        # class cannot be what selects the voice.
+        from pq_report import _letter_register
+        for cls in ("r", "c", "sg", "pg"):
+            reg = _letter_register(Thresholds(customer_class=cls,
+                                              service_role="generation"))
+            assert reg["generating"] is True, cls
+        assert not _letter_register(
+            Thresholds(customer_class="sg")).get("generating")
+
+    def test_it_is_addressed_to_the_point_of_interconnection(self):
+        from pq_report import _customer_vocabulary
+        rep, th = self._report()
+        assert _customer_vocabulary(rep, th)["site"] == "the plant"
+
+    def test_the_symptoms_are_things_a_plant_can_check(self):
+        from pq_report import _customer_conditions
+        rep, th = self._report()
+        joined = " ".join(c["symptom"] for c in _customer_conditions(rep, th))
+        assert "lights" not in joined.lower()
+        assert any(w in joined for w in ("inverter", "SCADA", "interconnection"))
+
+    def test_power_factor_is_not_billed_to_a_plant_off_a_load_clause(self):
+        # The plant is not drawing reactive power to serve a load; what it must
+        # hold is set by the interconnection agreement and 1547 Clause 5.
+        # Quoting a load tariff sheet and recommending capacitors would send
+        # the operator after the wrong fix.
+        from pq_report import _customer_conditions
+        rep, th = self._report()
+        pf = [c for c in _customer_conditions(rep, th)
+              if "power factor" in c["headline"].lower()]
+        if pf:
+            body = pf[0]["means"]
+            assert "interconnection agreement" in body
+            assert "1547" in body
+            assert "Sheet R" not in body
+            assert "capacitors are not the remedy" in body.lower()
+
+    def test_imbalance_points_at_a_unit_not_at_a_panel(self):
+        from pq_report import _customer_conditions
+        rep, th = self._report()
+        imb = [c for c in _customer_conditions(rep, th)
+               if "unevenly split" in c["headline"]]
+        assert imb, "expected an imbalance finding on this fixture"
+        assert "electrician" not in imb[0]["means"]
+        assert "panel" not in imb[0]["means"]
+        assert "inverter" in imb[0]["means"]
+
+    def test_the_urgent_signs_are_plant_equipment(self):
+        from pq_report import _urgent_signs, _letter_register
+        gen = _urgent_signs(_letter_register(
+            Thresholds(customer_class="sg", service_role="generation")))
+        assert "outlets" not in gen and "combiner" in gen
+        load = _urgent_signs(_letter_register(Thresholds(customer_class="r")))
+        assert "outlets" in load
+
+    def test_a_plant_is_not_shown_the_itic_curve(self):
+        # ITIC is a ride-through envelope for load equipment. A plant's
+        # obligation is 1547 Clause 6, a different curve this does not assess,
+        # so showing ITIC would invite judging it against the wrong standard.
+        from pq_report import _letter_register
+        assert _letter_register(
+            Thresholds(customer_class="sg",
+                       service_role="generation"))["itic_curve"] is False
+
+    def test_the_load_register_is_untouched(self):
+        from pq_report import _letter_register
+        reg = _letter_register(Thresholds(customer_class="r"))
+        assert reg["site"] == "your home"
+        assert reg["explains_basics"] is True
+
+
 class TestTariffScopingIsNotMisstated:
     """The two PF clauses and the 15% clause, as the filed tariff has them.
 

@@ -333,9 +333,11 @@ EXAMPLES
                         "the IEEE 1547 limits and the numerator of the 519-2022 "
                         "Figure 1 test for which standard applies.")
     p.add_argument("--annual-avg-load-kw", type=float, default=None,
-                   help="Annual average load demand, kW, from billing history. The "
-                        "denominator of the 519-2022 Figure 1 test: at or above 10%% "
-                        "generation the installation goes to IEEE 1547.")
+                   help="Annual average load demand, kW, from billing history: what "
+                        "the site consumes, before its own generation offsets any of "
+                        "it — not the net at the meter. Denominator of the 519-2022 "
+                        "Figure 1 test; at or above 10%% generation the installation "
+                        "goes to IEEE 1547.")
     p.add_argument("--il-amps", type=float, default=None,
                    help="Maximum demand load current from billing: the twelve "
                         "previous months' 15- or 30-min maximum demands, averaged, "

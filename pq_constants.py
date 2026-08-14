@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.48.1"
+__version__ = "0.49.0"
 
 
 @dataclass
@@ -81,6 +81,13 @@ class Thresholds:
     rated_ac_kw: Optional[float] = None
     # Annual average load demand, kW.  Figure 1's denominator, and available
     # only from billing history.  Without it the standards test cannot be run.
+    #
+    # This is what the site *consumes*, before its own generation offsets any
+    # of it -- not the net at the meter, and not an average of |current|.  On a
+    # service that generates, the net is smaller than the load and can be
+    # negative for part of the day; using it here would shrink the denominator
+    # and push sites across the 10% line into the wrong standard.  The label on
+    # the form says "non-gen load" for that reason.
     annual_avg_load_kw: Optional[float] = None
     # IL from billing, in amps.  519-2022 defines maximum demand load current
     # as the twelve previous months' 15- or 30-minute maximum demands averaged,

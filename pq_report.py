@@ -5290,6 +5290,72 @@ _SYMPTOMS = {
         "normal."),
 }
 
+#: The same conditions as they present at a plant, where nobody has noticed the
+#: lights doing anything. What a producer sees is inverters coming off line,
+#: output curtailed, or generation that does not match irradiance -- and unlike
+#: a homeowner they can check any of it against SCADA and revenue metering,
+#: so these are written to be verifiable rather than evocative.
+_SYMPTOMS_GENERATION = {
+    "under_voltage": (
+        "Inverters running closer to their low-voltage limit than the design "
+        "allows for, and reaching for reactive support they were not sized to "
+        "provide. Check for units riding at the bottom of their operating band "
+        "during the site's highest output."),
+    "over_voltage": (
+        "The most common cause of lost production on a generating service: as "
+        "output rises it lifts the voltage at the point of interconnection, "
+        "and the inverters curtail or disconnect to stay inside their limits. "
+        "It shows in SCADA as clipping or trips that track the sunniest hours "
+        "rather than the cloudiest."),
+    "sag_events": (
+        "Inverters tripping off line and going through their reconnect timers, "
+        "so a momentary dip costs minutes of production rather than seconds. "
+        "Cross-check the timestamps below against your trip logs."),
+    "swell_events": (
+        "Protective trips on overvoltage, and stress on DC-link capacitors and "
+        "surge protection. Repeated events shorten the life of both."),
+    "flicker": (
+        "Rapid output fluctuation reaching the system, usually from cloud "
+        "transients across a large array or from a battery cycling faster than "
+        "the interconnection can absorb smoothly."),
+    "neutral": (
+        "A high-impedance or open neutral on the auxiliary supply. It affects "
+        "trackers, controls and SCADA rather than the inverters themselves, so "
+        "it shows as instrumentation faults rather than as lost generation."),
+    "imbalance": (
+        "Per-inverter production data with one unit or string group sitting "
+        "consistently below its neighbours under the same irradiance, or a "
+        "phase current trend in SCADA that stays split rather than moving "
+        "together. Both point at the same unit."),
+}
+
+
+def _urgent_signs(register: dict) -> str:
+    """What "call us now" looks like, in equipment the reader actually has.
+
+    A plant has no outlets and no domestic panel, and telling an operator to
+    watch for scorch marks around either reads as a letter sent to the wrong
+    site -- which costs the trust every other sentence is spending.
+    """
+    if register.get("generating"):
+        return ("If you find signs of heating or arcing at the point of "
+                "interconnection, in the combiner boxes, or at the inverter or "
+                "switchgear terminations, treat that as urgent: isolate the "
+                "affected equipment and call the emergency number on your bill.")
+    return ("If you ever smell burning or see scorch marks near outlets or your "
+            "panel, treat that as urgent and call the emergency number on your "
+            "bill.")
+
+
+def _symptoms_for(register: dict) -> dict:
+    """The symptom vocabulary matching who the letter is addressed to.
+
+    A producer has not noticed the lights doing anything, so the load wording
+    would read as a form letter sent to the wrong site -- and worse, would
+    invite them to look for evidence that cannot exist there.
+    """
+    return _SYMPTOMS_GENERATION if register.get("generating") else _SYMPTOMS
+
 
 def _event_counts(event_result: dict) -> Dict[str, int]:
     """Count detected events by type.
@@ -5363,6 +5429,27 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "detail": "full",
         "itic_curve": True,
     },
+    # A producer's array is not a customer class -- it keeps whichever schedule
+    # it takes service under -- but it is a different reader entirely. Nobody
+    # there has noticed the lights flickering, because there are no lights.
+    # What they have is a plant that trips, curtails or underproduces, and a
+    # SCADA history to check a claim against.
+    "generation": {
+        "site": "the plant",
+        "reader": "the operator responsible for the plant",
+        "explains_basics": False,
+        "pf_sheet": "Sheet R121",
+        "owns_transformer": True,
+        "fix_agent": "your O&M contractor or the inverter supplier",
+        "detail": "full",
+        # ITIC is a ride-through envelope for load equipment. A generating
+        # plant's ride-through obligation is IEEE 1547 Clause 6, which is a
+        # different curve and is not assessed here, so showing this one would
+        # invite the reader to judge the plant against the wrong standard.
+        "itic_curve": False,
+        "symptom_label": "What this may look like on site:  ",
+        "generating": True,
+    },
 }
 
 #: A letter that lists only exceptions leaves its reader unable to tell a clean
@@ -5381,17 +5468,22 @@ for _key, _reg in _LETTER_REGISTER.items():
 
 #: Service classes that get the plain-language letter, and what to call the
 #: site. Every class does; the depth is what differs, per _LETTER_REGISTER.
-_LETTER_CLASSES = {cls: reg["site"] for cls, reg in _LETTER_REGISTER.items()}
+_LETTER_CLASSES = {cls: reg["site"] for cls, reg in _LETTER_REGISTER.items()
+                   if not reg.get("generating")}
 
 
-def _letter_register(customer_class: str) -> dict:
-    """The register for a class, defaulting to the most explanatory one.
+def _letter_register(thresh) -> dict:
+    """The register for a service, defaulting to the most explanatory one.
 
-    An unrecognised class gets the fullest explanation rather than the
-    tersest: over-explaining to an engineer wastes their time, while
-    under-explaining to a homeowner loses them entirely.
+    A plant with no load is addressed as a plant whatever schedule it takes
+    service under, so the role is checked before the class. Everything else
+    keys on the class: an unrecognised one gets the fullest explanation rather
+    than the tersest, because over-explaining to an engineer wastes their time
+    while under-explaining to a homeowner loses them entirely.
     """
-    return _LETTER_REGISTER.get(customer_class, _LETTER_REGISTER["r"])
+    if getattr(thresh, "service_role", "load") == "generation":
+        return _LETTER_REGISTER["generation"]
+    return _LETTER_REGISTER.get(thresh.customer_class, _LETTER_REGISTER["r"])
 
 
 def _discard_stale_letter(path: Path, reason: str) -> None:
@@ -5426,10 +5518,22 @@ def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
     120-volt halves; a three-phase business has a neutral shared by three phases,
     and describing it as two halves would simply be wrong.
     """
-    register = _letter_register(thresh.customer_class)
+    register = _letter_register(thresh)
     site = register["site"]
     topology = (report.get("file_summary") or {}).get("topology", "")
-    if topology == "3-phase":
+    if register.get("generating"):
+        # The neutral at a plant serves trackers, controls and SCADA, not the
+        # inverters, which are line-to-line. Describing it as the return for
+        # the site's supply would point an operator at the wrong cabinet.
+        neutral_measured = (
+            f"The auxiliary supply at {site} shares one return wire, called "
+            "the neutral, between its phases. If that shared connection "
+            "loosens or corrodes the phase voltages begin to move against each "
+            "other instead of holding steady, so that is the pattern we look "
+            "for. It affects trackers, controls and SCADA rather than the "
+            "inverters, which do not use it.")
+        neutral_symptom = _symptoms_for(register)["neutral"]
+    elif topology == "3-phase":
         neutral_measured = (
             f"{site.capitalize()} is supplied by three separate live wires that "
             "share one return wire, called the neutral. If that shared connection "
@@ -5448,7 +5552,7 @@ def _customer_vocabulary(report: dict, thresh: Thresholds) -> dict:
             "loosens or corrodes, the two halves begin to move in opposite "
             "directions -- one rising as the other falls -- so that is the "
             "pattern we look for.")
-        neutral_symptom = _SYMPTOMS["neutral"]
+        neutral_symptom = _symptoms_for(register)["neutral"]
     return {"site": site, "neutral_measured": neutral_measured,
             "neutral_symptom": neutral_symptom,
             # Everything above residential is billed for power factor and can
@@ -5575,7 +5679,7 @@ def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
             p95 <= v_thd["limit_pct"])
 
     pfr = report.get("power_factor") or {}
-    register = _letter_register(thresh.customer_class)
+    register = _letter_register(thresh)
     if pfr.get("available") and register.get("pf_sheet"):
         add("Power factor",
             f"lowest {_m(pfr['min_pf'], '.2f')}, "
@@ -5610,6 +5714,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     hours = (report.get("file_summary") or {}).get("duration_hours") or 0
     vocab = _customer_vocabulary(report, thresh)
     site = vocab["site"]
+    symptoms = _symptoms_for(vocab["register"])
     #: Whether this reader gets extent and phase alongside the peak, or just
     #: the peak. A facility engineer acts on how long a condition held; a
     #: homeowner is served by the shortest true sentence.
@@ -5636,7 +5741,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                     + ("refrigeration, compressors, pumps and air conditioning plant."
                        if vocab["is_business"] else
                        "refrigerators, freezers, air conditioners and well pumps.")),
-                "symptom": _SYMPTOMS["under_voltage"],
+                "symptom": symptoms["under_voltage"],
             })
         if worst_high is not None and worst_high > hi:
             out.append({
@@ -5653,7 +5758,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                 "means": (
                     "Sustained high voltage shortens the life of light bulbs and of "
                     "the electronics inside appliances."),
-                "symptom": _SYMPTOMS["over_voltage"],
+                "symptom": symptoms["over_voltage"],
             })
 
     # ── Voltage unbalance between the phases ──────────────────────────────
@@ -5759,7 +5864,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                 "Brief dips are usually caused by a large load starting up, either "
                 f"at {site} or nearby. Most equipment rides through them; clocks, "
                 "controls and electronics without battery backup may not."),
-            "symptom": _SYMPTOMS["sag_events"],
+            "symptom": symptoms["sag_events"],
         })
     if n_swell:
         out.append({
@@ -5769,7 +5874,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
             "means": (
                 "Brief rises often follow a large load switching off. Surge "
                 "protection on sensitive electronics is worthwhile."),
-            "symptom": _SYMPTOMS["swell_events"],
+            "symptom": symptoms["swell_events"],
         })
 
     # ── Visible flicker ───────────────────────────────────────────────────
@@ -5804,7 +5909,7 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                 "because flicker at this level is a recognized nuisance: it is the "
                 "kind of thing people notice as eye strain or restlessness in a "
                 "room without necessarily realizing the lighting is the cause."),
-            "symptom": _SYMPTOMS["flicker"],
+            "symptom": symptoms["flicker"],
         })
 
     # ── Small business only: things that cost money or appear on a bill ───
@@ -5814,36 +5919,71 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
     if vocab["is_business"]:
         register = vocab["register"]
         if pfr.get("available") and pfr.get("pct_below_limit", 0) > 0:
-            sheet = register["pf_sheet"] or "the applicable tariff sheet"
-            # Schedule PG asks for near unity rather than a stated 0.90 floor,
-            # so quoting a 0.90 requirement at a primary customer would be
-            # quoting them the wrong tariff.
-            requirement = ("near unity" if thresh.customer_class == "pg"
-                           else "0.90 or better")
-            explanation = (
-                "Power factor describes how much of the current you draw does "
-                "useful work. At a low power factor you draw more current for "
-                "the same output, which loads your wiring and ours without "
-                "producing anything extra. "
-                if register["explains_basics"] else
-                "Reactive demand raises the current for the same real load, "
-                "loading the service without producing output. ")
-            out.append({
-                "headline": "Your power factor is below the level the tariff requires",
-                "measured": (
-                    f"Power factor averaged {_m(pfr['mean_pf'], '.2f')} and fell as low "
-                    f"as {_m(pfr['min_pf'], '.2f')}. PSCo Electric Tariff {sheet} requires "
-                    f"{requirement}."),
-                "means": (
-                    explanation
-                    + f"Under {sheet} this can attract a billing adjustment, so "
-                    "correcting it usually pays for itself. The normal remedy is "
-                    "power factor correction capacitors, which "
-                    + register["fix_agent"] + " can size and install."),
-                "symptom": (
-                    "Nothing you would see or hear. This shows up on the bill "
-                    "rather than in how equipment behaves."),
-            })
+            if register.get("generating"):
+                # A load PF clause is the wrong instrument here. The plant is
+                # not drawing reactive power to serve a load; it is exporting
+                # at whatever displacement its inverters are commanded to, and
+                # what governs that is the interconnection agreement together
+                # with the reactive capability IEEE 1547 Clause 5 requires of
+                # the units. Quoting a tariff sheet written for load, and
+                # recommending capacitors, would send them after the wrong fix.
+                out.append({
+                    "headline": "Displacement power factor at the point of interconnection",
+                    "measured": (
+                        f"Power factor averaged {_m(pfr['mean_pf'], '.2f')} and "
+                        f"fell as low as {_m(pfr['min_pf'], '.2f')} over the "
+                        "recording, measured at the point of interconnection "
+                        "across both directions of flow."),
+                    "means": (
+                        "For a generating facility this is a question for the "
+                        "interconnection agreement rather than for the load "
+                        "power factor clauses of the tariff: what the plant is "
+                        "required to hold, and whether the inverters are being "
+                        "commanded to hold it, are set there and in the "
+                        "reactive capability IEEE 1547 Clause 5 requires of the "
+                        "units. It is reported here as measured, without a "
+                        "compliance finding attached, because this recording "
+                        "does not establish what was commanded. Capacitors are "
+                        "not the remedy on an inverter-based plant; the "
+                        "reactive capability is already in the units."),
+                    "symptom": (
+                        "Check the reactive setpoint or power factor mode the "
+                        "inverters are running in against what the "
+                        "interconnection agreement specifies. A plant left in "
+                        "unity power factor mode where the agreement expects "
+                        "voltage or reactive support is the usual explanation."),
+                })
+            else:
+                sheet = register["pf_sheet"] or "the applicable tariff sheet"
+                # Schedule PG asks for near unity rather than a stated 0.90
+                # floor, so quoting a 0.90 requirement at a primary customer
+                # would be quoting them the wrong tariff.
+                requirement = ("near unity" if thresh.customer_class == "pg"
+                               else "0.90 or better")
+                explanation = (
+                    "Power factor describes how much of the current you draw does "
+                    "useful work. At a low power factor you draw more current for "
+                    "the same output, which loads your wiring and ours without "
+                    "producing anything extra. "
+                    if register["explains_basics"] else
+                    "Reactive demand raises the current for the same real load, "
+                    "loading the service without producing output. ")
+                out.append({
+                    "headline": "Your power factor is below the level the tariff requires",
+                    "measured": (
+                        f"Power factor averaged {_m(pfr['mean_pf'], '.2f')} and fell as low "
+                        f"as {_m(pfr['min_pf'], '.2f')}. PSCo Electric Tariff {sheet} requires "
+                        f"{requirement}."),
+                    "means": (
+                        explanation
+                        + f"Under {sheet} this can attract a billing adjustment, so "
+                        "correcting it usually pays for itself. The normal remedy is "
+                        "power factor correction capacitors, which "
+                        + register["fix_agent"] + " can size and install."),
+                    "symptom": (
+                        "Nothing you would see or hear. This shows up on the bill "
+                        "rather than in how equipment behaves."),
+                })
 
         # Transformer loading, for the classes whose demand actually drives it.
         # A homeowner owns no transformer and a small commercial customer
@@ -5942,18 +6082,36 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
 
     # ── Load balance across the service ───────────────────────────────────
     if ci.get("available") and ci.get("pct_exceeding", 0) > 0:
-        out.append({
-            "headline": f"The electrical load is unevenly split across {site}",
-            "measured": (
-                f"The parts of your service differed in load by an average of "
-                f"{_m(ci['mean_imbalance_pct'], '.0f', '%')}, and at times by "
-                f"{_m(ci['max_imbalance_pct'], '.0f', '%')}."),
-            "means": (
-                "An uneven split is common and is not a fault in itself. It does make "
-                "low voltage and neutral problems worse, so it is worth correcting if "
-                "an electrician is already working in your panel."),
-            "symptom": _SYMPTOMS["imbalance"],
-        })
+        if vocab["register"].get("generating"):
+            out.append({
+                "headline": "Output is unevenly split across the phases",
+                "measured": (
+                    f"The phases differed in current by an average of "
+                    f"{_m(ci['mean_imbalance_pct'], '.0f', '%')}, and at times "
+                    f"by {_m(ci['max_imbalance_pct'], '.0f', '%')}."),
+                "means": (
+                    "On an inverter-based plant the phases are driven, not "
+                    "loaded, so a persistent split usually points at one unit "
+                    "or string group rather than at how something was "
+                    "connected. It is worth tracing: an imbalance that follows "
+                    "a single inverter is often the first sign of a fault on "
+                    "that unit, and it costs production before it costs "
+                    "anything else."),
+                "symptom": symptoms["imbalance"],
+            })
+        else:
+            out.append({
+                "headline": f"The electrical load is unevenly split across {site}",
+                "measured": (
+                    f"The parts of your service differed in load by an average of "
+                    f"{_m(ci['mean_imbalance_pct'], '.0f', '%')}, and at times by "
+                    f"{_m(ci['max_imbalance_pct'], '.0f', '%')}."),
+                "means": (
+                    "An uneven split is common and is not a fault in itself. It does make "
+                    "low voltage and neutral problems worse, so it is worth correcting if "
+                    "an electrician is already working in your panel."),
+                "symptom": symptoms["imbalance"],
+            })
 
     return out
 
@@ -6047,6 +6205,17 @@ def generate_customer_letter(
             "above. It measured the voltage and current many times a second and "
             "stored a summary every few minutes. This letter explains what those "
             "measurements show, in plain terms.")
+    elif register.get("generating"):
+        # A plant is metered at its point of interconnection, and what it wants
+        # to know is whether the system it exports into is holding up its end.
+        _body(doc,
+            f"A power quality recorder was installed at the point of "
+            f"interconnection of {vocab['site']} for the period shown above, "
+            "logging voltage, current, distortion and disturbance events at "
+            "interval resolution. This letter sets out what the recording "
+            "shows, what each figure is measured against, and what follows "
+            "from it. Where a condition would bear on the plant's own "
+            "production, that is said with the finding.")
     else:
         # No explanation of what a meter does: this reader specifies them.
         _body(doc,
@@ -6071,8 +6240,13 @@ def generate_customer_letter(
             "anything into the detail — it is here so you can see the whole "
             "period the findings below are drawn from."
             if register["explains_basics"] else
-            "Voltage and current across the whole recording, so the findings "
-            "below can be read against the conditions they came from.")
+            ("Voltage and current across the whole recording, so the findings "
+             "below can be read against the conditions they came from. The "
+             "current is the plant's output, so it follows the resource rather "
+             "than a load profile."
+             if register.get("generating") else
+             "Voltage and current across the whole recording, so the findings "
+             "below can be read against the conditions they came from."))
         _embed_plot(doc, outdir, stem, "overview.png",
                     caption="Voltage and current recorded at your service.")
         doc.add_paragraph()
@@ -6145,8 +6319,11 @@ def generate_customer_letter(
         _body(doc,
             f"We found {len(conditions)} thing"
             f"{'s' if len(conditions) != 1 else ''} worth bringing to your "
-            "attention. Each is explained below: what we measured, what it means, "
-            "and what you may have noticed.")
+            "attention. Each is explained below: what we measured, what it "
+            "means, and "
+            + ("what it would look like on site."
+               if register.get("generating") else
+               "what you may have noticed."))
 
     safety = [c for c in conditions if c.get("safety")]
     for idx, cond in enumerate(conditions, start=1):
@@ -6158,9 +6335,14 @@ def generate_customer_letter(
         # something about the finding that was never assessed. What is a safety
         # concern is answered in words, in its own section immediately below.
         _bold(p, f"{idx}. {cond['headline']}", color=_XE_RED, size_pt=11)
+        # "What you may have noticed" assumes someone was standing there when
+        # it happened. At a plant nobody was, and the question is instead what
+        # this would look like in the trip logs and production data.
         for label, key in (("What we measured:  ", "measured"),
                            ("What this means:  ", "means"),
-                           ("What you may have noticed:  ", "symptom")):
+                           (register.get("symptom_label",
+                                         "What you may have noticed:  "),
+                            "symptom")):
             q = doc.add_paragraph()
             q.paragraph_format.left_indent = Cm(0.6)
             _bold(q, label, size_pt=10)
@@ -6257,15 +6439,12 @@ def generate_customer_letter(
         _body(doc,
             "We did not find anything in these measurements that suggests an "
             "immediate safety risk. The items above affect how well your equipment "
-            "works and how long it lasts, rather than presenting a hazard. If you "
-            "ever smell burning or see scorch marks near outlets or your panel, "
-            "treat that as urgent and call the emergency number on your bill.")
+            "works and how long it lasts, rather than presenting a hazard. "
+            + _urgent_signs(register))
     else:
         _body(doc,
             "We did not find anything in these measurements that suggests a safety "
-            "risk. If you ever smell burning or see scorch marks near outlets or "
-            "your panel, treat that as urgent and call the emergency number on your "
-            "bill.")
+            "risk. " + _urgent_signs(register))
 
     # ── What happens next ─────────────────────────────────────────────────
     doc.add_paragraph()
