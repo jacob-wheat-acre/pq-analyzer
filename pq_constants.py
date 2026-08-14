@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.54.0"
+__version__ = "0.55.0"
 
 
 @dataclass
@@ -378,10 +378,19 @@ SEVERITY_WATCH_FRACTION = 0.85
 #: Watch.  0.95 flags roughly PF < 0.945 instead.
 SEVERITY_WATCH_FRACTION_FLOOR = 0.95
 
-#: Over the limit by this ratio -> at least "Significant".
-SEVERITY_SIGNIFICANT_MARGIN = 1.20
-#: Over the limit for this share of the recording (%) -> at least "Significant".
+#: "Significant" is built the same way as "Severe" below: a margin and a
+#: persistence together, with a margin-alone escape for a large excursion that
+#: did not last.  It used to be an OR on these two, which meant persistence
+#: alone promoted anything -- a metric 1% past its limit for a quarter of the
+#: week graded the same as one 20% past it, and a power factor of 0.89 against
+#: a 0.90 limit came out "Significant".  That is the disproportion the grading
+#: exists to prevent.
+SEVERITY_SIGNIFICANT_MARGIN = 1.05
+#: Over the limit for this share of the recording (%), together with the margin
+#: above -> "Significant".
 SEVERITY_SIGNIFICANT_PERSISTENCE = 25.0
+#: ...or this far past the limit, however briefly.
+SEVERITY_SIGNIFICANT_MARGIN_ALONE = 1.20
 
 #: "Severe" needs both a large margin and persistence -- a brief 1.6x excursion
 #: is not the same finding as one that holds for a quarter of the week.

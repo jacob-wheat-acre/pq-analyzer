@@ -2149,6 +2149,160 @@ _DOCUMENT_MATRIX = [
 ]
 
 
+class TestSeverityGradesTheRightQuantity:
+    """The margin has to describe whatever the verdict was reached on.
+
+    Voltage imbalance failed on excursions while the margin was computed from
+    the mean, so a residential service reaching 23% imbalance on a tenth of its
+    intervals was reported as "0.77x the limit" -- which reads as comfortably
+    inside. The 95th percentile is what IEEE 519 grades its own limits on, and
+    unlike the maximum it is not set by a single bad interval.
+    """
+
+    @staticmethod
+    def _ds(name):
+        from pathlib import Path
+        return extract_dataset(ProntoAdapter(
+            str(Path(__file__).parent / "test_data" / f"{name}.pqd")),
+            ChannelMapper())
+
+    def test_the_imbalance_checks_expose_a_percentile(self):
+        import pq_analysis as An
+        ds = self._ds("test_commercial_large")
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg")
+        for fn in (An.check_voltage_imbalance, An.check_current_imbalance):
+            r = fn(ds.df, th)
+            assert "p95_imbalance_pct" in r
+            assert r["mean_imbalance_pct"] <= r["p95_imbalance_pct"] + 1e-9
+            assert r["p95_imbalance_pct"] <= r["max_imbalance_pct"] + 1e-9
+
+    def test_current_tdd_exposes_a_percentile(self):
+        import pq_analysis as An
+        ds = self._ds("test_commercial_large")
+        c = An.check_thd(ds.df, Thresholds(nominal_voltage=277.0,
+                                           customer_class="sg",
+                                           isc_amps=40000.0))["current"]
+        assert c["mean_thd_pct"] <= c["p95_thd_pct"] <= c["max_thd_pct"] + 1e-9
+
+    def test_a_failing_finding_never_reports_a_margin_under_one(self):
+        # The symptom that gave this away: a failure described as 0.77x the
+        # limit. If the verdict is "outside", the margin must say so too.
+        import pq_analysis as An
+        from pq_report import generate_report, compute_severities
+        ds = self._ds("test_commercial_large")
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                        isc_amps=40000.0)
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th))
+        for key, graded in compute_severities(rep, th).items():
+            if graded["band"] in ("minor", "significant", "severe"):
+                margin = graded.get("margin")
+                if margin is not None:
+                    assert margin >= 1.0, (key, margin, graded["reason"])
+
+
+class TestSeverityNeedsMarginAndPersistence:
+    """"Significant" now takes the same shape as "severe".
+
+    It used to be an OR, so persistence alone promoted anything: a metric 1.2%
+    past its limit for a quarter of the week graded the same as one 20% past
+    it, and a power factor of 0.89 against a 0.90 limit came out Significant.
+    That is the disproportion the grading exists to prevent.
+    """
+
+    @staticmethod
+    def _band(measured, limit, persistence, lower=False):
+        from pq_analysis import grade_finding
+        return grade_finding(False, measured=measured, limit=limit,
+                             persistence_pct=persistence,
+                             lower_is_worse=lower)["band"]
+
+    def test_persistence_alone_no_longer_promotes(self):
+        # 1.2% over the limit is a minor finding whether it lasts an hour or
+        # the whole recording.
+        assert self._band(8.1, 8.0, 24) == "minor"
+        assert self._band(8.1, 8.0, 25) == "minor"
+        assert self._band(8.1, 8.0, 100) == "minor"
+
+    def test_a_margin_with_persistence_is_significant(self):
+        assert self._band(8.5, 8.0, 100) == "significant"
+        assert self._band(8.5, 8.0, 10) == "minor"      # margin without duration
+
+    def test_a_large_margin_alone_is_still_significant(self):
+        assert self._band(9.6, 8.0, 1) == "significant"
+
+    def test_severe_is_unchanged(self):
+        assert self._band(12.0, 8.0, 24) == "significant"
+        assert self._band(12.0, 8.0, 25) == "severe"
+        assert self._band(16.5, 8.0, 1) == "severe"
+
+    def test_a_marginal_power_factor_is_not_significant(self):
+        # 0.89 against a 0.90 limit is 1% short, all week.
+        assert self._band(0.89, 0.90, 100, lower=True) == "minor"
+        assert self._band(0.855, 0.90, 100, lower=True) == "significant"
+
+    def test_the_two_bands_share_one_shape(self):
+        # Both are (margin AND persistence) OR margin-alone, which is what
+        # keeps the ladder explicable to a reader.
+        from pq_constants import (SEVERITY_SIGNIFICANT_MARGIN,
+                                  SEVERITY_SIGNIFICANT_MARGIN_ALONE,
+                                  SEVERITY_SEVERE_MARGIN,
+                                  SEVERITY_SEVERE_MARGIN_ALONE)
+        assert SEVERITY_SIGNIFICANT_MARGIN < SEVERITY_SIGNIFICANT_MARGIN_ALONE
+        assert SEVERITY_SIGNIFICANT_MARGIN_ALONE <= SEVERITY_SEVERE_MARGIN
+        assert SEVERITY_SEVERE_MARGIN < SEVERITY_SEVERE_MARGIN_ALONE
+
+
+class TestLegDifferenceIsNotGradedAgainstNEMA:
+    """A split-phase service has no NEMA MG1 unbalance to be outside of.
+
+    The check already said so in words -- "NEMA MG1 unbalance is defined for
+    three-phase systems and is not applicable to a single-phase service" --
+    and then compared the leg difference against the 3% NEMA limit anyway.
+    With the mean as the margin that surfaced as a quiet "minor"; with a
+    percentile it became a "severe" on every house.
+    """
+
+    @staticmethod
+    def _result(name, nominal, cls):
+        import pq_analysis as An
+        from pathlib import Path
+        ds = extract_dataset(ProntoAdapter(
+            str(Path(__file__).parent / "test_data" / f"{name}.pqd")),
+            ChannelMapper())
+        th = Thresholds(nominal_voltage=nominal, customer_class=cls)
+        return An.check_voltage_imbalance(ds.df, th)
+
+    def test_a_split_phase_service_gets_no_limit(self):
+        r = self._result("test_residential", 120.0, "r")
+        assert r["metric"] == "leg_difference"
+        assert r["limit_pct"] is None
+        assert r["pct_exceeding"] == 0        # nothing to exceed
+
+    def test_a_three_phase_service_keeps_the_nema_limit(self):
+        r = self._result("test_commercial_large", 277.0, "sg")
+        assert r["metric"] == "nema_mg1"
+        assert r["limit_pct"] == 3.0
+
+    def test_the_measurement_is_still_reported(self):
+        # Not graded is not the same as not measured: the leg difference is a
+        # real indicator of unequal loading or neutral impedance.
+        r = self._result("test_residential", 120.0, "r")
+        assert r["max_imbalance_pct"] > 0
+        assert r["p95_imbalance_pct"] > 0
+
+
 class TestBothDocumentsBuildForEveryFixture:
     """The end-to-end guard the unit tests kept missing.
 

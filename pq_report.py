@@ -482,7 +482,11 @@ def generate_report(
                                        if pf_result.get("pct_below_limit") is not None
                                        else None)
                                       if pf_result["available"] else None,
-            "voltage_imbalance":      volt_imb_result["pct_exceeding"] == 0
+            # No limit means not evaluated, which is None -- not a pass. On
+            # two legs the metric is a leg difference no standard bounds.
+            "voltage_imbalance":      (volt_imb_result["pct_exceeding"] == 0
+                                       if volt_imb_result.get("limit_pct") is not None
+                                       else None)
                                       if volt_imb_result["available"] else None,
             # No limit means not evaluated, which is None -- not a pass. On a
             # two-leg service the leg difference is reported as a measurement
@@ -733,6 +737,13 @@ def print_report(report: dict) -> None:
     imb = report["voltage_imbalance"]
     if not imb["available"]:
         print(f"  {imb['error']}")
+    elif imb.get("limit_pct") is None:
+        # Two legs: a leg difference, which no standard bounds. Reported.
+        print(f"  Max={imb['max_imbalance_pct']:.2f}%  "
+              f"Mean={imb['mean_imbalance_pct']:.2f}%  "
+              f"P95={imb['p95_imbalance_pct']:.2f}%  [REPORTED — no limit applies]")
+        print("  NEMA MG1 unbalance is a three-phase definition; this is the "
+              "leg-to-leg difference against nominal.")
     else:
         sym = "PASS" if imb["pct_exceeding"] == 0 else "FAIL"
         print(f"  Max={imb['max_imbalance_pct']:.2f}%  Mean={imb['mean_imbalance_pct']:.2f}%  "
@@ -2013,13 +2024,15 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     # definition does not apply.
     if imb["available"]:
         meas = (f"Max {_m(imb['max_imbalance_pct'], '.2f', '%')}  /  "
-                f"Mean {_m(imb['mean_imbalance_pct'], '.2f', '%')}  "
-                f"(limit {imb['limit_pct']:.1f}%)")
+                f"Mean {_m(imb['mean_imbalance_pct'], '.2f', '%')}")
         if imb.get("metric") == "nema_mg1":
+            meas += f"  (limit {imb['limit_pct']:.1f}%)"
             imb_label = "Voltage imbalance < 3% (ANSI C84.1 / NEMA MG1)"
         else:
-            imb_label = (f"Leg-to-leg voltage difference < "
-                         f"{imb['limit_pct']:.0f}% of nominal (single-phase service)")
+            # Reported, not graded: the leg difference is a different quantity
+            # from NEMA unbalance and no standard bounds it.
+            imb_label = ("Leg-to-leg voltage difference "
+                         "(reported, no limit applies)")
             meas += "  |  NEMA MG1 unbalance is a three-phase definition"
             if imb.get("note"):
                 meas += "; only two of three phases measured"
@@ -2664,7 +2677,7 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
         if c_thd.get("light_load_filtered"):
             notes.append("light-load intervals excluded")
         sev["thd_current"] = grade_finding(
-            pf.get("thd_current"), measured=c_thd.get("mean_thd_pct"),
+            pf.get("thd_current"), measured=c_thd.get("p95_thd_pct"),
             limit=c_thd.get("limit_pct"),
             persistence_pct=c_thd.get("pct_exceeding"), confidence_notes=notes)
 
@@ -2681,12 +2694,12 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
 
     if imb.get("available"):
         sev["voltage_imbalance"] = grade_finding(
-            pf.get("voltage_imbalance"), measured=imb.get("mean_imbalance_pct"),
+            pf.get("voltage_imbalance"), measured=imb.get("p95_imbalance_pct"),
             limit=imb.get("limit_pct"), persistence_pct=imb.get("pct_exceeding"))
 
     if ci.get("available"):
         sev["current_imbalance"] = grade_finding(
-            pf.get("current_imbalance"), measured=ci.get("mean_imbalance_pct"),
+            pf.get("current_imbalance"), measured=ci.get("p95_imbalance_pct"),
             limit=ci.get("limit_pct"), persistence_pct=ci.get("pct_exceeding"))
 
     if "transformer" in dem:
@@ -5770,12 +5783,17 @@ def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
 
     imb = report.get("voltage_imbalance") or {}
     if imb.get("available"):
+        # On two legs this is a leg difference, which no standard bounds, so
+        # the customer sees the measurement without a verdict attached.
+        graded_imb = imb.get("limit_pct") is not None
         add("Voltage balance between phases",
             f"highest {_m(imb['max_imbalance_pct'], '.2f', '%')}, "
             f"average {_m(imb['mean_imbalance_pct'], '.2f', '%')}",
-            f"{imb.get('metric_label') or 'NEMA MG1'}: "
-            f"{imb['limit_pct']:.0f}% maximum",
-            imb["max_imbalance_pct"] <= imb["limit_pct"])
+            (f"{imb.get('metric_label') or 'NEMA MG1'}: "
+             f"{imb['limit_pct']:.0f}% maximum" if graded_imb else
+             f"{imb.get('metric_label') or 'Leg difference'}: "
+             "reported, no limit applies"),
+            (imb["max_imbalance_pct"] <= imb["limit_pct"]) if graded_imb else None)
 
     itic = report.get("itic") or {}
     if itic.get("available"):

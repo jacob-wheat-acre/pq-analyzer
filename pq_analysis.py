@@ -21,6 +21,7 @@ from pq_constants import (
     SEVERITY_SEVERE_MARGIN_ALONE,
     SEVERITY_SEVERE_PERSISTENCE,
     SEVERITY_SIGNIFICANT_MARGIN,
+    SEVERITY_SIGNIFICANT_MARGIN_ALONE,
     SEVERITY_SIGNIFICANT_PERSISTENCE,
     LOAD_FAMILY_LABEL,
     LOAD_FAMILY_RECOMMENDATION,
@@ -140,10 +141,17 @@ def grade_finding(
     p = persistence_pct if persistence_pct is not None else 0.0
     m = margin if margin is not None else 1.0
 
+    # Both upper bands take the same shape: a margin and a persistence
+    # together, or a margin large enough to stand on its own. Persistence by
+    # itself promotes nothing -- something 1% past its limit is a minor finding
+    # whether it lasts an hour or the whole week, and grading it otherwise is
+    # what makes a report read as alarming out of proportion to what it found.
     if m >= SEVERITY_SEVERE_MARGIN_ALONE or (
             m >= SEVERITY_SEVERE_MARGIN and p >= SEVERITY_SEVERE_PERSISTENCE):
         band = "severe"
-    elif m >= SEVERITY_SIGNIFICANT_MARGIN or p >= SEVERITY_SIGNIFICANT_PERSISTENCE:
+    elif m >= SEVERITY_SIGNIFICANT_MARGIN_ALONE or (
+            m >= SEVERITY_SIGNIFICANT_MARGIN
+            and p >= SEVERITY_SIGNIFICANT_PERSISTENCE):
         band = "significant"
     else:
         band = "minor"
@@ -1427,6 +1435,10 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "limit_pct":              current_limit,
                 "max_thd_pct":            float(worst.max()),
                 "mean_thd_pct":           float(worst.mean()),
+                # Graded on, for the same reason as the imbalance checks: the
+                # verdict comes from exceedances, so the margin has to describe
+                # them rather than the average of everything.
+                "p95_thd_pct":            float(worst.quantile(0.95)),
                 "pct_exceeding":          float(exceed.mean() * 100),
                 "light_load_filtered":    light_load_filtered if not use_tdd else False,
                 "harmonic_rms_source":    ", ".join(hrms_sources) or None,
@@ -3075,18 +3087,33 @@ def check_voltage_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
             note = None
 
     imb_series = pd.Series(imbalance, index=vdf.index)
-    exceed = imb_series > thresh.imbalance_limit
+    # The NEMA MG1 limit belongs to the NEMA MG1 metric. On two legs the
+    # quantity above is a different one -- the leg difference against nominal,
+    # as the basis text says -- and no standard sets a limit on it, exactly as
+    # check_current_imbalance already reports for the same geometry. Grading it
+    # against 3% anyway made a residential service read Severe on a metric
+    # nothing defines a threshold for.
+    limit = thresh.imbalance_limit if metric == "nema_mg1" else None
+    exceed = (imb_series > limit if limit is not None
+              else pd.Series(False, index=imb_series.index))
 
     return {
         "available":            True,
         "error":                None,
-        "limit_pct":            thresh.imbalance_limit,
+        "limit_pct":            limit,
         "metric":               metric,
         "metric_label":         metric_label,
         "basis":                basis,
         "note":                 note,
         "max_imbalance_pct":    float(np.nanmax(imbalance)),
         "mean_imbalance_pct":   float(np.nanmean(imbalance)),
+        # The statistic severity is graded on. The mean cannot describe a
+        # finding that fails on excursions -- a service reaching 23% on a
+        # tenth of its intervals has a mean under the limit, and grading that
+        # reported it as "0.77x the limit" while failing. The 95th percentile
+        # is what IEEE 519 grades its own limits on, and unlike the maximum it
+        # is not set by one bad interval.
+        "p95_imbalance_pct":    float(np.nanpercentile(imbalance, 95)),
         "pct_exceeding":        float(exceed.mean() * 100),
         "imbalance_series":     imb_series,
         "violation_timestamps": imb_series.index[exceed],
@@ -3177,6 +3204,13 @@ def check_current_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "note":                 note,
         "max_imbalance_pct":    float(np.nanmax(imbalance)),
         "mean_imbalance_pct":   float(np.nanmean(imbalance)),
+        # The statistic severity is graded on. The mean cannot describe a
+        # finding that fails on excursions -- a service reaching 23% on a
+        # tenth of its intervals has a mean under the limit, and grading that
+        # reported it as "0.77x the limit" while failing. The 95th percentile
+        # is what IEEE 519 grades its own limits on, and unlike the maximum it
+        # is not set by one bad interval.
+        "p95_imbalance_pct":    float(np.nanpercentile(imbalance, 95)),
         "pct_exceeding":        float(exceed.mean() * 100),
         "violation_timestamps": imb_series.index[exceed],
     }
