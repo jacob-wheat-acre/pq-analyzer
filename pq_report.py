@@ -31,7 +31,8 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
-from pq_analysis import (_IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
+from pq_analysis import (check_ride_through,
+                         _IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
                          _MIN_LOADED_AMPS, _VOLTAGE_RESOLUTION_V,
                          applicable_current_standard, check_trd, exports_power,
                          grade_finding, is_generation_only, standard_k_rating)
@@ -434,6 +435,9 @@ def generate_report(
         "harmonic_statistics":          stat_result,
         "events":                       event_result,
         "itic":                         itic_result or {"available": False, "note": "not evaluated"},
+        # The plant-side counterpart of ITIC. Derived here rather than passed
+        # in: it needs only the events and the thresholds, both already to hand.
+        "ride_through":                 check_ride_through(event_result, thresh),
         "neutral_health":               neutral_health_result or {"available": False, "reason": "not run"},
         "service_impedance":            impedance_result or {"available": False,
                                                              "reason": "not evaluated"},
@@ -6080,6 +6084,56 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                     "audible hum from a transformer or panel."),
             })
 
+    # ── Ride-through, for a plant ─────────────────────────────────────────
+    # The finding a producer actually wants: of the disturbances the system
+    # handed the plant, which ones was it required to stay on through. 6.4.2.1
+    # makes tripping inside a ride-through region the plant's non-compliance,
+    # so this is evidence about their settings, not a complaint about ours --
+    # and getting that backwards would blame the wrong party.
+    rt = report.get("ride_through") or {}
+    if vocab["register"].get("generating") and rt.get("available") and rt.get("n_events"):
+        obliged = rt["n_required_to_ride_through"]
+        beyond  = rt["n_beyond_requirement"]
+        worst_o = rt.get("worst_obliged")
+        if obliged:
+            detail = (
+                f"The deepest of them reached "
+                f"{_m(worst_o['pct_nominal'], '.0f', '%')} of nominal for "
+                f"{_m(worst_o['duration_s'], '.2f', ' s')}, inside the "
+                f"{worst_o['region'].lower()} region for Category "
+                f"{rt['category']}."
+            )
+        else:
+            detail = ""
+        out.append({
+            "headline": "Voltage disturbances measured against your ride-through obligation",
+            "measured": (
+                f"{rt['n_events']} voltage event"
+                f"{'s' if rt['n_events'] != 1 else ''} were recorded. "
+                f"{obliged} fell inside the region IEEE 1547-2018 Clause 6.4.2 "
+                f"requires a Category {rt['category']} resource to ride "
+                f"through without tripping"
+                + (f", and {beyond} fell outside it." if beyond else ".")
+                + (" " + detail if detail else "")),
+            "means": (
+                "Clause 6.4.2.1 is explicit that tripping on a disturbance "
+                "inside a ride-through region is non-compliance by the "
+                "resource, not a fault in the supply. So if your plant came "
+                "off line during any of the events counted above as inside "
+                "the region, the place to look is the inverter protection "
+                "settings and how they were commissioned against the "
+                "category in your interconnection agreement"
+                + (". Events outside the region are ones the standard permits "
+                   "you to drop on, and no setting change would keep the plant "
+                   "on through them." if beyond else ".")),
+            "symptom": (
+                "Cross-check the timestamps in the table below against your "
+                "trip and reconnect logs. A trip that lines up with an event "
+                "marked inside the region is worth raising with the inverter "
+                "supplier; one that lines up with an event outside it is the "
+                "plant behaving as the standard expects."),
+        })
+
     # ── Load balance across the service ───────────────────────────────────
     if ci.get("available") and ci.get("pct_exceeding", 0) > 0:
         if vocab["register"].get("generating"):
@@ -6347,6 +6401,57 @@ def generate_customer_letter(
             q.paragraph_format.left_indent = Cm(0.6)
             _bold(q, label, size_pt=10)
             _normal(q, cond[key], size_pt=10)
+
+    # ── Ride-through, event by event ──────────────────────────────────────
+    # A plant gets the list rather than a curve. The operator's next move is to
+    # put these timestamps beside their trip logs, and a scatter plot does not
+    # support that; the ITIC chart the other classes get would also be the
+    # wrong envelope here, since 1547 Clause 6.4.2 is what binds them.
+    rt_letter = report.get("ride_through") or {}
+    if register.get("generating") and rt_letter.get("available") and rt_letter.get("events"):
+        doc.add_paragraph()
+        _section_heading(doc, "Every dip and surge we recorded", level=1)
+        _body(doc,
+            f"Each voltage event from the recording, with the IEEE 1547-2018 "
+            f"Clause 6.4.2 region it falls in for a Category "
+            f"{rt_letter['category']} resource. The last column is what the "
+            f"standard required of the plant during that event.")
+        tbl = doc.add_table(rows=1, cols=5)
+        tbl.style = 'Table Grid'
+        _set_col_widths(tbl, [3.6, 1.8, 1.9, 3.4, 3.6])
+        for cell, text in zip(tbl.rows[0].cells,
+                              ["When", "Depth", "Duration", "Clause 6.4.2 region",
+                               "What was required"]):
+            _cell_shade(cell, _CHROME_BAND)
+            cell.paragraphs[0].add_run(text).bold = True
+            cell.paragraphs[0].runs[0].font.size = Pt(9)
+        for e in rt_letter["events"][:20]:
+            ts = e.get("timestamp")
+            cells = tbl.add_row().cells
+            # Each region asks for something different, and the differences
+            # are the point: permissive lets the plant stop exchanging current
+            # so long as it does not trip, and Category III momentary cessation
+            # requires it to stop.
+            if not e["must_not_trip"]:
+                required = "Tripping permitted"
+            else:
+                required = {
+                    "continuous": "Remain in operation",
+                    "mandatory":  "Ride through, do not trip",
+                    "permissive": "Do not trip; may cease to energize",
+                    "momentary":  "Do not trip; cease to energize",
+                }.get(e["mode"], "Ride through, do not trip")
+            values = [
+                str(ts)[:19] if ts is not None else "—",
+                f"{e['pct_nominal']:.0f}%",
+                f"{e['duration_s']:.2f} s",
+                e["region"],
+                required,
+            ]
+            for cell, text in zip(cells, values):
+                cell.paragraphs[0].add_run(text).font.size = Pt(9)
+        for caveat in rt_letter.get("caveats", []):
+            _body(doc, caveat)
 
     # ── The dips and surges, plotted ──────────────────────────────────────
     # "What we checked" already names the ITIC curve as the standard these

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.49.0"
+__version__ = "0.50.0"
 
 
 @dataclass
@@ -96,6 +98,12 @@ class Thresholds:
     # largest fundamental in the recording stands in for it and every number
     # normalised against it is labelled as resting on that substitution.
     il_amps_billing: Optional[float] = None
+    # IEEE 1547-2018 abnormal operating performance category: "I", "II" or
+    # "III".  Clause 6.4.2.1 gives the choice to the Area EPS operator -- us --
+    # and the DER states it on its nameplate, so it is entered, never inferred.
+    # It is not a detail: the ride-through a plant owes at 0.75 p.u. is 0.9 s
+    # under Category I and 20 s under Category III.
+    der_category: Optional[str] = None
     # The engineer picks these at the start; they resolve how many phases the
     # service actually has, which channel presence alone can get wrong when a
     # phase is simply missing from the export.
@@ -440,6 +448,124 @@ _H1547_ORDERS = [2, 3, 4, 5, 6, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]
 #: Figure 1's threshold: a site whose rated generation is below this share of
 #: its annual average load demand stays under 519 despite having a DER.
 _DER_SHARE_FOR_1547 = 0.10
+
+# ── IEEE 1547-2018 Clause 6.4.2: voltage ride-through ────────────────────────
+#
+# ITIC answers "should the customer's equipment have survived this dip".  At a
+# generating plant the question inverts: the plant is required to stay on
+# through disturbances the system hands it, and 6.4.2.1 is explicit that
+# failing to is the plant's non-compliance, not the utility's --
+#
+#   "Any tripping of the DER, or other failure to provide the specified
+#    ride-through capability, due to DER self-protection as a direct or
+#    indirect result of a voltage disturbance within a ride-through region,
+#    shall constitute non-compliance with this standard."
+#
+# So a measured event inside the ride-through region is evidence about the
+# plant, and one outside it is a disturbance the plant was entitled to drop on.
+# Getting the two the wrong way round would blame the wrong party, which is why
+# the region is reported for every event rather than a pass/fail.
+#
+# The category is not ours to infer: 6.4.2.1 says the DER "shall meet either
+# the abnormal operating performance Category I, Category II, or Category III
+# requirements of this clause, as specified by the Area EPS operator", and the
+# DER states its category on its nameplate.
+
+#: Operating modes, in the standard's own words. What each requires of the
+#: plant differs, so they are carried through rather than collapsed to a verdict.
+RIDE_THROUGH_MODES = {
+    "continuous":  "Continuous Operation",
+    "mandatory":   "Mandatory Operation",
+    "permissive":  "Permissive Operation",
+    "momentary":   "Momentary Cessation",
+    "cease":       "Cease to Energize",
+}
+
+#: Tables 14, 15 and 16, as
+#: ``(v_low, v_high, low_closed, high_closed, mode, minimum ride-through s)``.
+#:
+#: The inclusivity is carried explicitly because the tables are not uniform
+#: about it, and a uniform rule puts values in the wrong row. Below the
+#: continuous band the rows read "0.70 <= V < 0.88" -- closed underneath, open
+#: on top. Above it they read "1.15 < V <= 1.175" -- the other way round. The
+#: continuous band itself, "0.88 <= V <= 1.10", is closed at both ends. Getting
+#: this wrong is silent: 0.65 p.u. lands in permissive instead of mandatory and
+#: the plant is told it could have tripped when the standard says it could not.
+#:
+#: `None` for the minimum time is the tables' "N/A", on rows that call for
+#: cessation rather than ride-through. A callable is a row whose minimum is a
+#: linear slope.
+_RIDE_THROUGH_TABLES: Dict[str, List[tuple]] = {
+    # Table 14 — Category I
+    "I": [
+        (1.20,  None,  False, False, "cease",      None),
+        (1.175, 1.20,  False, True,  "permissive", 0.2),
+        (1.15,  1.175, False, True,  "permissive", 0.5),
+        (1.10,  1.15,  False, True,  "permissive", 1.0),
+        (0.88,  1.10,  True,  True,  "continuous", math.inf),
+        # "Linear slope of 4 s/1 p.u. voltage starting at 0.7 s @ 0.7 p.u."
+        (0.70,  0.88,  True,  False, "mandatory",
+         lambda v: 0.7 + 4.0 * (v - 0.70)),
+        (0.50,  0.70,  True,  False, "permissive", 0.16),
+        (None,  0.50,  False, False, "cease",      None),
+    ],
+    # Table 15 — Category II
+    "II": [
+        (1.20,  None,  False, False, "cease",      None),
+        (1.175, 1.20,  False, True,  "permissive", 0.2),
+        (1.15,  1.175, False, True,  "permissive", 0.5),
+        (1.10,  1.15,  False, True,  "permissive", 1.0),
+        (0.88,  1.10,  True,  True,  "continuous", math.inf),
+        # "Linear slope of 8.7 s/1 p.u. voltage starting at 3 s @ 0.65 p.u."
+        (0.65,  0.88,  True,  False, "mandatory",
+         lambda v: 3.0 + 8.7 * (v - 0.65)),
+        (0.45,  0.65,  True,  False, "permissive", 0.32),
+        (0.30,  0.45,  True,  False, "permissive", 0.16),
+        (None,  0.30,  False, False, "cease",      None),
+    ],
+    # Table 16 — Category III. The 0.50 p.u. boundary between mandatory and
+    # momentary cessation may be moved by mutual agreement (footnote c), so a
+    # site operating to an agreed threshold is not described by this table.
+    "III": [
+        (1.20,  None,  False, False, "cease",      None),
+        (1.10,  1.20,  False, True,  "momentary",  12.0),
+        (0.88,  1.10,  True,  True,  "continuous", math.inf),
+        (0.70,  0.88,  True,  False, "mandatory",  20.0),
+        (0.50,  0.70,  True,  False, "mandatory",  10.0),
+        (None,  0.50,  False, False, "momentary",  1.0),
+    ],
+}
+
+DER_CATEGORIES = tuple(_RIDE_THROUGH_TABLES)
+
+
+def ride_through_region(category: str, v_pu: float) -> Optional[dict]:
+    """The Table 14/15/16 row a per-unit voltage falls in.
+
+    Returns the mode, the standard's label for it, and the minimum ride-through
+    time in seconds -- infinite in the continuous region, None where the row
+    calls for cessation rather than ride-through.
+    """
+    rows = _RIDE_THROUGH_TABLES.get((category or "").upper())
+    if rows is None:
+        return None
+    for low, high, low_closed, high_closed, mode, minimum in rows:
+        if low is not None:
+            if v_pu < low or (v_pu == low and not low_closed):
+                continue
+        if high is not None:
+            if v_pu > high or (v_pu == high and not high_closed):
+                continue
+        seconds = minimum(v_pu) if callable(minimum) else minimum
+        return {
+            "mode":        mode,
+            "label":       RIDE_THROUGH_MODES[mode],
+            "min_ride_s":  seconds,
+            "v_low_pu":    low,
+            "v_high_pu":   high,
+        }
+    return None
+
 
 #: Current harmonic orders the adapter exposes.  It has to be the union of what
 #: both standards grade, not 519's list alone: 1547 Table 27 limits the second,

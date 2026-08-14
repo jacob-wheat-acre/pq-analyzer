@@ -603,6 +603,13 @@ class PQApp(tk.Tk):
                  font=_FONT_UI).pack(side="left")
         tk.Label(il_frame, text="A",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left", padx=(4, 0))
+
+        tk.Label(il_frame, text="1547 category", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(14, 4))
+        self._der_cat_var = tk.StringVar(value="— not specified —")
+        ttk.Combobox(il_frame, textvariable=self._der_cat_var,
+                     values=["— not specified —", "I", "II", "III"],
+                     width=16, font=_FONT_UI, state="readonly").pack(side="left")
         tk.Label(il_frame,
                  text="(12 months of 15/30-min maximum demands, averaged — "
                       "IEEE 519's own definition; blank uses the recording peak)",
@@ -1494,6 +1501,9 @@ class PQApp(tk.Tk):
             "rated_ac_kw":    _float_or_none(self._rated_kw_var.get()),
             "annual_avg_load_kw": _float_or_none(self._avg_load_var.get()),
             "il_amps_billing":    _float_or_none(self._il_billing_var.get()),
+            "der_category":       (self._der_cat_var.get()
+                                   if self._der_cat_var.get() in ("I", "II", "III")
+                                   else None),
             "site":           self._site_var.get().strip(),
             "address":        self._address_var.get().strip(),
             "engineer":       self._eng_name_var.get().strip(),
@@ -1606,6 +1616,7 @@ class PQApp(tk.Tk):
             rated_ac_kw=params["rated_ac_kw"],
             annual_avg_load_kw=params["annual_avg_load_kw"],
             il_amps_billing=params["il_amps_billing"],
+            der_category=params["der_category"],
             isc_amps=isc_amps,
             isc_source=isc_source,
             transformer_kva=kva,
@@ -1943,6 +1954,7 @@ class PQApp(tk.Tk):
         # switching pages with use(). Tab order and file order are separate.
         pg_start     = page("Start here")
         pg_standard  = page("Which standard")
+        pg_ridethru  = page("Ride-through")
         pg_tariff    = page("PSCo tariff")
         pg_refs      = page("Standards")
         pg_workflow  = page("Investigating a job")
@@ -2021,6 +2033,8 @@ class PQApp(tk.Tk):
             "Where to go next",
             "  Which standard        519 or 1547, and which schedules mean\n"
             "                        generation is actually on site\n"
+            "  Ride-through          what the plant must survive, and whose\n"
+            "                        problem a trip is (Clause 6.4.2)\n"
             "  PSCo tariff           the PF and phase clauses, and what they\n"
             "                        actually say (this catches people out)\n"
             "  Standards             the reference shelf, with links\n"
@@ -2186,6 +2200,84 @@ class PQApp(tk.Tk):
             "be supported for a DER, though the 2nd harmonic was not relaxed.",
         )
 
+        use(pg_ridethru)
+        section("Ride-Through — What the Plant Must Survive")
+        lead(
+            "Clause 7.3 limits what a plant may inject into the system. This is the\n"
+            "other direction: what the system may hand the plant, and how long the\n"
+            "plant is required to stay on through it. Only applies where there is\n"
+            "generation behind the meter."
+        )
+
+        concept(
+            "Clause 6.4.2 — what the plant owes the system",
+            "Clause 7.3 limits what a plant may inject. Clause 6.4.2 is the other\n"
+            "direction: what it must survive. During a voltage disturbance the plant\n"
+            "is required to stay on, and 6.4.2.1 is blunt about whose problem it is\n"
+            "when it does not:\n"
+            "\n"
+            "    Any tripping of the DER, or other failure to provide the specified\n"
+            "    ride-through capability, due to DER self-protection as a direct or\n"
+            "    indirect result of a voltage disturbance within a ride-through\n"
+            "    region, shall constitute non-compliance with this standard.\n"
+            "\n"
+            "So this is the reverse of an ITIC finding. ITIC asks whether a\n"
+            "customer's equipment should have survived our dip. Clause 6.4.2 asks\n"
+            "whether the plant should have — and if it tripped inside a ride-through\n"
+            "region, the answer points at their inverter settings, not at our supply.\n"
+            "Reading it the other way round blames the wrong party, which is why the\n"
+            "report gives the region for every event rather than a pass or a fail.\n"
+            "\n"
+            "Three categories, and the difference between them is not marginal —\n"
+            "at 0.75 p.u. the plant owes 0.9 s under Category I and 20 s under\n"
+            "Category III. 6.4.2.1 gives the choice to the Area EPS operator, which\n"
+            "is us, and the DER states its category on its nameplate. Enter it from\n"
+            "the interconnection agreement; the tool will not guess.\n"
+            "\n"
+            "Regions, low to high (Category II shown; see Tables 14–16):\n"
+            "\n"
+            "    V < 0.30            Cease to Energize    tripping is correct\n"
+            "    0.30 ≤ V < 0.45     Permissive           0.16 s, may cease\n"
+            "    0.45 ≤ V < 0.65     Permissive           0.32 s, may cease\n"
+            "    0.65 ≤ V < 0.88     Mandatory            3 s + 8.7 s/p.u. above 0.65\n"
+            "    0.88 ≤ V ≤ 1.10     Continuous           indefinitely\n"
+            "    1.10 < V ≤ 1.15     Permissive           1 s\n"
+            "    1.15 < V ≤ 1.175    Permissive           0.5 s\n"
+            "    1.175 < V ≤ 1.20    Permissive           0.2 s\n"
+            "    V > 1.20            Cease to Energize    tripping is correct\n"
+            "\n"
+            "Note the boundaries change sense across the continuous band: below it\n"
+            "the rows are closed underneath and open on top, above it the reverse.\n"
+            "\n"
+            "It needs event durations, which means a variable-rate or waveform\n"
+            "record. A five-minute interval average cannot tell a 100 ms dip from a\n"
+            "four-second one, and the whole requirement is voltage against duration.",
+        )
+
+        concept(
+            "What Clause 6 this does not do",
+            "Clause 6 is larger than the part a recording can speak to. Implemented:\n"
+            "voltage ride-through, 6.4.2, event by event. Not implemented, and not\n"
+            "implied by a clean report:\n"
+            "\n"
+            "  6.4.1   Mandatory voltage tripping — a settings audit, not a\n"
+            "          measurement. Nothing in a recording shows what the relay is\n"
+            "          set to, only what the system did.\n"
+            "  6.4.2.5 Consecutive disturbances (Table 17). Each event here is taken\n"
+            "          on its own; the tables' durations are also cumulative within\n"
+            "          a disturbance, which this does not accumulate.\n"
+            "  6.5     Frequency ride-through and ROCOF. The frequency channel is\n"
+            "          interval-averaged, so it cannot resolve the excursions these\n"
+            "          are written about.\n"
+            "  6.2/6.3 Faults, open phase, and reclosing coordination.\n"
+            "  6.6     Return to service after trip.\n"
+            "\n"
+            "If a plant is disputing a trip, this tool tells you what the voltage\n"
+            "did and which region that put the plant in. It does not tell you what\n"
+            "the plant was configured to do about it.",
+        )
+
+        use(pg_standard)
         concept(
             "Two caveats that travel with every 1547 number",
             "Both are printed in the report, and neither is a formality:\n"
@@ -3014,8 +3106,8 @@ class PQApp(tk.Tk):
             "references that specific load type and its recommended mitigation.",
         )
 
-        for _pg in (pg_start, pg_standard, pg_tariff, pg_refs, pg_workflow,
-                    pg_concepts, pg_neutral, pg_methods):
+        for _pg in (pg_start, pg_standard, pg_ridethru, pg_tariff, pg_refs,
+                    pg_workflow, pg_concepts, pg_neutral, pg_methods):
             _pg.config(state="disabled")
 
         ttk.Button(win, text="Close", command=win.destroy,

@@ -338,6 +338,11 @@ EXAMPLES
                         "it — not the net at the meter. Denominator of the 519-2022 "
                         "Figure 1 test; at or above 10%% generation the installation "
                         "goes to IEEE 1547.")
+    p.add_argument("--der-category", default=None, choices=["I", "II", "III"],
+                   help="IEEE 1547-2018 abnormal operating performance category, "
+                        "from the interconnection agreement. Sets the voltage "
+                        "ride-through the plant owes under Clause 6.4.2 — at "
+                        "0.75 p.u. that is 0.9 s under I and 20 s under III.")
     p.add_argument("--il-amps", type=float, default=None,
                    help="Maximum demand load current from billing: the twelve "
                         "previous months' 15- or 30-min maximum demands, averaged, "
@@ -414,6 +419,7 @@ def main():
         rated_ac_kw=args.rated_ac_kw,
         annual_avg_load_kw=args.annual_avg_load_kw,
         il_amps_billing=args.il_amps,
+        der_category=args.der_category,
         service_type=args.service_type,
         topology=args.topology,
         conductor_key=args.conductor,

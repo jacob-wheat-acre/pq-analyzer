@@ -1771,11 +1771,24 @@ class TestFixturesAreCompliant:
 
     def test_records_of_one_session_share_one_time_base(self, path):
         # Within a session, 'Interval (avg)' and 'Interval (max-min)' are
-        # pooled, which is only sound when they sit on the same grid.
+        # pooled, which is only sound when they sit on the same grid. Only
+        # those two are pooled: a point-on-wave capture and a variable-rate
+        # record carry their own timing by definition -- a capture is
+        # thousands of samples of one instant, and an adaptive record gives
+        # every channel its own base -- so neither belongs in this comparison
+        # even when it happens to share a start time with an interval record.
         f = pqdif.PQDIFFile(path)
+
+        def is_interval(obs):
+            if any(c.quantity_type == 'WAVEFORM' for c in obs.channels):
+                return False
+            base = obs.channels[0].time
+            return all(c.time is not None and len(c.time) == len(base)
+                       for c in obs.channels)
+
         by_start = {}
         for obs in f.observations:
-            if obs.channels:
+            if obs.channels and is_interval(obs):
                 by_start.setdefault(obs.start_time, set()).add(
                     len(obs.channels[0].time))
         for start, grids in by_start.items():
@@ -2090,6 +2103,165 @@ class TestGenerationIL:
         td = check_thd(df, load)["tdd_info"]
         assert td["il_basis"] == "measured_demand"
         assert td["il_amps"] < 300.0
+
+
+class TestRideThroughTables:
+    """IEEE 1547-2018 Tables 14, 15 and 16, transcribed and spot-checked.
+
+    The tables are the whole check, so they are asserted against the standard
+    rather than against whatever the code happens to produce. The two sloped
+    rows are the ones worth checking arithmetic on: Category I is a 4 s/p.u.
+    slope from 0.7 s at 0.7 p.u., Category II is 8.7 s/p.u. from 3 s at 0.65.
+    """
+
+    @staticmethod
+    def _region(cat, v):
+        from pq_constants import ride_through_region
+        return ride_through_region(cat, v)
+
+    def test_the_continuous_region_is_the_ansi_range_b_band(self):
+        # 0.88 to 1.10 p.u. in all three categories.
+        for cat in ("I", "II", "III"):
+            assert self._region(cat, 0.88)["mode"] == "continuous", cat
+            assert self._region(cat, 1.10)["mode"] == "continuous", cat
+            assert self._region(cat, 0.879)["mode"] != "continuous", cat
+            assert self._region(cat, 1.101)["mode"] != "continuous", cat
+            assert self._region(cat, 1.0)["min_ride_s"] == math.inf, cat
+
+    def test_category_i_mandatory_slope(self):
+        # Table 14: 0.7 s at 0.70 p.u., rising 4 s per p.u.
+        assert self._region("I", 0.70)["min_ride_s"] == pytest.approx(0.70)
+        assert self._region("I", 0.75)["min_ride_s"] == pytest.approx(0.90)
+        assert self._region("I", 0.85)["min_ride_s"] == pytest.approx(1.30)
+
+    def test_category_ii_mandatory_slope(self):
+        # Table 15: 3 s at 0.65 p.u., rising 8.7 s per p.u.
+        assert self._region("II", 0.65)["min_ride_s"] == pytest.approx(3.00)
+        assert self._region("II", 0.75)["min_ride_s"] == pytest.approx(3.87)
+        assert self._region("II", 0.85)["min_ride_s"] == pytest.approx(4.74)
+
+    def test_category_iii_is_flat_and_far_longer(self):
+        # Table 16 is where the categories diverge most: 20 s of mandatory
+        # operation at 0.75 p.u. against 0.9 s under Category I.
+        assert self._region("III", 0.75)["min_ride_s"] == 20.0
+        assert self._region("III", 0.55)["min_ride_s"] == 10.0
+        assert self._region("III", 0.40)["mode"] == "momentary"
+        assert self._region("III", 1.15)["mode"] == "momentary"
+
+    def test_the_deep_and_high_extremes_cease_to_energize(self):
+        for cat in ("I", "II", "III"):
+            assert self._region(cat, 1.25)["mode"] == "cease", cat
+        assert self._region("I", 0.40)["mode"] == "cease"
+        assert self._region("II", 0.25)["mode"] == "cease"
+
+    def test_an_unknown_category_is_not_guessed_at(self):
+        assert self._region("IV", 0.9) is None
+        assert self._region(None, 0.9) is None
+
+
+class TestRideThroughAgainstMeasuredEvents:
+    """Clause 6.4.2 applied to what the meter actually caught."""
+
+    @staticmethod
+    def _events(rows):
+        import pandas as pd
+        return {"events": pd.DataFrame(rows)}
+
+    @staticmethod
+    def _t(**kw):
+        kw.setdefault("service_role", "generation")
+        kw.setdefault("der_category", "II")
+        return Thresholds(nominal_voltage=277.0, **kw)
+
+    def test_a_service_without_generation_is_not_assessed(self):
+        from pq_analysis import check_ride_through
+        r = check_ride_through({}, Thresholds(nominal_voltage=277.0))
+        assert r["available"] is False
+        assert "distributed energy resource" in r["note"]
+
+    def test_the_category_is_required_rather_than_assumed(self):
+        # 6.4.2.1 leaves the category to the Area EPS operator, and the
+        # difference between them is 0.9 s against 20 s at 0.75 p.u.
+        from pq_analysis import check_ride_through
+        r = check_ride_through({}, self._t(der_category=None))
+        assert r["available"] is False
+        assert "Area EPS operator" in r["note"]
+
+    def test_an_event_inside_the_region_obliges_the_plant_to_stay_on(self):
+        from pq_analysis import check_ride_through
+        r = check_ride_through(self._events([
+            {"type": "voltage_sag", "phase": "a", "value_v": 277 * 0.85,
+             "duration_ms": 300, "timestamp": "t"}]), self._t())
+        e = r["events"][0]
+        assert e["region"] == "Mandatory Operation"
+        assert e["must_not_trip"] is True
+        assert r["n_required_to_ride_through"] == 1
+
+    def test_an_event_longer_than_the_required_time_is_beyond_it(self):
+        # 0.75 p.u. under Category II requires 3.87 s; six seconds is past what
+        # the standard asks the plant to survive.
+        from pq_analysis import check_ride_through
+        r = check_ride_through(self._events([
+            {"type": "voltage_sag", "phase": "a", "value_v": 277 * 0.75,
+             "duration_ms": 6000, "timestamp": "t"}]), self._t())
+        assert r["events"][0]["must_not_trip"] is False
+        assert r["n_beyond_requirement"] == 1
+
+    def test_a_deep_dip_is_one_the_plant_may_drop_on(self):
+        from pq_analysis import check_ride_through
+        r = check_ride_through(self._events([
+            {"type": "voltage_sag", "phase": "a", "value_v": 277 * 0.25,
+             "duration_ms": 100, "timestamp": "t"}]), self._t())
+        assert r["events"][0]["region"] == "Cease to Energize"
+        assert r["events"][0]["must_not_trip"] is False
+
+    def test_the_category_changes_the_answer_on_the_same_event(self):
+        # The reason the field is required rather than defaulted.
+        from pq_analysis import check_ride_through
+        ev = self._events([{"type": "voltage_sag", "phase": "a",
+                            "value_v": 277 * 0.75, "duration_ms": 5000,
+                            "timestamp": "t"}])
+        assert check_ride_through(ev, self._t(der_category="I")
+                                  )["events"][0]["must_not_trip"] is False
+        assert check_ride_through(ev, self._t(der_category="III")
+                                  )["events"][0]["must_not_trip"] is True
+
+    def test_it_says_so_when_the_recording_cannot_resolve_durations(self):
+        # Clause 6.4.2 is voltage against duration; interval averages cannot
+        # tell a 100 ms dip from a 4 s one.
+        from pq_analysis import check_ride_through
+        r = check_ride_through(self._events([
+            {"type": "voltage_sag", "phase": "a", "value_v": 200.0,
+             "timestamp": "t"}]), self._t())
+        assert r["available"] is False
+        assert "durations" in r["note"]
+
+    def test_the_cumulative_duration_limit_is_stated(self):
+        # The tables are cumulative within a disturbance and Table 17 governs
+        # consecutive ones; neither is evaluated, so neither is implied.
+        from pq_analysis import check_ride_through
+        r = check_ride_through(self._events([
+            {"type": "voltage_sag", "phase": "a", "value_v": 277 * 0.85,
+             "duration_ms": 300, "timestamp": "t"}]), self._t())
+        assert any("cumulative" in c for c in r["caveats"])
+
+    def test_it_runs_end_to_end_from_the_fixture(self):
+        # The fixture carries a variable-rate record, which is the only thing
+        # that resolves an event duration -- before it, neither this check nor
+        # the ITIC one had ever been exercised against a file.
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pq_analysis import detect_events, check_ride_through
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        th = self._t()
+        r = check_ride_through(detect_events(ds, th), th)
+        assert r["available"] is True
+        assert r["n_events"] == 3
+        assert r["n_required_to_ride_through"] == 2
+        assert r["n_beyond_requirement"] == 1
+        depths = sorted(e["pct_nominal"] for e in r["events"])
+        assert depths == pytest.approx([25.0, 85.0, 112.0], abs=0.5)
 
 
 class TestTheLetterToAProducer:

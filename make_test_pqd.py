@@ -1285,6 +1285,50 @@ def _steady_capture(v_rms: float, i_rms: float, *, exporting: bool = False,
     )
 
 
+#: Cycle-level RMS, which is the resolution an event duration needs. A 5-minute
+#: interval average cannot tell a 100 ms dip from a 4 s one, and both ITIC and
+#: IEEE 1547 Clause 6.4.2 are voltage-against-duration requirements -- so
+#: without a record at this rate neither check has anything to grade, which is
+#: exactly the state every fixture was in before this.
+ADAPTIVE_STEP_S = 1.0 / 60.0
+
+
+def adaptive_event_channels(events: list[tuple], nominal: float,
+                            phases=("a", "b", "c"),
+                            pad_cycles: int = 30) -> list[Channel]:
+    """A variable-rate observation carrying voltage events with real durations.
+
+    *events* are ``(offset_seconds, per_unit_depth, duration_seconds, phase)``.
+    Everything outside an event sits at nominal.
+
+    The channels deliberately carry slightly different time bases, because that
+    is both what a real variable-rate record looks like and what the adapter
+    uses to tell an adaptive observation from an interval one: a record whose
+    channels share a single time base is an interval trend by definition.
+    """
+    span = max(off + dur for off, _d, dur, _p in events) + pad_cycles * ADAPTIVE_STEP_S
+    n = int(round(span / ADAPTIVE_STEP_S)) + 1
+    base = np.arange(n, dtype=float) * ADAPTIVE_STEP_S
+
+    channels: list[Channel] = []
+    for i, ph in enumerate(phases):
+        # A hundredth of a cycle apart: enough that the adapter sees per-channel
+        # timing, far too little to move an event boundary.
+        t = base + i * ADAPTIVE_STEP_S / 100.0
+        v = np.full(n, nominal, dtype=float)
+        for off, depth, dur, target in events:
+            if target != ph:
+                continue
+            inside = (base >= off) & (base < off + dur)
+            v[inside] = nominal * depth
+        channels.append(Channel(f"V{ph}n adaptive", f"{ph}n", "voltage",
+                                'VALUELOG', [
+            Series('TIME', 'INSTANTANEOUS', 's', t),
+            Series('AVG', 'RMS', 'V', v),
+        ]))
+    return channels
+
+
 def _large_captures() -> list[tuple]:
     """An ordinary load service: every capture taken while importing."""
     return [
@@ -1322,6 +1366,26 @@ def _solar_captures() -> list[tuple]:
 #: Which fixtures carry point-on-wave captures, and what is in them. Kept apart
 #: from SCENARIOS because a capture is a separate observation, not another
 #: interval channel.
+def _producer_adaptive() -> list[tuple]:
+    """Three events the ride-through table grades differently, on one plant.
+
+    Under Category II: 0.85 p.u. for 0.30 s is well inside mandatory operation
+    (which requires 4.74 s there), so the plant owed the system continued
+    operation. 0.25 p.u. is below the 0.30 p.u. floor, where the standard has
+    it cease to energize -- tripping is correct. 1.12 p.u. for 0.50 s is
+    permissive, where it must not trip but may cease to energize.
+    """
+    return [(
+        "test_producer_array - Variable Adaptive",
+        adaptive_event_channels(
+            [(1.0, 0.85, 0.30, "a"),
+             (4.0, 0.25, 0.10, "b"),
+             (7.0, 1.12, 0.50, "c")],
+            nominal=277.0),
+        START_TIME + timedelta(hours=11),
+    )]
+
+
 def _producer_captures() -> list[tuple]:
     """A plant: every usable capture taken while exporting.
 
@@ -1341,6 +1405,11 @@ CAPTURES = {
     "test_commercial_large.pqd":  _large_captures,
     "test_solar_net_metered.pqd": _solar_captures,
     "test_producer_array.pqd":    _producer_captures,
+}
+
+#: Variable-rate records, which are what carry event durations.
+ADAPTIVE = {
+    "test_producer_array.pqd": _producer_adaptive,
 }
 
 
@@ -1401,6 +1470,7 @@ def main():
             (f"{site} (general) - Interval (avg)", avg),
             (f"{site} (general) - Interval (max-min)", maxmin),
         ]
+        observations.extend(ADAPTIVE.get(fname, lambda: [])())
         observations.extend(CAPTURES.get(fname, lambda: [])())
         pqd_bytes = build_file(site, observations)
         path = out_dir / fname

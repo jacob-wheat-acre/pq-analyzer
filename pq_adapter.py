@@ -1494,7 +1494,12 @@ class ProntoAdapter:
             )
             return
 
-        df = pd.concat([s.rename(name) for name, s in columns.items()], axis=1)
+        # sort=False on the join, then sort explicitly: every channel here has
+        # its own time base, so the union index is interleaved either way and
+        # the ordering that matters is the one below. Event durations are read
+        # off index differences, so an unsorted index would not be cosmetic.
+        df = pd.concat([s.rename(name) for name, s in columns.items()],
+                       axis=1, sort=False)
         df.sort_index(inplace=True)
         df = df[~df.index.duplicated(keep='first')]
         self._adaptive_df = df

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -39,6 +40,7 @@ from pq_constants import (
     _TRD_LIMIT,
     _h519_limit,
     _h1547_limit,
+    ride_through_region,
     _impedance_range,
     expected_service_impedance,
     _itic_lower_v,
@@ -4345,6 +4347,133 @@ def check_itic(event_result: dict, thresh: Thresholds) -> dict:
         "worst":        violations[0] if violations else None,
         "violations":   violations[:20],
     }
+
+
+def check_ride_through(event_result: dict, thresh: Thresholds) -> dict:
+    """Measured voltage events against IEEE 1547-2018 Clause 6.4.2.
+
+    The counterpart of `check_itic` for a service that generates, and it asks
+    the opposite question.  ITIC asks whether a customer's equipment should
+    have survived a dip.  Clause 6.4.2 asks whether the *plant* was required to
+    stay on through it, and 6.4.2.1 makes failing to do so the plant's
+    non-compliance rather than the system's.  So this does not produce a
+    pass/fail against the utility: it says, for each event, which region of the
+    table the plant was in and what that region required of it.
+
+    Every event is reported rather than only the exceedances, because the
+    useful finding here is usually the ordinary-looking one -- a shallow dip
+    inside the continuous region that the plant tripped on anyway.
+
+    Two limits are worth stating with the result.  The tables' durations are
+    cumulative within a disturbance, and consecutive disturbances have their
+    own requirement in Table 17 that this does not evaluate; and the standard
+    measures the phase with the least voltage against the nominal, so a
+    per-phase event list is what it wants and what it gets here.
+    """
+    result: dict = {
+        "available": False, "category": thresh.der_category,
+        "events": [], "counts": {}, "n_events": 0,
+        "n_required_to_ride_through": 0, "n_beyond_requirement": 0,
+    }
+
+    if not exports_power(thresh):
+        result["note"] = ("Clause 6 applies to a distributed energy resource. "
+                          "This service has none.")
+        return result
+
+    if not thresh.der_category:
+        result["note"] = (
+            "IEEE 1547-2018 Clause 6.4.2 grades voltage disturbances against "
+            "one of three abnormal operating performance categories, and the "
+            "standard leaves the choice to the Area EPS operator rather than "
+            "to the recording: the ride-through a plant owes at 0.75 p.u. is "
+            "0.9 s under Category I and 20 s under Category III. Enter the "
+            "category from the interconnection agreement to assess it."
+        )
+        return result
+
+    ev = (event_result or {}).get("events")
+    if ev is None or len(ev) == 0:
+        result.update({
+            "available": True,
+            "note": "No voltage sag or swell events were detected in this recording.",
+        })
+        return result
+
+    vs = ev[ev["type"].isin(["voltage_sag", "voltage_swell"])].copy()
+    if vs.empty:
+        result.update({
+            "available": True,
+            "note": "No voltage sag or swell events were detected in this recording.",
+        })
+        return result
+    if "duration_ms" not in vs.columns or not vs["duration_ms"].notna().any():
+        result["note"] = (
+            "Voltage events were detected, but Clause 6.4.2 is a voltage "
+            "against duration requirement and this recording carries no event "
+            "durations. Cycle-level adaptive or waveform records are needed to "
+            "resolve them."
+        )
+        return result
+
+    vs = vs.dropna(subset=["duration_ms", "value_v"])
+    counts: Dict[str, int] = {}
+    events: List[dict] = []
+    for _, row in vs.iterrows():
+        v_pu = float(row["value_v"]) / thresh.nominal_voltage
+        seconds = float(row["duration_ms"]) / 1000.0
+        region = ride_through_region(thresh.der_category, v_pu)
+        if region is None:
+            continue
+        minimum = region["min_ride_s"]
+
+        # What the region required, and whether this event stayed inside it.
+        if region["mode"] == "continuous":
+            required, within = True, True
+        elif minimum is None:                      # cease-to-energize row
+            required, within = False, False
+        else:
+            required = True
+            within = seconds <= minimum
+        counts[region["mode"]] = counts.get(region["mode"], 0) + 1
+        events.append({
+            "timestamp":   row.get("timestamp"),
+            "type":        row["type"],
+            "phase":       row.get("phase"),
+            "v_pu":        round(v_pu, 3),
+            "pct_nominal": round(v_pu * 100.0, 1),
+            "duration_s":  round(seconds, 3),
+            "mode":        region["mode"],
+            "region":      region["label"],
+            "min_ride_s":  (None if minimum is None else
+                            (None if minimum == math.inf else round(minimum, 3))),
+            "continuous":  region["mode"] == "continuous",
+            # True where the plant was obliged not to trip on this event.
+            "must_not_trip": required and within,
+        })
+
+    # Deepest first: the one an operator will ask about is the worst one.
+    events.sort(key=lambda e: abs(e["pct_nominal"] - 100), reverse=True)
+    obliged = [e for e in events if e["must_not_trip"]]
+    result.update({
+        "available": True,
+        "events": events,
+        "counts": counts,
+        "n_events": len(events),
+        "n_required_to_ride_through": len(obliged),
+        "n_beyond_requirement": len(events) - len(obliged),
+        "worst": events[0] if events else None,
+        "worst_obliged": obliged[0] if obliged else None,
+        "caveats": [
+            "The durations in Tables 14 to 16 are cumulative within a "
+            "disturbance, and consecutive disturbances carry their own "
+            "requirement in Table 17. Neither is evaluated here; each event is "
+            "taken on its own.",
+            "Clause 6.4.2 measures the phase with the least voltage against "
+            "nominal, so events are listed per phase rather than combined.",
+        ],
+    })
+    return result
 
 
 def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List[dict]:
