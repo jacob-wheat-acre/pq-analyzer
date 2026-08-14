@@ -33,9 +33,104 @@ from pq_constants import (
 from pq_adapter import PQDataset
 from pq_analysis import (_IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
                          _MIN_LOADED_AMPS, _VOLTAGE_RESOLUTION_V,
-                         grade_finding, standard_k_rating)
+                         applicable_current_standard, check_trd, exports_power,
+                         grade_finding, is_generation_only, standard_k_rating)
 
 log = logging.getLogger(__name__)
+
+
+def _word_current_standard(doc, report: dict, thresh) -> None:
+    """State which current distortion standard governs, and how that was decided.
+
+    Only printed where there is a decision to report -- a service with no
+    generation is under 519 and always was, and saying so at every ordinary
+    site would bury the cases where it matters.
+    """
+    std = report.get("current_standard") or {}
+    if std.get("branch") == "no_der":
+        return
+
+    _body(doc, std.get("reason", ""))
+
+    trd = report.get("trd_compliance") or {}
+    if std.get("standard") != "1547":
+        return
+
+    if not trd.get("available"):
+        _body(doc, trd.get("note", ""))
+        return
+
+    _body(doc,
+          f"Total rated-current distortion (TRD) is "
+          f"√(I_rms² − I₁²) ÷ I_rated, with I_rated the plant's rated current "
+          f"capacity of {_m(trd['irated_amps'], '.0f', ' A')}. Measured TRD "
+          f"reached {_m(trd.get('trd_pct'), '.2f', '%')} against the "
+          f"{trd['trd_limit_pct']:.1f}% limit of IEEE 1547-2018 Table 26"
+          + (f", on phase {trd['trd_phase'].upper()}."
+             if trd.get("trd_phase") else "."))
+
+    if trd.get("orders"):
+        tbl = doc.add_table(rows=1, cols=4)
+        tbl.style = 'Table Grid'
+        _set_col_widths(tbl, [1.6, 3.0, 3.0, 2.0])
+        for cell, text in zip(tbl.rows[0].cells,
+                              ["Order", "Worst % of I_rated", "Limit (% of I_rated)",
+                               "Result"]):
+            _cell_shade(cell, _CHROME_BAND)
+            cell.paragraphs[0].add_run(text).bold = True
+            cell.paragraphs[0].runs[0].font.size = Pt(9)
+        for h, od in sorted(trd["orders"].items()):
+            cells = tbl.add_row().cells
+            values = [
+                f"H{h}" + (" (even)" if od["even"] else ""),
+                f"{od['max_pct_irated']:.3f}%",
+                f"{od['limit_pct']:.1f}%",
+                "Within limit" if od["pass"] else "Outside limit",
+            ]
+            for cell, text in zip(cells, values):
+                cell.paragraphs[0].add_run(text).font.size = Pt(9)
+
+    for caveat in trd.get("caveats", []):
+        _body(doc, caveat)
+
+
+def _il_basis_phrase(tdd_info: dict) -> str:
+    """One sentence saying what IL is, which is not the same thing every time.
+
+    At a load service IL is the measured demand. At a plant it is the entered
+    nameplate where there is one, and otherwise the largest export the
+    recording happened to catch -- which is a weaker reference and has to say
+    so, because a cloudy week shrinks it and inflates every percentage taken
+    against it.
+    """
+    if not tdd_info or not tdd_info.get("il_amps"):
+        return ""
+    amps = _m(tdd_info["il_amps"], ".0f", " A")
+    basis = tdd_info.get("il_basis", "demand")
+    if basis == "rated_output":
+        kw = tdd_info.get("rated_ac_kw")
+        rating = f" ({kw:,.0f} kW AC nameplate)" if kw else ""
+        return (f"This is a generating facility, so the reference current (IL) "
+                f"is its rated output{rating}, {amps}, rather than a demand "
+                f"load it does not have.")
+    if basis == "measured_export":
+        return (f"This is a generating facility with no demand load to take IL "
+                f"from, and no nameplate rating was supplied, so IL is the "
+                f"largest export measured in this recording, {amps}. The "
+                f"percentages below are therefore relative to what the plant "
+                f"did over these days rather than to what it is rated to do; "
+                f"a recording taken in poorer conditions would raise them.")
+    if basis == "billing":
+        return (f"The maximum demand load current (IL) is {amps}, taken from "
+                f"billing history as IEEE 519-2022 defines it: the twelve "
+                f"previous months' 15- or 30-minute maximum demands, averaged.")
+    return (f"IEEE 519-2022 defines the maximum demand load current (IL) as the "
+            f"twelve previous months' 15- or 30-minute maximum demands averaged, "
+            f"which is a billing quantity rather than a measurement. None was "
+            f"supplied, so the largest fundamental current in this recording, "
+            f"{amps}, is used in its place. Where the recording covers a period "
+            f"that is not representative of the year, the percentages taken "
+            f"against it move accordingly.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Word report dependencies (optional)
@@ -317,6 +412,14 @@ def generate_report(
         "kfactor":               kfactor_result or {"available": False,
                                                     "note": "not evaluated"},
         "thd_compliance":        thd_result,
+        # Which standard governs current distortion here, and the IEEE 1547
+        # assessment where one applies. Both are derived rather than passed in:
+        # they depend only on the thresholds and the frame, and threading two
+        # more results through every caller would buy nothing.
+        "current_standard":      applicable_current_standard(thresh),
+        "trd_compliance":        (check_trd(ds.df, thresh) if exports_power(thresh)
+                                  else {"available": False,
+                                        "note": "No generation at this service."}),
         "power_factor":          pf_result,
         "voltage_imbalance":     volt_imb_result,
         "current_imbalance":     curr_imb_result,
@@ -1829,8 +1932,14 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
 
     # Current imbalance — a limit on three-phase service, a reported
     # measurement on two legs, where no PSCo or standard limit exists.
-    if thresh.customer_class in ("sg", "pg"):
-        ci_label = "Current imbalance < 10%  (PSCo Tariff Sheet R121 ≤ 15% for C&I)"
+    if thresh.customer_class in ("c", "sg", "pg"):
+        # Sheet R123 is a billing-demand provision, not a limit: above 15%
+        # between phases the Company "may take as the Billing Demand" the
+        # three-phase equivalent of the worst phase. Calling it a limit told a
+        # customer they were in breach of something they were not.
+        ci_label = ("Current imbalance < 10% (NEMA MG1); above 15% between "
+                    "phases PSCo Sheet R123 allows billing demand to be taken "
+                    "from the worst phase")
     else:
         ci_label = "Current imbalance < 10% (NEMA MG1)"
     if ci["available"] and ci.get("limit_pct") is None:
@@ -2274,13 +2383,15 @@ def _build_structured_actions(report: dict, thresh: Thresholds) -> List[dict]:
     # Compliance-driven actions not already covered by assessment findings
     if (not residential and pf["power_factor"] is False
             and "power factor" not in covered):
-        if cls == "pg":
-            rec = ("Install power factor correction to maintain near unity power factor "
-                   "per PSCo Electric Tariff Sheet R121 (Schedule PG — C&I Primary service).")
-        else:
-            sched = "SG" if cls == "sg" else "C"
-            rec = (f"Install power factor correction capacitors to bring power factor "
-                   f"above 0.90 lagging per PSCo Electric Tariff Sheet R73 (Schedule {sched}).")
+        # Both clauses bind a C&I customer at once, and neither is class
+        # specific: Sheet R73 sits in the General rules and sets 90% lagging
+        # for every customer; Sheet R121 sits in the Commercial and Industrial
+        # rules and asks for near unity from all of C, SG and PG alike.
+        rec = ("Install power factor correction capacitors to bring power factor "
+               "above 0.90 lagging, which PSCo Electric Tariff Sheet R73 states "
+               "the Company's rates contemplate. Sheet R121 additionally asks "
+               "commercial and industrial customers to maintain a power factor "
+               "as near unity as practicable at the point of delivery.")
         actions.append({"recommendation": rec,
                         "purpose":  "Meet the tariff power factor requirement and avoid "
                                     "penalty or discontinuance exposure.",
@@ -2784,15 +2895,15 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
                     f"Power factor fell below {pfr['limit']:.2f} during "
                     f"{_mp(pfr['pct_below_limit'], '.1f')} of the recording "
                     f"(mean {_m(pfr['mean_pf'], '.3f')} {direction}, minimum {_m(pfr['min_pf'], '.3f')}). "
-                    "PSCo Electric Tariff Sheet R121 requires Primary service customers "
-                    "(Schedule PG) to maintain power factor as near unity as practicable. "
+                    "PSCo Electric Tariff Sheet R121 requires commercial and industrial "
+                    "customers to maintain power factor as near unity as practicable. "
                     "The customer should evaluate power factor correction equipment to comply "
                     "with tariff requirements."
                 )
         else:
-            # Schedule C or SG — Sheet R73 requires PF ≥ 0.90 lagging
-            sched = "SG" if thresh.customer_class == "sg" else "C"
-            tariff_cite = f"PSCo Electric Tariff Sheet R73 (Schedule {sched})"
+            # Sheet R73 sits in the General rules and sets 0.90 lagging for
+            # every class, so it is not cited against a schedule.
+            tariff_cite = "PSCo Electric Tariff Sheet R73"
             if pfr["pct_below_limit"] == 0:
                 _body(doc,
                     f"Power factor was consistently above the 0.90 lagging requirement "
@@ -2955,21 +3066,27 @@ def _word_harmonics(doc, report, thresh, df, outdir, stem="") -> None:
     _section_heading(doc, "Harmonic Evaluation", level=1)
     if tdd_info or c_thd.get("available") or ih.get("available"):
         _section_heading(doc, "Harmonic Compliance Evaluation", level=2)
+    # Which standard applies comes before any limit is quoted: 519 and 1547
+    # differ by three times in the aggregate limit and use different
+    # denominators, so a limit stated without its standard is not a limit.
+    _word_current_standard(doc, report, thresh)
+
+    il_phrase = _il_basis_phrase(tdd_info)
     if tdd_info and tdd_info.get("isc_provided"):
         _body(doc,
             f"The available short-circuit current at the point of delivery is {tdd_info['isc_amps']:,.0f} A "
             f"(source: {tdd_info.get('isc_source', 'provided')}). "
-            f"The maximum demand load current (IL) over the recording was {_m(tdd_info['il_amps'], '.0f', ' A')}. "
+            f"{il_phrase} "
             f"The resulting ISC/IL ratio is {tdd_info['isc_il_ratio']:.1f}, placing this service in the "
             f"IEEE 519-2022 {tdd_info['tdd_class']} class with a TDD limit of {tdd_info['tdd_limit_pct']:.1f}%."
         )
     elif tdd_info:
         _body(doc,
             f"Current distortion is evaluated as Total Demand Distortion (TDD), which "
-            f"references harmonic current to the maximum demand load current (IL) rather "
+            f"references harmonic current to a fixed reference current (IL) rather "
             f"than to the instantaneous fundamental — this avoids overstating distortion "
-            f"during light-load periods. IL over the recording was "
-            f"{_m(tdd_info['il_amps'], '.0f', ' A')}. The available short-circuit current at the "
+            f"when the fundamental is small. "
+            f"{il_phrase} The available short-circuit current at the "
             f"point of delivery was not provided, so the most restrictive IEEE 519-2022 "
             f"class (ISC/IL < 20) is assumed, giving a conservative TDD limit of "
             f"{tdd_info['tdd_limit_pct']:.1f}%; the true limit for this service can only "
@@ -3628,6 +3745,43 @@ def _word_harmonic_direction(doc, report, thresh) -> None:
             ]
             for cell, text in zip(cells, values):
                 cell.paragraphs[0].add_run(text).font.size = Pt(9)
+
+        # The exporting captures, on a generating service. They are a separate
+        # table rather than extra rows because they are a different population
+        # -- the site is running as a source in them -- and averaging the two
+        # together would describe an operating state the service never sat in.
+        exporting = (wf.get("export_split") or {}).get("exporting") or {}
+        if exporting.get("orders"):
+            doc.add_paragraph()
+            _body(doc,
+                  f"While exporting ({exporting['capture_phases']} phase-captures). "
+                  "The service is generating in these, so an order flowing out "
+                  "of the premises here is carried on the same path as the "
+                  "exported fundamental and does not by itself place the source "
+                  "inside the customer's system.")
+            tbl2 = doc.add_table(rows=1, cols=6)
+            tbl2.style = 'Table Grid'
+            _set_col_widths(tbl2, [1.3, 2.4, 2.6, 2.6, 2.4, 3.7])
+            for cell, text in zip(tbl2.rows[0].cells,
+                                  ["Order", "Readings", "Toward system",
+                                   "Median P_h (W)", "Median V–I angle",
+                                   "Indication"]):
+                _cell_shade(cell, _CHROME_BAND)
+                cell.paragraphs[0].add_run(text).bold = True
+                cell.paragraphs[0].runs[0].font.size = Pt(9)
+            for h, od in sorted(exporting["orders"].items()):
+                cells = tbl2.add_row().cells
+                values = [
+                    f"H{h}",
+                    f"{od['samples']}",
+                    f"{od['toward_system']} of {od['samples']}",
+                    _signed_watts(od['median_p_w']),
+                    f"{od['median_angle_deg']:.0f}°",
+                    _DIRECTION_LABEL.get(od.get("indication"),
+                                         od.get("indication", "")),
+                ]
+                for cell, text in zip(cells, values):
+                    cell.paragraphs[0].add_run(text).font.size = Pt(9)
     elif wf.get("note"):
         doc.add_paragraph()
         hdr = doc.add_paragraph()
@@ -4883,9 +5037,18 @@ def _word_appendix(doc, report, thresh, df) -> None:
             "infers direction from covariance rather than measuring it. (2) At each "
             "point-on-wave capture, harmonic phasors are projected onto the measured "
             "fundamental and its multiples, giving P_h = ½·Re(V_h·I_h*), whose sign "
-            "is the direction of harmonic power flow; the sign convention is fixed "
-            "by the fundamental real power, so reversed CTs are detected and "
-            "corrected rather than silently inverting the result. Captures taken "
+            "is the direction of harmonic power flow; "
+            + ("the service carries on-site generation, so the sign of the "
+               "fundamental cannot establish CT orientation -- reversed clamps "
+               "while importing and correct clamps while exporting read alike -- "
+               "and the captures are instead separated by their own direction of "
+               "flow and each half read on its own terms, with the CTs taken as "
+               "installed arrow-toward-load. "
+               if exports_power(thresh) else
+               "the sign convention is fixed by the fundamental real power, so "
+               "reversed CTs are detected and corrected rather than silently "
+               "inverting the result. ")
+            + "Captures taken "
             "during a voltage event, below "
             f"{_MIN_LOADED_AMPS:.0f} A of load, shorter than three cycles, or with "
             "no steady fundamental are excluded. The power-direction sign identifies "
@@ -5185,7 +5348,7 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "site": "your business",
         "reader": "a small business owner",
         "explains_basics": True,
-        "pf_sheet": "Sheet R73 (Schedule C)",
+        "pf_sheet": "Sheet R73",
         "owns_transformer": False,
         "fix_agent": "a licensed electrician",
     },
@@ -5193,7 +5356,7 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "site": "your facility",
         "reader": "whoever looks after the electrical system on site",
         "explains_basics": False,
-        "pf_sheet": "Sheet R73 (Schedule SG)",
+        "pf_sheet": "Sheet R73",
         "owns_transformer": False,
         "fix_agent": "your electrical contractor or maintenance team",
         "detail": "full",
@@ -5203,7 +5366,7 @@ _LETTER_REGISTER: Dict[str, dict] = {
         "site": "your facility",
         "reader": "the engineer responsible for the site's electrical system",
         "explains_basics": False,
-        "pf_sheet": "Sheet R121 (Schedule PG)",
+        "pf_sheet": "Sheet R121",
         "owns_transformer": True,
         "fix_agent": "your electrical engineer or contractor",
         "detail": "full",

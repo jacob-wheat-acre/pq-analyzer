@@ -793,6 +793,127 @@ class TestHarmonicDirectionFromWaveforms:
         assert "No point-on-wave captures" in r["note"]
 
 
+class TestHarmonicDirectionOnANetMeteredService:
+    """A service that exports breaks the CT-polarity test.
+
+    Reversed clamps on an importing service and correct clamps on an exporting
+    one produce the same negative fundamental power. Nothing in a single
+    capture separates them, so on a net-metered service the correction is not
+    applied at all and the captures are split on their own direction of flow.
+
+    Schedule NM is a service element under every rate schedule, so this is a
+    fact about the service and not about the customer class -- the flag is
+    entered, never inferred from the recording.
+    """
+
+    THRESH = Thresholds(nominal_voltage=120.0, service_role="mixed")
+    V1 = (120.0 * np.sqrt(2), 0.0)
+    I1_IMPORT = (10.0 * np.sqrt(2), 0.0)         # in phase with V → importing
+    I1_EXPORT = (10.0 * np.sqrt(2), 180.0)       # antiphase        → exporting
+
+    def _run(self, captures, thresh=None):
+        from pq_analysis import harmonic_direction_from_waveforms
+        import pandas as pd
+        return harmonic_direction_from_waveforms(
+            _FakeDataset(pd.DataFrame(), captures), thresh or self.THRESH)
+
+    def _importing(self):
+        # H3 leaving the premises while importing: source is inside.
+        return _capture({1: self.V1, 3: (4.0, 180.0)},
+                        {1: self.I1_IMPORT, 3: (2.0, 0.0)})
+
+    def _exporting(self):
+        return _capture({1: self.V1, 3: (4.0, 180.0)},
+                        {1: self.I1_EXPORT, 3: (2.0, 0.0)})
+
+    def test_exporting_captures_are_not_read_as_reversed_cts(self):
+        caps = [self._exporting()] * 3
+        r = self._run(caps)
+        assert r["ct_polarity_inverted"] is False
+        assert r["ct_polarity_verified"] is False
+        # The same captures on a service not declared as generating are read
+        # the old way -- which is correct there and wrong here.
+        r_load = self._run(caps, Thresholds(nominal_voltage=120.0))
+        assert r_load["ct_polarity_inverted"] is True
+
+    def test_the_two_directions_of_flow_are_reported_separately(self):
+        r = self._run([self._importing()] * 3 + [self._exporting()] * 3)
+        split = r["export_split"]
+        # Two phases per capture, so three captures give six phase-readings.
+        assert split["importing"]["capture_phases"] == 6
+        assert split["exporting"]["capture_phases"] == 6
+        assert 3 in split["importing"]["orders"]
+        assert 3 in split["exporting"]["orders"]
+
+    def test_the_main_table_states_the_importing_captures(self):
+        # The importing half is the one comparable with a non-generating
+        # service, so it is what the top-level result carries.
+        r = self._run([self._importing()] * 3 + [self._exporting()] * 3)
+        assert r["orders"] == r["export_split"]["importing"]["orders"]
+        assert r["overall"] == r["export_split"]["importing"]["overall"]
+        assert r["orders"][3]["indication"] == "downstream"
+
+    def test_an_exporting_sample_never_lands_in_the_importing_set(self):
+        # The split is per capture, not from the median over all of them: one
+        # exporting capture among many importing ones must not be averaged in.
+        r = self._run([self._importing()] * 5 + [self._exporting()])
+        split = r["export_split"]
+        assert split["importing"]["capture_phases"] == 10
+        assert split["exporting"]["capture_phases"] == 2
+        # The importing set holds its ten readings and not the odd exporting
+        # one; the exporting set is two readings, under the floor for an
+        # indication, so it gets none rather than a verdict from one capture.
+        assert split["importing"]["orders"][3]["samples"] == 10
+        assert split["exporting"]["orders"] == {}
+        assert split["exporting"]["overall"] == "indeterminate"
+
+    def test_a_service_that_only_exported_still_reports_that_half(self):
+        r = self._run([self._exporting()] * 3)
+        assert r["available"] is True
+        assert r["orders"] == {}
+        assert r["export_split"]["exporting"]["orders"][3]["samples"] == 6
+        assert "No capture was taken while the service was importing" in \
+            r["polarity_note"]
+
+    def test_the_flag_changes_the_verdict_on_the_real_fixture(self):
+        """End to end, from the .pqd file, not from synthetic captures.
+
+        test_solar_net_metered.pqd holds two captures taken before sunrise and
+        four taken across the middle of the day, all with H5 built to leave the
+        premises. Read as a load service the exporting majority drags the
+        median fundamental negative, the CTs are declared reversed, and every
+        direction inverts -- the file reports the distortion as the utility's.
+        """
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pq_analysis import harmonic_direction_from_waveforms
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_solar_net_metered.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        assert len(ds.waveforms) == 6
+
+        as_load = harmonic_direction_from_waveforms(
+            ds, Thresholds(nominal_voltage=277.0, customer_class="sg"))
+        assert as_load["ct_polarity_inverted"] is True
+        assert as_load["overall"] == "upstream"          # the wrong answer
+
+        as_gen = harmonic_direction_from_waveforms(
+            ds, Thresholds(nominal_voltage=277.0, customer_class="sg",
+                           service_role="mixed"))
+        assert as_gen["ct_polarity_inverted"] is False
+        assert as_gen["overall"] == "downstream"         # what was built in
+        split = as_gen["export_split"]
+        assert split["importing"]["capture_phases"] == 6     # 2 captures x 3 ph
+        assert split["exporting"]["capture_phases"] == 12    # 4 captures x 3 ph
+        assert split["exporting"]["overall"] == "downstream"
+
+    def test_the_note_says_the_ct_orientation_was_not_confirmed(self):
+        r = self._run([self._importing()] * 3 + [self._exporting()] * 3)
+        note = r["polarity_note"]
+        assert "on-site generation" in note
+        assert "arrow toward" in note
+        assert "reversed" not in note      # the load-service claim must not appear
+
+
 class TestHarmonicDirectionCombined:
     """The two methods together, including when they disagree."""
 
@@ -1633,7 +1754,13 @@ class TestFixturesAreCompliant:
         asserting against data the run never saw.
         """
         f = pqdif.PQDIFFile(path)
-        obs = [o for o in f.observations if o.channels]
+        # Point-on-wave captures are not sessions. They carry their own trigger
+        # time and thousands of samples where an interval record carries a few
+        # hundred, so grouping on (start, length) files each capture as a
+        # session of its own and picking the longest then picks a capture.
+        obs = [o for o in f.observations
+               if o.channels
+               and not any(c.quantity_type == 'WAVEFORM' for c in o.channels)]
         by_session = {}
         for o in obs:
             key = (o.start_time, len(o.channels[0].time))
@@ -1752,6 +1879,578 @@ def _frame(**cols):
     import pandas as pd
     n = len(next(iter(cols.values())))
     return pd.DataFrame(cols, index=pd.date_range("2025-01-01", periods=n, freq="5min"))
+
+
+def _solar_frame(days=3.7, night_i1=3.0, peak_i1=2000.0,
+                 night_ih=1.5, peak_ih=60.0):
+    """A generating service: output collapses to nothing every night.
+
+    This is the shape that breaks any statistic taken against the fundamental.
+    At night I1 is a few amps, so THD% runs away while the harmonic amperes
+    behind it stay trivial.  TDD, measured against a fixed IL, does not move.
+    """
+    import numpy as np
+    import pandas as pd
+    n    = int(days * 24 * 12)
+    idx  = pd.date_range("2024-04-06 12:00", periods=n, freq="5min")
+    hour = idx.hour + idx.minute / 60.0
+    day  = np.clip(np.sin((hour - 6) / 12 * np.pi), 0, None)
+
+    i1   = night_i1 + peak_i1 * day
+    ih   = night_ih + peak_ih * day
+    df   = pd.DataFrame(index=idx)
+    for ph in ("a", "b", "c"):
+        df[f"current_{ph}"]      = np.sqrt(i1 ** 2 + ih ** 2)
+        df[f"hrms_current_{ph}"] = ih
+        df[f"thd_current_{ph}"]  = 100.0 * ih / i1
+        df[f"h5_current_{ph}"]   = ih * 0.8
+    return df
+
+
+class TestHarmonicStatisticsOnAGeneratingService:
+    """The 9907 Queensburg failure: a THD series graded against a TDD limit.
+
+    The report put P95 = 59.70% beside a maximum TDD of 4.44% taken from
+    another block of the same run -- two different series under one label, and
+    a comparison no reader could have made sense of.
+    """
+
+    def test_the_aggregate_row_is_tdd_not_raw_thd(self):
+        from pq_analysis import check_harmonic_statistics
+        from pq_constants import Thresholds
+        df = _solar_frame()
+        # The raw THD channel reaches 50% every night on this profile.
+        assert df["thd_current_a"].quantile(0.95) > 40
+        w = check_harmonic_statistics(df, Thresholds(isc_amps=40000.0))["weekly"]["thd"]["a"]
+        # TDD is ~60 A against an IL of ~2000 A, whatever the hour.
+        assert w["p95"] < 5.0
+        assert w["p95_pass"] is True
+
+    def test_percentiles_never_exceed_the_maximum_reported_elsewhere(self):
+        # The invariant the report violated: one service, one denominator, so
+        # the statistical block's P95/P99 must sit under check_thd's maximum.
+        from pq_analysis import check_harmonic_statistics, check_thd
+        from pq_constants import Thresholds
+        th  = Thresholds(isc_amps=40000.0)
+        df  = _solar_frame()
+        w   = check_harmonic_statistics(df, th)["weekly"]["thd"]["a"]
+        top = check_thd(df, th)["current"]["max_thd_pct"]
+        assert w["p95"] <= top + 1e-9
+        assert w["p99"] <= top + 1e-9
+
+    def test_il_matches_the_one_check_thd_grades_against(self):
+        # Both blocks normalise against IL; if they derive it differently the
+        # per-order table and the TDD row describe different denominators.
+        from pq_analysis import check_harmonic_statistics, check_thd
+        from pq_constants import Thresholds
+        th   = Thresholds(isc_amps=40000.0)
+        df   = _solar_frame()
+        stat = check_harmonic_statistics(df, th)
+        assert stat["il_amps"] == pytest.approx(
+            check_thd(df, th)["current"]["il_amps"], rel=1e-3)
+
+    def test_a_phase_without_harmonic_rms_falls_back_rather_than_vanishing(self):
+        # Meters that report only THD totals must still get a TDD row, derived
+        # as Ih = THD% x I1 / 100, not be dropped from the assessment.
+        from pq_analysis import check_harmonic_statistics
+        from pq_constants import Thresholds
+        df = _solar_frame().drop(columns=["hrms_current_a", "hrms_current_b",
+                                          "hrms_current_c"])
+        w  = check_harmonic_statistics(df, Thresholds(isc_amps=40000.0))["weekly"]["thd"]
+        assert set(w) == {"a", "b", "c"}
+        assert w["a"]["p95"] < 5.0
+
+
+class TestHarmonicDirectionAtAProducerArray:
+    """A plant with no load: the polarity check returns, with its sign flipped.
+
+    The three roles are not a severity scale. Fundamental flow is one-way at
+    both ends and two-way only in the middle, so a wrong sign catches reversed
+    clamps at a load service and at a plant alike -- it is the mixed service
+    where the check cannot be made at all.
+    """
+
+    V1 = (277.0 * np.sqrt(2), 0.0)
+    I1_EXPORT = (230.0 * np.sqrt(2), 180.0)
+    I1_IMPORT = (230.0 * np.sqrt(2), 0.0)
+
+    def _run(self, captures, role="generation"):
+        from pq_analysis import harmonic_direction_from_waveforms
+        import pandas as pd
+        return harmonic_direction_from_waveforms(
+            _FakeDataset(pd.DataFrame(), captures),
+            Thresholds(nominal_voltage=277.0, service_role=role))
+
+    def _producing(self, reversed_cts=False):
+        i1 = self.I1_IMPORT if reversed_cts else self.I1_EXPORT
+        h5 = (-2.0, 0.0) if reversed_cts else (2.0, 0.0)
+        return _capture({1: self.V1, 5: (4.0, 180.0)}, {1: i1, 5: h5})
+
+    def test_exporting_is_the_expected_sign_and_is_not_corrected(self):
+        r = self._run([self._producing()] * 3)
+        assert r["ct_polarity_inverted"] is False
+        assert r["ct_polarity_verified"] is True
+        assert r["orders"][5]["indication"] == "downstream"
+
+    def test_a_plant_reading_as_importing_is_a_reversed_ct(self):
+        # The load rule with its sign flipped: at a plant that is producing,
+        # positive fundamental real power is the anomaly.
+        r = self._run([self._producing(reversed_cts=True)] * 3)
+        assert r["ct_polarity_inverted"] is True
+        assert "reversed" in r["polarity_note"]
+        # Corrected, it must reach the same conclusion as the sound install.
+        assert r["orders"][5]["indication"] == "downstream"
+
+    def test_the_mixed_split_is_not_applied_to_a_plant(self):
+        r = self._run([self._producing()] * 3)
+        assert "export_split" not in r
+
+    def test_calling_a_plant_a_load_inverts_every_direction(self):
+        # The defect the third role exists to prevent.
+        r = self._run([self._producing()] * 3, role="load")
+        assert r["ct_polarity_inverted"] is True
+        assert r["orders"][5]["indication"] == "upstream"
+
+    def test_calling_a_plant_mixed_throws_the_answer_away(self):
+        # Safe but useless: with no importing captures the top-level result is
+        # empty, so a plant must not be filed under the mixed role either.
+        r = self._run([self._producing()] * 3, role="mixed")
+        assert r["orders"] == {}
+        assert r["overall"] == "indeterminate"
+
+    def test_the_note_says_direction_is_a_check_not_a_finding(self):
+        # At a plant the only source behind the meter is the plant, so
+        # "customer side" could not have come out any other way.
+        note = self._run([self._producing()] * 3)["polarity_note"]
+        assert "check on the measurement" in note
+
+    def test_the_real_fixture_reads_correctly_only_as_a_plant(self):
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pq_analysis import harmonic_direction_from_waveforms
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        assert len(ds.waveforms) == 4
+
+        def run(role):
+            return harmonic_direction_from_waveforms(
+                ds, Thresholds(nominal_voltage=277.0, customer_class="sg",
+                               service_role=role))
+
+        assert run("load")["overall"] == "upstream"           # inverted
+        assert run("mixed")["overall"] == "indeterminate"     # answer lost
+        assert run("generation")["overall"] == "downstream"   # right
+
+
+class TestGenerationIL:
+    """IL at a plant, which has no demand load to take it from."""
+
+    @staticmethod
+    def _thresh(**kw):
+        return Thresholds(nominal_voltage=277.0, customer_class="sg",
+                          service_role="generation", isc_amps=40000.0, **kw)
+
+    @staticmethod
+    def _df():
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        return extract_dataset(ProntoAdapter(str(path)), ChannelMapper()).df
+
+    def test_the_nameplate_is_used_when_given(self):
+        from pq_analysis import check_thd
+        # 250 kW AC at 277 V line-to-neutral, three-phase: 250000/(3x277) = 301 A.
+        td = check_thd(self._df(), self._thresh(rated_ac_kw=250.0))["tdd_info"]
+        assert td["il_amps"] == pytest.approx(300.8, abs=1.0)
+        assert td["il_basis"] == "rated_output"
+
+    def test_without_a_nameplate_it_falls_back_to_measured_export(self):
+        from pq_analysis import check_thd
+        td = check_thd(self._df(), self._thresh())["tdd_info"]
+        assert td["il_basis"] == "measured_export"
+        # The fixture's week is hazy, so the plant never reaches its rating.
+        assert td["il_amps"] < 300.0
+
+    def test_the_weaker_reference_inflates_the_percentages(self):
+        # Why the basis has to be stated rather than just used: the same
+        # harmonic amperes grade differently against the two denominators.
+        from pq_analysis import check_thd
+        df = self._df()
+        rated    = check_thd(df, self._thresh(rated_ac_kw=250.0))["current"]
+        measured = check_thd(df, self._thresh())["current"]
+        assert measured["max_thd_pct"] > rated["max_thd_pct"]
+
+    def test_a_load_service_ignores_the_rating_entirely(self):
+        # IL at a load service is measured demand; a stray rating must not
+        # quietly become the denominator there.
+        from pq_analysis import check_thd
+        df = self._df()
+        load = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                          isc_amps=40000.0, rated_ac_kw=250.0)
+        td = check_thd(df, load)["tdd_info"]
+        assert td["il_basis"] == "measured_demand"
+        assert td["il_amps"] < 300.0
+
+
+class TestTariffScopingIsNotMisstated:
+    """The two PF clauses and the 15% clause, as the filed tariff has them.
+
+    Verified against COLO. PUC No. 8 Electric on 2026-08-13:
+
+      Sheet R73   Rules and Regulations, GENERAL: "Company's rates contemplate
+                  Customer's use of service at a Power Factor... of not less
+                  than ninety percent (90%) lagging."  General, so all classes.
+      Sheet R121  Rules and Regulations, COMMERCIAL AND INDUSTRIAL: "a Power
+                  Factor as near unity as practicable."  All of C, SG and PG.
+      Sheet R123  C&I billing demand provisions: above 15% between phases the
+                  Company "may take as the Billing Demand" the three-phase
+                  equivalent of the worst phase.  A charge, not a limit.
+
+    These went into a customer-facing document, so they are pinned.
+    """
+
+    @staticmethod
+    def _sources():
+        from pathlib import Path
+        root = Path(__file__).parent
+        return {name: (root / name).read_text()
+                for name in ("run.py", "pq_report.py", "pq_analyzer.py")}
+
+    def test_no_file_calls_r121_a_primary_only_clause(self):
+        for name, text in self._sources().items():
+            assert "Sheet R121 (Schedule PG)" not in text, name
+            assert "R121 requires Primary service" not in text, name
+
+    def test_no_file_attributes_sheet_r73_to_a_schedule(self):
+        for name, text in self._sources().items():
+            for sched in ("C", "SG"):
+                assert f"Sheet R73 (Schedule {sched})" not in text, name
+
+    def test_the_fifteen_percent_clause_is_not_called_a_requirement(self):
+        for name, text in self._sources().items():
+            assert "R121 requires that load in any one phase" not in text, name
+            assert "Sheet R121 (≤ 15%" not in text, name
+
+    def test_residential_is_not_described_as_having_no_pf_clause(self):
+        # R73 is in the General rules and reaches Schedule R too. What is true
+        # is that no reactive billing applies there.
+        text = self._sources()["run.py"]
+        assert "Residential customers are not contractually required" not in text
+
+    def test_the_imbalance_row_cites_r123_as_a_billing_provision(self):
+        # The compliance row a customer reads. It named R121 and called 15% a
+        # limit; the clause is R123 and it sets a charge, not a limit.
+        text = self._sources()["pq_report.py"]
+        assert "PSCo Tariff Sheet R121 ≤ 15% for C&I" not in text
+        assert "Sheet R123" in text and "billing demand" in text.lower()
+
+
+class TestMixedServicePopulations:
+    """A service with generation holds two populations that share a meter.
+
+    Pooling them is the failure mode: the light-load gate takes its floor from
+    a share of the peak, so the export peak sets a bar the load can never
+    reach and the whole load half drops out as "light load" with nothing
+    saying so. The two direction methods then describe opposite halves and get
+    reported as agreeing with each other.
+    """
+
+    @staticmethod
+    def _ds():
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_solar_net_metered.pqd"
+        return extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+
+    @staticmethod
+    def _t(role="mixed"):
+        return Thresholds(nominal_voltage=277.0, customer_class="sg",
+                          service_role=role)
+
+    def test_the_gate_no_longer_takes_its_floor_from_the_export_peak(self):
+        from pq_analysis import harmonic_spectrum_significance
+        df = self._ds().df
+        s = harmonic_spectrum_significance(df, self._t())
+        # The export peak is around 200 A; the load's own demand is a few amps.
+        # A floor set from the former excludes every load interval.
+        assert s["il_amps"] < 50.0
+        assert s["load_floor_amps"] < 5.0
+
+    def test_the_load_half_of_the_service_survives_the_gate(self):
+        from pq_analysis import harmonic_spectrum_significance
+        df = self._ds().df
+        s = harmonic_spectrum_significance(df, self._t())
+        kept = s["loaded"]
+        assert s["loaded_intervals"] > 0
+        # Every kept interval is an importing one, and none are exporting:
+        # the two are characterised apart, not pooled.
+        assert int((df["power_real"].loc[kept] < 0).sum()) == 0
+
+    def test_a_load_service_is_not_split_at_all(self):
+        from pq_analysis import harmonic_spectrum_significance
+        df = self._ds().df
+        s = harmonic_spectrum_significance(df, self._t(role="load"))
+        assert s["flow"]["split"] is False
+        assert s["flow"]["direction"] == "all"
+
+    def test_both_direction_methods_read_the_same_population(self):
+        from pq_analysis import (harmonic_direction_from_intervals,
+                                 harmonic_direction_from_waveforms)
+        ds, th = self._ds(), self._t()
+        iv = harmonic_direction_from_intervals(ds.df, th)
+        wf = harmonic_direction_from_waveforms(ds, th)
+        # The captures' top-level result is the importing half; the interval
+        # regression must be over importing intervals, or "agreement" between
+        # them compares two different things.
+        assert iv["flow"]["direction"] == "importing"
+        assert wf["export_split"]["importing"]["capture_phases"] > 0
+
+    def test_a_plant_reads_its_exporting_intervals(self):
+        from pq_analysis import harmonic_direction_from_intervals, primary_flow_direction
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pathlib import Path
+        th = self._t(role="generation")
+        assert primary_flow_direction(th) == "exporting"
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        iv = harmonic_direction_from_intervals(ds.df, th)
+        assert iv["flow"]["direction"] == "exporting"
+
+    def test_a_service_with_no_power_channel_says_it_could_not_split(self):
+        # Silence here would be the original defect wearing a new coat.
+        from pq_analysis import flow_scope
+        df = self._ds().df.drop(columns=["power_real"])
+        scoped, info = flow_scope(df, self._t(), "importing")
+        assert scoped is not None          # still assessed
+        assert info["split"] is False
+        assert "no real-power channel" in info["reason"]
+
+
+class TestCaptureSplitDeadband:
+    """Near the crossover the sign of P1 is a residue, not a direction.
+
+    Current magnitude alone cannot reach the deadband: the light-load gate
+    already drops any capture under 1 A, which at 277 V is twice the polarity
+    floor in watts. What does reach it is a capture whose fundamental is almost
+    entirely reactive -- generation offsetting load in real terms while current
+    still circulates. P1 is then a residue whose sign is noise, and on an
+    unbalanced service it can point opposite ways on two phases of one capture.
+    """
+
+    V1 = (277.0 * np.sqrt(2), 0.0)
+
+    def _run(self, captures):
+        from pq_analysis import harmonic_direction_from_waveforms
+        import pandas as pd
+        return harmonic_direction_from_waveforms(
+            _FakeDataset(pd.DataFrame(), captures),
+            Thresholds(nominal_voltage=277.0, service_role="mixed"))
+
+    def _capture_at(self, i1_amps, deg):
+        return _capture({1: self.V1, 5: (4.0, 180.0)},
+                        {1: (i1_amps * np.sqrt(2), deg), 5: (2.0, 0.0)})
+
+    def test_a_capture_with_no_real_power_lands_in_neither_half(self):
+        # 150 A at 90 degrees: plenty of current, no real power to take a sign
+        # from. P1 = V x I x cos(90) is zero however large the current is.
+        r = self._run([self._capture_at(150.0, 0.0)] * 3
+                      + [self._capture_at(150.0, 90.0)] * 3)
+        split = r["export_split"]
+        assert split["importing"]["capture_phases"] == 6
+        assert split["exporting"]["capture_phases"] == 0
+        assert split["near_crossover"] == 6
+
+    def test_the_note_accounts_for_the_captures_it_set_aside(self):
+        r = self._run([self._capture_at(150.0, 0.0)] * 3
+                      + [self._capture_at(150.0, 90.0)] * 3)
+        assert "in neither half" in r["polarity_note"]
+
+    def test_a_clear_export_is_still_filed_as_exporting(self):
+        r = self._run([self._capture_at(150.0, 0.0)] * 3
+                      + [self._capture_at(150.0, 180.0)] * 3)
+        split = r["export_split"]
+        assert split["importing"]["capture_phases"] == 6
+        assert split["exporting"]["capture_phases"] == 6
+        assert split["near_crossover"] == 0
+
+    def test_a_mostly_reactive_capture_still_counts_when_real_power_is_clear(self):
+        # 60 degrees is a poor power factor, not an ambiguous direction:
+        # cos(60) x 277 V x 150 A is well clear of the floor.
+        r = self._run([self._capture_at(150.0, 60.0)] * 3)
+        split = r["export_split"]
+        assert split["importing"]["capture_phases"] == 6
+        assert split["near_crossover"] == 0
+
+
+class TestWhichCurrentStandardApplies:
+    """IEEE 519-2022 Figure 1, the decision tree for an installation with DER.
+
+    519 limits its own scope to a PCC "primarily with harmonic producing
+    loads". Applying it to a plant quotes a limit three times looser than the
+    one that governs, so the branch taken has to be reported, not assumed.
+    """
+
+    @staticmethod
+    def _t(**kw):
+        return Thresholds(nominal_voltage=277.0, customer_class="sg", **kw)
+
+    def test_a_service_with_no_generation_is_a_519_site(self):
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t())
+        assert r["standard"] == "519"
+        assert r["branch"] == "no_der"
+
+    def test_generation_under_a_tenth_of_load_stays_under_519(self):
+        from pq_analysis import applicable_current_standard
+        # 40 kW of solar on a service averaging 500 kW: 8%.
+        r = applicable_current_standard(self._t(
+            service_role="mixed", rated_ac_kw=40.0, annual_avg_load_kw=500.0))
+        assert r["standard"] == "519"
+        assert r["branch"] == "der_below_threshold"
+        assert r["der_share"] == pytest.approx(0.08)
+
+    def test_generation_at_a_tenth_of_load_goes_to_1547(self):
+        from pq_analysis import applicable_current_standard
+        # Exactly 10%: the tree asks whether it is *below* the threshold.
+        r = applicable_current_standard(self._t(
+            service_role="mixed", rated_ac_kw=50.0, annual_avg_load_kw=500.0))
+        assert r["standard"] == "1547"
+
+    def test_a_plant_with_no_load_goes_to_1547(self):
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t(
+            service_role="generation", rated_ac_kw=250.0, annual_avg_load_kw=2.0))
+        assert r["standard"] == "1547"
+        assert "1547" in r["reason"]
+
+    def test_missing_records_are_reported_undetermined_not_guessed(self):
+        # Both quantities come from records. Guessing either picks the wrong
+        # standard, and the two differ by 3x in the aggregate limit.
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t(
+            service_role="mixed", rated_ac_kw=250.0))
+        assert r["determined"] is False
+        assert r["branch"] == "undetermined"
+        assert "annual average load demand" in r["reason"]
+        # It still grades against something rather than going silent.
+        assert r["standard"] == "519"
+
+    def test_the_reason_names_both_figures_it_compared(self):
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t(
+            service_role="mixed", rated_ac_kw=40.0, annual_avg_load_kw=500.0))
+        assert "40 kW" in r["reason"] and "500 kW" in r["reason"]
+
+
+class TestTRDAgainst1547:
+    """IEEE 1547-2018 Clause 7.3: TRD against rated current, not demand."""
+
+    @staticmethod
+    def _df():
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        return extract_dataset(ProntoAdapter(str(path)), ChannelMapper()).df
+
+    @staticmethod
+    def _t(**kw):
+        kw.setdefault("isc_amps", 40000.0)
+        return Thresholds(nominal_voltage=277.0, customer_class="sg",
+                          service_role="generation", **kw)
+
+    def test_it_declines_without_a_nameplate_rather_than_substituting(self):
+        # I_rated is a nameplate. Falling back to a measured peak and calling
+        # the result 1547 would be inventing the denominator.
+        from pq_analysis import check_trd
+        r = check_trd(self._df(), self._t())
+        assert r["available"] is False
+        assert "nameplate" in r["note"]
+
+    def test_trd_is_graded_against_five_percent_of_rated_current(self):
+        from pq_analysis import check_trd
+        r = check_trd(self._df(), self._t(rated_ac_kw=250.0))
+        assert r["available"] is True
+        assert r["irated_amps"] == pytest.approx(300.8, abs=1.0)
+        assert r["trd_limit_pct"] == 5.0
+        assert r["trd_pct"] < 5.0 and r["trd_pass"] is True
+
+    def test_the_limits_do_not_move_with_isc(self):
+        # 519's limits scale with ISC/IL; 1547's are fixed. A stiff system must
+        # not buy the plant headroom it is not entitled to.
+        from pq_analysis import check_trd
+        df = self._df()
+        stiff = check_trd(df, self._t(rated_ac_kw=250.0, isc_amps=200000.0))
+        weak  = check_trd(df, self._t(rated_ac_kw=250.0, isc_amps=5000.0))
+        assert stiff["trd_limit_pct"] == weak["trd_limit_pct"] == 5.0
+        assert stiff["orders"][5]["limit_pct"] == weak["orders"][5]["limit_pct"]
+
+    def test_even_orders_use_their_own_looser_table(self):
+        from pq_analysis import check_trd
+        r = check_trd(self._df(), self._t(rated_ac_kw=250.0))
+        # Table 27: h=2 is 1.0%, h=4 is 2.0%, h=6 is 3.0% -- and 519's blanket
+        # 25%-of-odd would have made all three 1.0%.
+        assert r["orders"][2]["limit_pct"] == 1.0
+        assert r["orders"][4]["limit_pct"] == 2.0
+        assert r["orders"][6]["limit_pct"] == 3.0
+        assert all(r["orders"][h]["even"] for h in (2, 4, 6))
+
+    def test_the_1547_limits_are_tighter_than_the_519_ones_here(self):
+        # The reason the branch matters: same measurement, different verdict
+        # headroom. The producer's ISC/IL puts it in 519's loosest class.
+        from pq_analysis import check_trd, check_thd
+        df = self._df()
+        th = self._t(rated_ac_kw=250.0)
+        trd = check_trd(df, th)
+        tdd = check_thd(df, th)["tdd_info"]
+        assert tdd["tdd_limit_pct"] == 15.0
+        assert trd["trd_limit_pct"] == 5.0
+
+    def test_both_caveats_are_carried_with_the_result(self):
+        # Neither is optional: one says the figure is conservative, the other
+        # says a narrow pass is not clearance.
+        from pq_analysis import check_trd
+        r = check_trd(self._df(), self._t(rated_ac_kw=250.0))
+        joined = " ".join(r["caveats"])
+        assert "without the plant connected" in joined
+        assert "interharmonics" in joined.lower()
+
+
+class TestILFromBilling:
+    """519-2022 defines IL from twelve months of billing, not from a recording."""
+
+    @staticmethod
+    def _df():
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_commercial_large.pqd"
+        return extract_dataset(ProntoAdapter(str(path)), ChannelMapper()).df
+
+    def test_an_entered_il_is_used_over_the_recording_peak(self):
+        from pq_analysis import check_thd
+        df = self._df()
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                        isc_amps=40000.0, il_amps_billing=400.0)
+        td = check_thd(df, th)["tdd_info"]
+        assert td["il_amps"] == pytest.approx(400.0)
+        assert td["il_basis"] == "billing"
+
+    def test_without_one_the_recording_peak_stands_in_and_is_labelled(self):
+        from pq_analysis import check_thd
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                        isc_amps=40000.0)
+        td = check_thd(self._df(), th)["tdd_info"]
+        assert td["il_basis"] == "measured_demand"
+
+    def test_a_small_il_inflates_the_percentages(self):
+        # Why the substitution has to be labelled: IL is a denominator, and a
+        # recording from a slow week can manufacture a violation.
+        from pq_analysis import check_thd
+        df = self._df()
+        def tdd(il):
+            th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                            isc_amps=40000.0, il_amps_billing=il)
+            return check_thd(df, th)["current"]["max_thd_pct"]
+        assert tdd(50.0) > tdd(400.0)
 
 
 class TestKFactorByPhase:
@@ -2552,6 +3251,77 @@ def gui_app():
     app.update_idletasks()
     yield app
     app.destroy()
+
+
+class TestHelpWindowStructure:
+    """The reference guide is paged, not one scroll of everything.
+
+    It carries three different kinds of thing -- what to enter and why, what
+    the standards say, and how to work a job -- and it grew past a thousand
+    lines. A reader after one of those should not have to scroll past the
+    other two, and no single pane should be a wall on its own.
+    """
+
+    @staticmethod
+    def _panes(app):
+        import tkinter as tk
+        app._show_help()
+        win = [w for w in app.winfo_children() if isinstance(w, tk.Toplevel)][-1]
+        kids = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                kids.append(c)
+                walk(c)
+
+        walk(win)
+        nb = [w for w in kids if w.winfo_class() == "TNotebook"][0]
+        txts = [w for w in kids if isinstance(w, tk.Text)]
+        tabs = [nb.tab(i, "text").strip() for i in range(len(nb.tabs()))]
+        return win, tabs, txts
+
+    def test_it_opens_as_tabs_with_start_here_first(self, gui_app):
+        win, tabs, txts = self._panes(gui_app)
+        assert tabs[0] == "Start here"
+        assert len(tabs) == len(txts) >= 6
+        win.destroy()
+
+    def test_no_single_pane_is_a_wall(self, gui_app):
+        # Before paging, one scroll held ~918 lines and the merged concepts
+        # page alone held 475. Either is more than anyone reads.
+        win, tabs, txts = self._panes(gui_app)
+        lines = {t: len(w.get("1.0", "end-1c").splitlines())
+                 for t, w in zip(tabs, txts)}
+        assert max(lines.values()) < 300, lines
+        assert sum(lines.values()) > 600      # nothing was dropped in the split
+        win.destroy()
+
+    def test_the_three_entered_inputs_are_on_the_first_page(self, gui_app):
+        # The whole point of a landing page: the things no .pqd file carries,
+        # where guessing changes the answer rather than the wording.
+        win, tabs, txts = self._panes(gui_app)
+        start = txts[tabs.index("Start here")].get("1.0", "end-1c")
+        assert "Power flow" in start
+        assert "Figure 1" in start
+        assert "twelve previous months" in start
+        win.destroy()
+
+    def test_every_pane_is_read_only(self, gui_app):
+        win, tabs, txts = self._panes(gui_app)
+        assert all(str(w.cget("state")) == "disabled" for w in txts)
+        win.destroy()
+
+    def test_links_are_bound_on_the_pane_that_holds_them(self, gui_app):
+        # The tags are created while a page is being written; binding them to
+        # a stale widget would leave them inert without looking broken.
+        win, tabs, txts = self._panes(gui_app)
+        found = 0
+        for w in txts:
+            for tag in (t for t in w.tag_names() if t.startswith("_lnk")):
+                assert w.tk.call(w._w, "tag", "bind", tag, "<Button-1>")
+                found += 1
+        assert found >= 5
+        win.destroy()
 
 
 class TestClearAll:
@@ -3848,9 +4618,15 @@ class TestComplianceRowsQuoteMeasurements:
         from pq_analysis import check_individual_harmonics
         # H5 is the larger current but sits well inside its limit; H23's much
         # tighter limit makes it the order that actually binds.
+        #
+        # The margins have to be separated by more than a rounding step.  At
+        # 6.0 A and 0.9 A both orders sit at exactly 0.60 of their limits, and
+        # which one "wins" is then decided by the last bit of the division --
+        # so the assertion below held for a reason that had nothing to do with
+        # margins.  1.2 A puts H23 at 0.80 of its limit against H5's 0.60.
         df = _frame(current_a=[100.0] * 10,
                     h5_current_a=[6.0] * 10,
-                    h23_current_a=[0.9] * 10)
+                    h23_current_a=[1.2] * 10)
         r = check_individual_harmonics(df, Thresholds(isc_amps=5000.0))
         assert r["available"]
         assert r["worst_order"][0] == 5              # largest magnitude
@@ -5435,7 +6211,15 @@ class TestCustomerLetter:
         # A primary-metered customer owns the transformer, and the letter says so.
         assert "transformer at this site is yours" in texts["pg"]
 
-    def test_the_power_factor_tariff_sheet_follows_the_class(self):
+    def test_the_power_factor_sheet_is_not_attributed_to_a_schedule(self):
+        """The PF clauses are scoped by rules section, not by rate schedule.
+
+        Sheet R73 sits in the General rules and sets 0.90 lagging for every
+        class; Sheet R121 sits in the Commercial and Industrial rules and asks
+        all of C, SG and PG for near unity. Writing "Sheet R73 (Schedule C)"
+        told a customer the clause was theirs alone, which is not what the
+        tariff says and is not a claim worth defending in a letter.
+        """
         from pq_report import _customer_conditions
         sheets = {}
         for cls in ("c", "sg", "pg"):
@@ -5444,10 +6228,11 @@ class TestCustomerLetter:
             pf = [c for c in _customer_conditions(rep, th)
                   if "power factor" in c["headline"].lower()]
             sheets[cls] = pf[0]["measured"] if pf else ""
-        assert "Sheet R73 (Schedule C)" in sheets["c"]
-        assert "Sheet R73 (Schedule SG)" in sheets["sg"]
-        # Schedule PG asks for near unity, not a 0.90 floor.
-        assert "Sheet R121 (Schedule PG)" in sheets["pg"]
+        assert "Sheet R73" in sheets["c"] and "Schedule C" not in sheets["c"]
+        assert "Sheet R73" in sheets["sg"] and "Schedule SG" not in sheets["sg"]
+        # Primary practice is near unity rather than a 0.90 floor, and R121 is
+        # cited without being called a Schedule PG clause.
+        assert "Sheet R121" in sheets["pg"] and "Schedule PG" not in sheets["pg"]
         assert "near unity" in sheets["pg"] and "0.90" not in sheets["pg"]
 
     def test_no_customer_document_mentions_the_internal_report(self, tmp_path):
@@ -5493,16 +6278,17 @@ class TestCustomerLetter:
             assert residential not in text, f"business letter says {residential!r}"
         assert "your business" in text
 
-    def test_business_letter_names_the_tariff_schedule(self, tmp_path):
+    def test_business_letter_names_the_tariff_sheet(self, tmp_path):
         from docx import Document
         from pq_report import generate_customer_letter
         rep, th = self._report(Path("test_data/test_commercial_small.pqd"),
                                customer_class="c")
         out = generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t")
         text = " ".join(p.text for p in Document(str(out)).paragraphs)
-        # Power factor is the one item with a direct billing consequence, so the
-        # schedule it comes from is worth naming.
-        assert "Schedule C" in text and "R73" in text
+        # Power factor is the one item with a direct billing consequence, so
+        # the customer should be able to look the clause up -- which means the
+        # sheet, not a schedule the clause does not belong to.
+        assert "R73" in text
 
     def test_neutral_wording_follows_the_service_topology(self):
         # "Two 120-volt halves" is true of a house and false of a three-phase site.

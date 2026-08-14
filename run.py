@@ -45,6 +45,30 @@ _SCHEDULE_KEY = {
     "Schedule PG — C&I Primary":              "pg",
 }
 
+# ── Which way power flows at the meter → CLI key ─────────────────────────────
+# Not a tariff schedule: NM and PV ride on top of the schedules above, and the
+# solar schedules where the array is off-site (OS-NM, RC, SRCS) measure as
+# plain load. What matters here is what is physically behind the meter.
+_ROLE_LABELS = [
+    "Load only",
+    "Load + generation  (NM, PV, RE, AVPP)",
+    "Generation only  (producer's array)",
+]
+_ROLE_KEY = {
+    _ROLE_LABELS[0]: "load",
+    _ROLE_LABELS[1]: "mixed",
+    _ROLE_LABELS[2]: "generation",
+}
+
+
+def _float_or_none(text: str):
+    """A blank or unparseable entry box is 'not given', not zero."""
+    try:
+        value = float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
 # ── Which version is running ─────────────────────────────────────────────────
 # Read on its own, ahead of the engine import below and out of its try/except:
 # when that import fails, the version is the first thing anyone asks for, and a
@@ -395,7 +419,71 @@ class PQApp(tk.Tk):
         )
         cclass_combo.pack(side="left")
         tk.Label(cclass_frame,
-                 text="(R: no PF clause  |  C/SG: ≥ 0.90 Sheet R73  |  PG: near unity Sheet R121)",
+                 text="(PF: Sheet R73 ≥ 0.90 lagging, all classes  |  Sheet R121 near unity, C&I only)",
+                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(8, 0))
+
+        # Generation rides on top of the class above rather than replacing it
+        # -- Schedule NM applies "as a service element under all rate
+        # schedules" -- so it is its own row, not a fifth entry in the list.
+        # Three values rather than a checkbox: a plant that only generates is
+        # not a further degree of a service that also generates, and the CT
+        # polarity check treats them oppositely.
+        nm_frame = tk.Frame(self, bg=_BG)
+        nm_frame.pack(fill="x", **pad)
+        tk.Label(nm_frame, text="Power flow", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+        self._role_var = tk.StringVar(value=_ROLE_LABELS[0])
+        role_combo = ttk.Combobox(
+            nm_frame, textvariable=self._role_var, values=_ROLE_LABELS,
+            width=34, font=_FONT_UI, state="readonly",
+        )
+        role_combo.pack(side="left")
+
+        tk.Label(nm_frame, text="Rated gen kW", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(12, 4))
+        self._rated_kw_var = tk.StringVar(value="")
+        rated_entry = tk.Entry(nm_frame, textvariable=self._rated_kw_var, width=8,
+                               font=_FONT_UI)
+        rated_entry.pack(side="left")
+
+        tk.Label(nm_frame, text="Avg load kW", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(10, 4))
+        self._avg_load_var = tk.StringVar(value="")
+        avg_entry = tk.Entry(nm_frame, textvariable=self._avg_load_var, width=8,
+                             font=_FONT_UI)
+        avg_entry.pack(side="left")
+
+        rated_hint = tk.Label(
+            nm_frame,
+            text="(the two decide 519 vs 1547 — see ? Help)",
+            bg=_BG, fg="#888888", font=_FONT_UI_S)
+        rated_hint.pack(side="left", padx=(8, 0))
+
+        def _sync_rated(*_a):
+            # Both only mean anything where there is generation, so they are
+            # greyed out rather than silently ignored.
+            on = _ROLE_KEY.get(self._role_var.get(), "load") != "load"
+            state = "normal" if on else "disabled"
+            rated_entry.configure(state=state)
+            avg_entry.configure(state=state)
+            rated_hint.configure(fg="#888888" if on else "#555555")
+
+        role_combo.bind("<<ComboboxSelected>>", _sync_rated)
+        _sync_rated()
+
+        # ── Billing IL row ────────────────────────────────────────────────────
+        il_frame = tk.Frame(self, bg=_BG)
+        il_frame.pack(fill="x", **pad)
+        tk.Label(il_frame, text="IL from billing", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+        self._il_billing_var = tk.StringVar(value="")
+        tk.Entry(il_frame, textvariable=self._il_billing_var, width=10,
+                 font=_FONT_UI).pack(side="left")
+        tk.Label(il_frame, text="A",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left", padx=(4, 0))
+        tk.Label(il_frame,
+                 text="(12 months of 15/30-min maximum demands, averaged — "
+                      "IEEE 519's own definition; blank uses the recording peak)",
                  bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(8, 0))
 
         # ── Service type + nominal row ─────────────────────────────────────────
@@ -1309,6 +1397,10 @@ class PQApp(tk.Tk):
             "session":        self._selected_session(),
             "nominal":        nominal,
             "cclass_key":     _SCHEDULE_KEY.get(self._cclass_var.get(), "sg"),
+            "service_role":   _ROLE_KEY.get(self._role_var.get(), "load"),
+            "rated_ac_kw":    _float_or_none(self._rated_kw_var.get()),
+            "annual_avg_load_kw": _float_or_none(self._avg_load_var.get()),
+            "il_amps_billing":    _float_or_none(self._il_billing_var.get()),
             "site":           self._site_var.get().strip(),
             "address":        self._address_var.get().strip(),
             "meter_id":       self._meter_id_var.get().strip(),
@@ -1420,6 +1512,10 @@ class PQApp(tk.Tk):
         thresh = Thresholds(
             nominal_voltage=nominal,
             customer_class=params["cclass_key"],
+            service_role=params["service_role"],
+            rated_ac_kw=params["rated_ac_kw"],
+            annual_avg_load_kw=params["annual_avg_load_kw"],
+            il_amps_billing=params["il_amps_billing"],
             isc_amps=isc_amps,
             isc_source=isc_source,
             transformer_kva=kva,
@@ -1665,6 +1761,8 @@ class PQApp(tk.Tk):
         win.resizable(True, True)
         win.minsize(640, 560)
 
+        win.minsize(760, 620)
+
         # Header bar
         hdr = tk.Frame(win, bg=_BTN_RUN)
         hdr.pack(fill="x")
@@ -1672,39 +1770,70 @@ class PQApp(tk.Tk):
                  bg=_BTN_RUN, fg="white", font=_FONT_UI_B,
                  pady=10, padx=16).pack(anchor="w")
 
-        # Scrollable content
-        outer = tk.Frame(win, bg=_BG)
-        outer.pack(fill="both", expand=True, padx=16, pady=10)
+        # One notebook page per topic rather than one scroll of everything.
+        # The guide covers three different kinds of thing -- what to enter and
+        # why, what the standards say, and how to work a job -- and a reader
+        # who wants one of them should not have to scroll past the other two.
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=12, pady=(10, 6))
 
         _f0, _fs = _FONT_UI[0], _FONT_UI[1]
-        txt = tk.Text(outer, bg=_BG, fg=_LABEL_FG, font=_FONT_UI,
-                      relief="flat", wrap="word", cursor="arrow",
-                      state="normal", padx=6, pady=4)
-        sb = ttk.Scrollbar(outer, command=txt.yview)
-        txt["yscrollcommand"] = sb.set
-        sb.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
-
-        txt.tag_config("h1",   font=(_f0, _fs, "bold"), foreground=_BTN_RUN,
-                       spacing1=10, spacing3=2)
-        txt.tag_config("rule", font=(_f0, 8),  foreground="#cccccc")
-        txt.tag_config("h2",   font=(_f0, _fs, "bold"), foreground="#333333",
-                       spacing1=8, spacing3=1, lmargin1=12, lmargin2=12)
-        txt.tag_config("body", font=_FONT_UI,  foreground="#555555",
-                       lmargin1=24, lmargin2=24, spacing3=2)
-        txt.tag_config("link", font=(_f0, _fs-1), foreground=_BTN_RUN, underline=True)
-        txt.tag_config("note", font=(_f0, _fs-1), foreground="#999999",
-                       lmargin1=24, lmargin2=24)
-
         _link_map = {}
+        _current = {}
+
+        class _CurrentText:
+            """Writes to whichever page is being built."""
+            def __getattr__(self, name):
+                return getattr(_current["page"], name)
+
+        txt = _CurrentText()
+
+        def page(tab_title):
+            """A scrollable pane, added as a tab, and returned to be selected."""
+            frame = tk.Frame(nb, bg=_BG)
+            nb.add(frame, text=f"  {tab_title}  ")
+            t = tk.Text(frame, bg=_BG, fg=_LABEL_FG, font=_FONT_UI,
+                        relief="flat", wrap="word", cursor="arrow",
+                        state="normal", padx=10, pady=8)
+            sb = ttk.Scrollbar(frame, command=t.yview)
+            t["yscrollcommand"] = sb.set
+            sb.pack(side="right", fill="y")
+            t.pack(side="left", fill="both", expand=True)
+
+            t.tag_config("h1",   font=(_f0, _fs, "bold"), foreground=_BTN_RUN,
+                         spacing1=10, spacing3=2)
+            t.tag_config("rule", font=(_f0, 8),  foreground="#cccccc")
+            t.tag_config("h2",   font=(_f0, _fs, "bold"), foreground="#333333",
+                         spacing1=8, spacing3=1, lmargin1=12, lmargin2=12)
+            t.tag_config("body", font=_FONT_UI,  foreground="#555555",
+                         lmargin1=24, lmargin2=24, spacing3=2)
+            t.tag_config("lead", font=_FONT_UI, foreground="#444444",
+                         lmargin1=12, lmargin2=12, spacing3=3)
+            t.tag_config("link", font=(_f0, _fs-1), foreground=_BTN_RUN,
+                         underline=True)
+            t.tag_config("note", font=(_f0, _fs-1), foreground="#999999",
+                         lmargin1=24, lmargin2=24)
+            return t
+
+        def use(t):
+            _current["page"] = t
+
+        def lead(body):
+            """An orienting paragraph under a page's title, before the entries."""
+            for line in body.splitlines():
+                txt.insert("end", f"  {line}\n", "lead")
+            txt.insert("end", "\n")
 
         def _add_link(label, url):
             tag = f"_lnk{len(_link_map)}"
             _link_map[tag] = url
-            txt.insert("end", label, ("link", tag))
-            txt.tag_bind(tag, "<Enter>",    lambda e: txt.config(cursor="hand2"))
-            txt.tag_bind(tag, "<Leave>",    lambda e: txt.config(cursor="arrow"))
-            txt.tag_bind(tag, "<Button-1>", lambda e, u=url: webbrowser.open(u))
+            target = _current["page"]
+            target.insert("end", label, ("link", tag))
+            target.tag_bind(tag, "<Enter>",
+                            lambda e, w=target: w.config(cursor="hand2"))
+            target.tag_bind(tag, "<Leave>",
+                            lambda e, w=target: w.config(cursor="arrow"))
+            target.tag_bind(tag, "<Button-1>", lambda e, u=url: webbrowser.open(u))
 
         def section(title):
             txt.insert("end", f"\n{title}\n", "h1")
@@ -1724,8 +1853,105 @@ class PQApp(tk.Tk):
                 txt.insert("end", f"  {line}\n", "body")
             txt.insert("end", "\n")
 
+        # Pages are created here in the order the tabs should appear; the
+        # content below is emitted in whatever order it already sat in, by
+        # switching pages with use(). Tab order and file order are separate.
+        pg_start     = page("Start here")
+        pg_standard  = page("Which standard")
+        pg_tariff    = page("PSCo tariff")
+        pg_refs      = page("Standards")
+        pg_workflow  = page("Investigating a job")
+        pg_concepts  = page("Concepts")
+        pg_neutral   = page("Neutral integrity")
+        pg_methods   = page("Methods")
+
+        # ── Start here ─────────────────────────────────────────────────────
+        use(pg_start)
+        section("Start here")
+        lead(
+            "This tool measures a recording and grades it against whichever\n"
+            "standard governs the service. Most of that is automatic. Three\n"
+            "things are not, because nothing in a .pqd file carries them, and\n"
+            "getting any of the three wrong changes the answer rather than\n"
+            "just the wording."
+        )
+
+        concept(
+            "1. What is physically behind the meter",
+            "Set Power flow to match the site, not the customer's rate schedule:\n"
+            "\n"
+            "    Load only                consumes only\n"
+            "    Load + generation        an array or battery in parallel\n"
+            "    Generation only          a producer's plant, no load to speak of\n"
+            "\n"
+            "This decides whether a negative fundamental means the CTs are on\n"
+            "backwards or the site is exporting — opposite conclusions from the\n"
+            "same measurement.  See \"Which standard\" for which schedules mean\n"
+            "there is hardware on site; several solar schedules do not.",
+        )
+
+        concept(
+            "2. Rated generation and average load demand",
+            "Needed on any site with generation.  IEEE 519-2022 Figure 1 compares\n"
+            "them to decide whether 519 governs the service at all or whether\n"
+            "IEEE 1547 does, and the two standards differ by three times in the\n"
+            "aggregate current limit.\n"
+            "\n"
+            "Both come from records: a nameplate and a year of billing.  Left\n"
+            "blank, the report says the standard is undetermined rather than\n"
+            "guessing — which is honest, but it is not an answer you can send.",
+        )
+
+        concept(
+            "3. IL from billing",
+            "IEEE 519 defines IL as the twelve previous months' 15- or 30-minute\n"
+            "maximum demands, averaged.  That is a billing quantity; no week-long\n"
+            "recording can produce it.\n"
+            "\n"
+            "Leave it blank and the tool substitutes the largest fundamental in\n"
+            "the recording and says so on the page.  That is fine for a look, but\n"
+            "IL is a denominator: a slow week shrinks it and inflates every\n"
+            "percentage measured against it.  Before telling a customer they are\n"
+            "outside a limit, get the twelve-month figure.",
+        )
+
+        concept(
+            "What the tool will not guess",
+            "A recurring principle rather than a list of quirks.  Where a quantity\n"
+            "is knowable only from records or from the field, the tool asks for it\n"
+            "and states what it did without it:\n"
+            "\n"
+            "  · the primary line-to-line nominal on a primary-metered service\n"
+            "  · which way power flows at the meter\n"
+            "  · the plant rating and the annual average load demand\n"
+            "  · IL from billing\n"
+            "  · the conductor and run length for an expected-impedance check\n"
+            "\n"
+            "Anything derived from a substitute is labelled as such in the report.\n"
+            "If a number looks surprising, read the sentence next to it first —\n"
+            "it usually says which input it was resting on.",
+        )
+
+        concept(
+            "Where to go next",
+            "  Which standard        519 or 1547, and which schedules mean\n"
+            "                        generation is actually on site\n"
+            "  PSCo tariff           the PF and phase clauses, and what they\n"
+            "                        actually say (this catches people out)\n"
+            "  Standards             the reference shelf, with links\n"
+            "  Investigating a job   what to check first, by customer class\n"
+            "  Concepts              the ideas the checks are built on\n"
+            "  Neutral integrity     split-phase open-neutral theory and tests\n"
+            "  Methods               how each individual check is computed",
+        )
+
         # ── IEEE Standards ─────────────────────────────────────────────────
+        use(pg_refs)
         section("IEEE / ANSI Standards")
+        lead(
+            "The reference shelf. What each standard covers and where to read it;\n"
+            "the limits and tables the tool applies are on the other pages."
+        )
 
         std(
             "IEEE 519-2022 — Harmonic Control in Electric Power Systems",
@@ -1800,71 +2026,244 @@ class PQApp(tk.Tk):
         txt.insert("end", "\n\n")
 
         # ── PSCo Tariff Reference ──────────────────────────────────────────
+        # ── Which harmonic standard applies ────────────────────────────────
+        use(pg_standard)
+        section("Which Harmonic Standard Applies — 519 or 1547")
+        lead(
+            "Two questions, in order. Is there generation physically behind this\n"
+            "meter? And if so, is it big enough relative to the load that IEEE 519\n"
+            "hands the site to IEEE 1547? The second question is the one people\n"
+            "miss, and the schedules make the first one harder than it looks."
+        )
+
+        concept(
+            "519 does not cover every service",
+            "IEEE 519-2022 limits its own scope, in Clause 5.2, to \"a user's PCC\n"
+            "primarily with harmonic producing loads\", and directs installations that\n"
+            "are primarily inverter-based to another standard.  A site with solar or\n"
+            "storage may therefore not be a 519 site at all, and grading it against\n"
+            "Table 2 would quote a limit three times looser than the one that governs.\n"
+            "\n"
+            "Figure 1 of 519-2022 is the decision tree, and this tool follows it:\n"
+            "\n"
+            "    Does the installation have a DER or IBR?\n"
+            "      No  ─────────────────────────────► IEEE 519 limits at the PCC\n"
+            "      Yes ─► Is combined site rated generation\n"
+            "             < 10% of annual average load demand?\n"
+            "               Yes ─────────────────────► IEEE 519 limits at the PCC\n"
+            "               No  ─────────────────────► IEEE 1547 (or 2800)\n"
+            "\n"
+            "Both quantities in that test come from records, not from the recording:\n"
+            "a nameplate and a year of billing.  Enter them in the Power flow row.\n"
+            "Without them the tool says the standard is undetermined rather than\n"
+            "guessing, because the two answers are not close together.",
+        )
+
+        concept(
+            "What changes when 1547 applies",
+            "1547 is not 519 with different numbers.  Three things differ:\n"
+            "\n"
+            "  Denominator   519 uses IL, the maximum demand load current.  1547 uses\n"
+            "                I_rated, the DER unit's rated current capacity — a\n"
+            "                nameplate, transformed to the reference point of\n"
+            "                applicability if a transformer sits between.  Nothing in a\n"
+            "                recording establishes it.\n"
+            "\n"
+            "  Limits        519's limits scale with ISC/IL: a stiff service earns a\n"
+            "                load more headroom.  1547's are fixed.  A strong system\n"
+            "                buys a plant nothing.\n"
+            "\n"
+            "  The metric    519 grades TDD, which specifically excludes interharmonics.\n"
+            "                1547 grades TRD, which includes them.  They are different\n"
+            "                measurements even where the denominators agree.\n"
+            "\n"
+            "                TRD = √(I_rms² − I₁²) ÷ I_rated × 100%   (1547 Eq. 2)\n"
+            "\n"
+            "IEEE 1547-2018 Clause 7.3, Table 26 — odd orders, % of I_rated:\n"
+            "\n"
+            "    h < 11    11 ≤ h < 17   17 ≤ h < 23   23 ≤ h < 35   35 ≤ h < 50   TRD\n"
+            "     4.0%        2.0%          1.5%          0.6%          0.3%       5.0%\n"
+            "\n"
+            "Table 27 — even orders:  h=2 → 1.0%   h=4 → 2.0%   h=6 → 3.0%\n"
+            "                         8 ≤ h < 50 → the odd range above\n"
+            "\n"
+            "Note the even limits are *looser* than 519's blanket 25%-of-odd rule.\n"
+            "1547's rationale is that the 25% figure was researched and not found to\n"
+            "be supported for a DER, though the 2nd harmonic was not relaxed.",
+        )
+
+        concept(
+            "Two caveats that travel with every 1547 number",
+            "Both are printed in the report, and neither is a formality:\n"
+            "\n"
+            "  Background exclusion   1547 sets its limits \"exclusive of any harmonic\n"
+            "                         currents due to harmonic voltage distortion\n"
+            "                         present in the Area EPS without the DER\n"
+            "                         connected\".  Strictly, that needs a measurement\n"
+            "                         taken with the plant offline.  A single site\n"
+            "                         visit does not have one, so the figures include\n"
+            "                         whatever the background drives through the\n"
+            "                         inverters — conservative against the plant.\n"
+            "\n"
+            "  Interharmonics         TRD includes them; our meters report integer\n"
+            "                         orders only.  The true TRD is therefore at least\n"
+            "                         what we print, so a narrow pass is not clearance.",
+        )
+
+        concept(
+            "IL is a billing quantity, not a measurement",
+            "This one catches everyone.  519-2022 defines maximum demand load current\n"
+            "as:\n"
+            "\n"
+            "    the sum of the rms currents corresponding to the 15 min or 30 min\n"
+            "    maximum demand during each of the twelve previous months divided\n"
+            "    by 12\n"
+            "\n"
+            "That is a year of billing history.  No week-long recording can produce it.\n"
+            "If you leave the IL field blank, this tool substitutes the largest\n"
+            "fundamental current in the recording and says so on the page — but that\n"
+            "is a stand-in, and it moves with the weather, the season and the shift\n"
+            "pattern that happened to run while the meter was on.\n"
+            "\n"
+            "It matters because IL is a denominator.  A recording taken in a slow week\n"
+            "gives a small IL, which inflates every percentage measured against it and\n"
+            "can manufacture a violation that a year of data would not support.  If\n"
+            "you are about to tell a customer they are outside IEEE 519, get the\n"
+            "twelve-month figure from billing first.",
+        )
+
+        concept(
+            "Which schedules mean generation is present",
+            "PSCo has seven renewable schedules and only some put hardware behind the\n"
+            "meter.  The Figure 1 test is about what is physically there, not what the\n"
+            "customer is billed under:\n"
+            "\n"
+            "    Generation on site        No generation on site\n"
+            "    ─────────────────────     ──────────────────────────────────────\n"
+            "    NM    net metering        OS-NM   array on other property\n"
+            "    PV    rooftop/on-site     RC/RCF  Renewable*Connect subscription\n"
+            "    RE    recycled energy     SRCS    Solar*Rewards Community share\n"
+            "    AVPP  aggregated DERs\n"
+            "\n"
+            "The right column bills like solar and measures like an ordinary load, so\n"
+            "\"the customer is net metered\" is not enough to go on — ask what is on\n"
+            "site.  Two easy mistakes:\n"
+            "\n"
+            "  · RE is waste-heat generation, not solar, and it is real parallel\n"
+            "    generation.  AVPP is batteries, which export on dispatch rather than\n"
+            "    on sunlight, so there is no quiet period to reason from.\n"
+            "  · Schedule SRCS names the *subscribers* who buy a community array's\n"
+            "    output.  The array itself is the \"SRCS Producer\" and takes service\n"
+            "    separately, on the Company's own production meter.  If you are\n"
+            "    metering the field, you are not metering an SRCS customer.",
+        )
+
+        std(
+            "IEEE 1547-2018 — Interconnection and Interoperability of DER",
+            "Governs current distortion for inverter-based installations, which\n"
+            "519-2022 Figure 1 hands over whenever site rated generation reaches 10%\n"
+            "of annual average load demand.  Clause 7.3 and Tables 26–27 carry the\n"
+            "limits; Clause 7.4 covers overvoltage contribution.",
+            "https://ieeexplore.ieee.org/search/searchresult.jsp"
+            "?newsearch=true&queryText=IEEE+1547-2018",
+        )
+
+        use(pg_tariff)
         section("PSCo Electric Tariff — PQ Requirements")
-
-        concept(
-            "Schedule R — Residential",
-            "No power factor clause.  Residential customers are not contractually required\n"
-            "to maintain any particular power factor.  Values in the 0.85–0.95 range are\n"
-            "typical and expected.  No IEEE 519 harmonic clause exists in the tariff;\n"
-            "harmonic enforcement for all classes is via the PSCo Blue Book and IEEE 519.",
+        lead(
+            "The tariff clauses are scoped by which section of the Rules and\n"
+            "Regulations they sit in, not by rate schedule. That is the opposite\n"
+            "of how they are usually quoted, including by earlier versions of this\n"
+            "tool, so the wording below is taken from the filed tariff."
         )
 
         concept(
-            "Schedule C — Small Commercial  (< 50 kW demand)",
-            "Power Factor: PSCo Electric Tariff Sheet R73 requires the customer to maintain\n"
-            "power factor of not less than 90% lagging (0.90).  The Company reserves the\n"
-            "right to install metering and bill a reactive demand charge, or to discontinue\n"
-            "service, if the customer does not comply.\n"
+            "The PF clauses are scoped by rules section, not by schedule",
+            "This is easy to get backwards, and the tool had it backwards until it was\n"
+            "checked against the filed tariff.  The Rules and Regulations are divided\n"
+            "into GENERAL, RESIDENTIAL and COMMERCIAL AND INDUSTRIAL parts, and the two\n"
+            "power factor clauses live in different ones:\n"
             "\n"
-            "Harmonics: No specific harmonic clause in the tariff.  Enforcement is through\n"
-            "the PSCo Blue Book standard, which references IEEE 519-2022.",
+            "  Sheet R73   Rules and Regulations — GENERAL, \"Customer's Installation\"\n"
+            "              \"Company's rates contemplate Customer's use of service at a\n"
+            "              Power Factor, at the point where service is metered, of not\n"
+            "              less than ninety percent (90%) lagging... Company reserves\n"
+            "              the right to discontinue service to any Customer not\n"
+            "              complying herewith.\"\n"
+            "              → General section, so it reaches EVERY class, residential\n"
+            "                included.  It also requires PF correction on inherently\n"
+            "                low-PF equipment (neon, fluorescent and the like).\n"
+            "\n"
+            "  Sheet R121  Rules and Regulations — COMMERCIAL AND INDUSTRIAL\n"
+            "              \"Customer, at all times, will maintain at Company's Point of\n"
+            "              Delivery a Power Factor as near unity as practicable.\"\n"
+            "              → All of C, SG and PG, not PG alone.  Where correction\n"
+            "                equipment is fitted, the customer must also install a\n"
+            "                relay or switch to control it and prevent excessive\n"
+            "                voltage variation on the Company's lines.\n"
+            "\n"
+            "So a C&I customer is under both at once, and a residential customer is\n"
+            "under R73.  The Residential rules section contains no power factor clause\n"
+            "of its own — which is not the same as residential being exempt.  What is\n"
+            "true is that no reactive billing applies there, so the tool does not raise\n"
+            "power factor as a finding on Schedule R.",
         )
 
         concept(
-            "Schedule SG — C&I Secondary  (≥ 50 kW demand)",
-            "Power Factor: Same as Schedule C — Sheet R73 requires PF ≥ 0.90 lagging.\n"
-            "The Company reserves the right to discontinue service to any customer not\n"
-            "complying herewith.  Reactive demand charges may also be assessed.\n"
+            "The 15% phase clause is a billing provision, not a limit",
+            "Sheet R123, Commercial and Industrial, under \"Billing Demands will be\n"
+            "determined as set forth in the applicable rate schedule, subject to the\n"
+            "following provisions\":\n"
             "\n"
-            "Phase Balance: Sheet R121 requires that load in any one phase shall not exceed\n"
-            "the load in any other phase by more than 15% for three-phase services.\n"
+            "    If three-phase service is provided and Customer's equipment is so\n"
+            "    connected that at the Point of Delivery the load on any one (1) phase\n"
+            "    exceeds the load on any other phase by more than fifteen percent\n"
+            "    (15%), the Company MAY TAKE AS THE BILLING DEMAND the three-phase\n"
+            "    equivalent of the maximum kilovolt-amperes in any phase adjusted to a\n"
+            "    ninety percent (90%) Power Factor.\n"
             "\n"
-            "Harmonics: No specific harmonic clause in the tariff.  Enforcement is through\n"
-            "the PSCo Blue Book standard, which references IEEE 519-2022.",
+            "Read it carefully: nothing there forbids imbalance.  It says what the\n"
+            "Company may charge for if imbalance exceeds 15%.  Telling a customer they\n"
+            "are \"outside Sheet R121's 15% limit\" is wrong twice over — wrong sheet,\n"
+            "and wrong about what the clause does.  The defensible sentence is that\n"
+            "above 15% their billing demand may be computed from the worst phase.\n"
+            "\n"
+            "The 10% figure the tool flags against is the PSCo Blue Book and NEMA MG1\n"
+            "guidance for equipment health, which is a separate matter from billing.",
         )
 
         concept(
-            "Schedule PG — C&I Primary",
-            "Power Factor: Sheet R121 requires Primary service customers to maintain power\n"
-            "factor as near unity as practicable.  There is no explicit numeric threshold\n"
-            "stated, but 0.90 lagging is the practical enforcement floor consistent with\n"
-            "Sheet R73 for secondary customers.\n"
-            "\n"
-            "Phase Balance: Sheet R121 requires that load in any one phase shall not exceed\n"
-            "the load in any other phase by more than 15% for three-phase services.\n"
-            "\n"
-            "Harmonics: No specific harmonic clause in the tariff.  Enforcement is through\n"
-            "the PSCo Blue Book standard, which references IEEE 519-2022.",
+            "Harmonics are not in the tariff at all",
+            "No PSCo schedule carries a harmonic clause.  Enforcement runs through the\n"
+            "PSCo Blue Book, which references IEEE 519 — or, for an installation with\n"
+            "generation, IEEE 1547 by way of 519-2022 Figure 1.  See the section above.",
         )
 
         concept(
             "Tariff Sheet Reference Summary",
-            "  Sheet R73  — Power factor clause for Secondary customers (Schedules C, SG)\n"
-            "               Minimum 0.90 lagging; right to discontinue service.\n"
+            "  Sheet R73   PF ≥ 0.90 lagging at the metering point.  GENERAL rules, so\n"
+            "              all classes.  Right to discontinue service for non-compliance.\n"
             "\n"
-            "  Sheet R121 — Requirements for Primary service (Schedule PG)\n"
-            "               PF near unity; phase imbalance ≤ 15% between phases.\n"
+            "  Sheet R121  PF as near unity as practicable at the point of delivery.\n"
+            "              COMMERCIAL AND INDUSTRIAL rules, so C, SG and PG.\n"
             "\n"
-            "  Harmonics  — No tariff clause; governed by PSCo Blue Book → IEEE 519-2022.\n"
+            "  Sheet R123  Billing demand provisions, including the 15% phase clause.\n"
+            "              A billing remedy, not a limit on the customer.\n"
             "\n"
-            "Note: Sheet numbers reference the PSCo Electric Service Rules and Regulations\n"
-            "(Tariff) as filed with the Colorado PUC.  Sheet numbering may change with\n"
-            "tariff revisions — verify against the current filed tariff when citing.",
+            "  Harmonics   No tariff clause; Blue Book → IEEE 519-2022 / IEEE 1547-2018.\n"
+            "\n"
+            "Verified against the filed tariff (COLO. PUC No. 8 Electric) on 2026-08-13.\n"
+            "Sheet numbering moves with tariff revisions — re-check before citing a\n"
+            "sheet number to a customer.",
         )
 
         # ── Investigation Guidance by Customer Class ───────────────────────
+        use(pg_workflow)
         section("Investigation Guidance by Customer Class")
+        lead(
+            "What to look at first when a job lands, by who the customer is. This\n"
+            "is procedure, not limits -- the numbers live on the other pages."
+        )
 
         concept(
             "Schedule R — Residential",
@@ -1933,7 +2332,9 @@ class PQApp(tk.Tk):
             "     Plot against ITIC to show whether their other equipment should be\n"
             "     immune to their own starts.\n"
             "  4. Current imbalance — unbalanced single-phase loads spread across a\n"
-            "     3-phase panel.  Cite Sheet R121 (≤ 15%).  Over 10% warrants action.\n"
+            "     3-phase panel.  Over 10% warrants action (Blue Book / NEMA MG1).  Above\n"
+"     15%, Sheet R123 lets billing demand be taken from the worst phase —\n"
+"     that is a charge, not a breach.\n"
             "  5. Power factor — large motor loads.  Cite Sheet R73.  Note that\n"
             "     adding capacitor banks for PF correction can create harmonic resonance\n"
             "     — check for amplified harmonic orders after correction is installed.\n"
@@ -1953,7 +2354,8 @@ class PQApp(tk.Tk):
             "at primary metering, they own it definitively.\n"
             "\n"
             "Most likely causes and what to check first:\n"
-            "  1. Power factor — cite Sheet R121.  Large lagging PF is visible on the\n"
+            "  1. Power factor — cite Sheet R121 (near unity, all C&I) and Sheet R73\n"
+"     (0.90 lagging, all classes).  Large lagging PF is visible on the\n"
             "     feeder and depresses voltage for neighboring customers.  Common cause:\n"
             "     bulk capacitor banks undersized or switched off-peak.\n"
             "  2. Flicker (Pst/Plt) — arc furnaces and welders cause flicker that\n"
@@ -1964,7 +2366,8 @@ class PQApp(tk.Tk):
             "     voltage can amplify specific harmonic orders dramatically.  An H7 or\n"
             "     H11 spike that is disproportionate to the load signature is the tell.\n"
             "  4. Current imbalance — large 3-phase industrial with unbalanced\n"
-            "     single-phase loads.  Cite Sheet R121 (≤ 15% between phases).\n"
+            "     single-phase loads.  Above 15% Sheet R123 allows billing demand from\n"
+"     the worst phase; the 10% action threshold is Blue Book / NEMA MG1.\n"
             "  5. Demand profile — spikes in peak demand that pull your feeder voltage\n"
             "     down affect all other customers.  Use as context for any voltage\n"
             "     complaint investigations on the same feeder.\n"
@@ -1976,7 +2379,12 @@ class PQApp(tk.Tk):
         )
 
         # ── Key Concepts ───────────────────────────────────────────────────
+        use(pg_concepts)
         section("Key Concepts")
+        lead(
+            "How each check works and why it is built the way it is. Read this when\n"
+            "a result is surprising and you want to know what produced it."
+        )
 
         concept(
             "THD vs TDD",
@@ -2066,7 +2474,13 @@ class PQApp(tk.Tk):
         # service where the correct interpretation flips depending on the
         # secondary configuration, and where the same measurement can mean
         # "healthy" or "failing" depending on which service you are looking at.
+        use(pg_neutral)
         section("Neutral Integrity — Theory and Diagnostics")
+        lead(
+            "Split-phase only, and the one failure mode that damages equipment\n"
+            "rather than merely annoying people. The theory first, then what the\n"
+            "tool measures and what each reading rules in or out."
+        )
 
         concept(
             "1. What the neutral actually carries",
@@ -2263,7 +2677,12 @@ class PQApp(tk.Tk):
             "    limit for \"neutral health\"; the thresholds are practical ones.",
         )
 
+        use(pg_methods)
         section("Analysis Methods & Diagnostics")
+        lead(
+            "How individual checks are computed, in the order the report presents\n"
+            "them. Useful when you need to defend a number or explain one."
+        )
 
         concept(
             "Voltage Compliance — ANSI C84.1",
@@ -2451,8 +2870,9 @@ class PQApp(tk.Tk):
             "Current imbalance uses the PSCo procedure:\n"
             "  Iu = max |Iphase − Iavg| / Iavg × 100  (%)\n"
             "\n"
-            "PSCo Blue Book limit: 10%.  Tariff Sheet R121 requires three-phase loads\n"
-            "to remain within 15% phase-to-phase.  Both thresholds are evaluated.",
+            "PSCo Blue Book limit: 10%.  Tariff Sheet R123 does not limit imbalance: above\n"
+            "15% phase-to-phase it allows the Company to take billing demand from the\n"
+            "worst phase.  Both thresholds are evaluated, but only the first is a limit.",
         )
 
         concept(
@@ -2500,7 +2920,9 @@ class PQApp(tk.Tk):
             "references that specific load type and its recommended mitigation.",
         )
 
-        txt.config(state="disabled")
+        for _pg in (pg_start, pg_standard, pg_tariff, pg_refs, pg_workflow,
+                    pg_concepts, pg_neutral, pg_methods):
+            _pg.config(state="disabled")
 
         tk.Button(win, text="Close", command=win.destroy,
                   font=_FONT_UI, relief="flat", padx=20, pady=6,

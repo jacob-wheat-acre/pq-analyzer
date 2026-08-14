@@ -31,10 +31,14 @@ from pq_constants import (
     SIGNATURE_FAMILY_SEPARATION,
     SIGNATURE_MEMBER_SEPARATION,
     Thresholds,
+    _DER_SHARE_FOR_1547,
     _H519_ORDERS,
+    _H1547_ORDERS,
     _LOAD_SIGNATURES,
     _SERVICE_TYPE_LABEL,
+    _TRD_LIMIT,
     _h519_limit,
+    _h1547_limit,
     _impedance_range,
     expected_service_impedance,
     _itic_lower_v,
@@ -214,6 +218,130 @@ def service_geometry(thresh: Thresholds, columns) -> str:
 def accumulates_triplens(geometry: str) -> bool:
     """True where triplen harmonics add in the neutral rather than subtract."""
     return geometry in ("two-leg-208", "three-phase")
+
+
+def exports_power(thresh: Thresholds) -> bool:
+    """True where the meter can see power flowing out of the premises."""
+    return getattr(thresh, "service_role", "load") in ("mixed", "generation")
+
+
+def is_generation_only(thresh: Thresholds) -> bool:
+    """True at a plant with no load worth the name -- a producer's array."""
+    return getattr(thresh, "service_role", "load") == "generation"
+
+
+def applicable_current_standard(thresh: Thresholds) -> dict:
+    """Which harmonic current standard governs this installation, per Figure 1.
+
+    IEEE 519-2022 does not claim every service.  Clause 5.2 limits its own
+    scope to "a user's PCC primarily with harmonic producing loads" and directs
+    installations that are primarily inverter-based elsewhere; Figure 1 is the
+    decision tree for the case in between:
+
+        DER or IBR present?
+          no  -> 519
+          yes -> combined site rated generation < 10% of annual average
+                 load demand?
+                   yes -> 519
+                   no  -> "a standard with an applicable scope such as
+                           IEEE Std 1547 or IEEE Std 2800"
+
+    Both quantities in that test are records quantities -- a nameplate and a
+    year of billing -- so neither can be recovered from a recording, and the
+    tree cannot be walked without them.  Rather than guess, an installation
+    that declares generation but supplies neither is reported as undetermined
+    and graded against 519 with that stated: the two standards differ by three
+    times in the aggregate limit, which is not a difference to paper over.
+    """
+    out = {
+        "standard":     "519",
+        "branch":       "no_der",
+        "der_share":    None,
+        "determined":   True,
+        "rated_ac_kw":  thresh.rated_ac_kw,
+        "annual_avg_load_kw": thresh.annual_avg_load_kw,
+    }
+    if not exports_power(thresh):
+        out["reason"] = ("The installation has no distributed energy resource, "
+                         "so IEEE 519-2022 applies at the PCC.")
+        return out
+
+    rated = thresh.rated_ac_kw
+    load  = thresh.annual_avg_load_kw
+    if not rated or not load or load <= 0:
+        missing = []
+        if not rated:
+            missing.append("the combined site rated generation")
+        if not load or load <= 0:
+            missing.append("the annual average load demand")
+        out.update({
+            "branch":     "undetermined",
+            "determined": False,
+            "reason": (
+                "This installation has generation, so IEEE 519-2022 Figure 1 "
+                "decides whether its limits apply here or whether IEEE 1547's "
+                "do. That test compares the combined site rated generation "
+                f"against the annual average load demand, and {' and '.join(missing)} "
+                f"{'were' if len(missing) > 1 else 'was'} not supplied. "
+                "The 519 limits are applied below, but they "
+                "may not be the applicable ones: where generation reaches a "
+                "tenth of average load demand the governing aggregate limit "
+                "becomes 5.0% of the plant's rated current rather than a class "
+                "limit read from ISC/IL."
+            ),
+        })
+        return out
+
+    share = rated / load
+    out["der_share"] = share
+    if share < _DER_SHARE_FOR_1547:
+        out.update({
+            "branch": "der_below_threshold",
+            "reason": (
+                f"The combined site rated generation ({rated:,.0f} kW) is "
+                f"{share * 100:.1f}% of the annual average load demand "
+                f"({load:,.0f} kW), below the 10% at which IEEE 519-2022 "
+                "Figure 1 hands the installation to another standard, so the "
+                "519 limits apply at the PCC."
+            ),
+        })
+        return out
+
+    out.update({
+        "standard": "1547",
+        "branch":   "der_at_or_above_threshold",
+        "reason": (
+            f"The combined site rated generation ({rated:,.0f} kW) is "
+            f"{share * 100:.1f}% of the annual average load demand "
+            f"({load:,.0f} kW). IEEE 519-2022 Figure 1 directs an installation "
+            "at or above 10% to a standard with an applicable scope, so the "
+            "current distortion limits below are IEEE 1547-2018 Clause 7.3 "
+            "and are stated as a percentage of the plant's rated current, not "
+            "of a maximum demand load current."
+        ),
+    })
+    return out
+
+
+def rated_output_amps(thresh: Thresholds, geometry: str) -> Optional[float]:
+    """The plant's rated AC output as a current, or None if no rating was given.
+
+    Inverters are rated in kW AC at unity power factor, so the current follows
+    from the service geometry alone.  `nominal_voltage` is line-to-neutral
+    throughout this module, which is why the three-phase divisor is 3·V_LN
+    (that is sqrt(3)·V_LL) rather than sqrt(3)·V_LN.
+    """
+    kw = getattr(thresh, "rated_ac_kw", None)
+    v_ln = thresh.nominal_voltage
+    if not kw or kw <= 0 or not v_ln or v_ln <= 0:
+        return None
+    divisor = {
+        "three-phase": 3.0 * v_ln,      # sqrt(3) x V_LL, and V_LL = sqrt(3) x V_LN
+        "two-leg-208": np.sqrt(3.0) * v_ln,
+        "split-phase": 2.0 * v_ln,      # rated across the 240 V leg pair
+    }.get(geometry, v_ln)
+    amps = kw * 1000.0 / divisor
+    return amps if amps > 0 else None
 
 
 #: Service classes that normally have the service transformer to themselves.
@@ -565,6 +693,89 @@ _MIN_LOADED_AMPS = 1.0
 _MIN_LOADED_INTERVALS = 20
 
 
+#: Below this share of the largest |P| seen, an interval is too near the
+#: crossover for its sign to say which way power was flowing. A service whose
+#: generation is currently matching its load sits there, and filing those
+#: intervals by the sign of a small residue would sort them by noise.
+_FLOW_DEADBAND_FRACTION = 0.02
+
+
+def primary_flow_direction(thresh: Thresholds) -> str:
+    """The population a harmonic characterisation should describe by default.
+
+    One answer used everywhere, so that the two direction methods and the
+    spectrum gate cannot end up describing different halves of the same
+    service and then be compared with each other.
+
+    On a mixed service that is the importing intervals: the load is the half
+    comparable with a service that does not generate, and the exporting half is
+    reported separately on its own terms. On a plant there is only one
+    population and it is the exporting one.
+    """
+    if is_generation_only(thresh):
+        return "exporting"
+    if exports_power(thresh):
+        return "importing"
+    return "all"
+
+
+def flow_scope(df: pd.DataFrame, thresh: Thresholds, direction: str
+               ) -> Tuple[Optional[pd.DataFrame], dict]:
+    """The frame restricted to intervals flowing one way, and how that went.
+
+    A service with generation behind it holds two populations that share a
+    meter, and almost every harmonic statistic silently pools them. Grading a
+    load's spectrum over intervals when its inverters were carrying the service
+    describes the inverter; comparing a method that saw one population against
+    a method that saw the other is not corroboration.
+
+    `direction` is "importing", "exporting", or "all". Intervals within a
+    deadband of zero are in neither: near the crossover the sign of real power
+    is a residue, not a direction.
+
+    Returns (frame or None, info). A None frame means the split could not be
+    made -- no real-power channel, or too few intervals on that side -- and the
+    caller should say so rather than quietly using everything.
+    """
+    info = {"direction": direction, "split": False, "intervals": len(df),
+            "reason": ""}
+    if direction == "all" or not exports_power(thresh):
+        info["reason"] = "No generation at this service; all intervals used."
+        return df, info
+
+    if "power_real" not in df.columns or df["power_real"].notna().sum() == 0:
+        info["reason"] = (
+            "This service has generation, so its importing and exporting "
+            "intervals describe different things, but the meter recorded no "
+            "real-power channel to tell them apart. Every interval is pooled "
+            "below, which mixes the two."
+        )
+        return df, info
+
+    p = df["power_real"]
+    scale = float(p.abs().max())
+    deadband = scale * _FLOW_DEADBAND_FRACTION
+    mask = (p > deadband) if direction == "importing" else (p < -deadband)
+    kept = int(mask.sum())
+    info.update({
+        "split": True,
+        "intervals": kept,
+        "deadband_w": round(deadband, 1),
+        "near_crossover": int((p.abs() <= deadband).sum()),
+    })
+    if kept < _MIN_LOADED_INTERVALS:
+        info["reason"] = (
+            f"Only {kept} interval(s) were {direction} by more than the "
+            f"crossover deadband, too few to characterise separately."
+        )
+        return None, info
+    info["reason"] = (
+        f"{kept} of {len(df)} intervals were {direction}; the rest are "
+        f"excluded here so the two directions are not pooled."
+    )
+    return df[mask], info
+
+
 def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """Whether the current harmonic spectrum carries usable shape information.
 
@@ -588,6 +799,18 @@ def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict
                  "loaded_intervals": 0, "dominant_order_amps": 0.0,
                  "resolution_steps": 0.0, "load_verified": bool(i_cols)}
 
+    # One direction of flow at a time. The floor below is a share of the peak,
+    # so pooling both directions on a generating service lets the export peak
+    # set a floor the load can never reach -- and the whole load half of the
+    # service then drops out as "light load" without anything saying so.
+    direction = primary_flow_direction(thresh)
+    scoped, flow_info = flow_scope(df, thresh, direction)
+    out["flow"] = flow_info
+    if scoped is None:
+        out["reason"] = flow_info["reason"]
+        return out
+    full_index, df = df.index, scoped
+
     # Restricting to loaded intervals is a refinement and needs an RMS current
     # channel. The resolution test below is the substantive one and stands on
     # its own, so a file without RMS current is still assessed rather than
@@ -597,7 +820,10 @@ def harmonic_spectrum_significance(df: pd.DataFrame, thresh: Thresholds) -> dict
         il_amps = float(demand.max())
         floor = max(_MIN_LOADED_AMPS, il_amps * 0.10)
         loaded = demand >= floor
-        out["loaded"] = loaded
+        # Callers index the original frame with this, so it goes back on the
+        # full index: intervals dropped by the direction split are False here,
+        # not missing.
+        out["loaded"] = loaded.reindex(full_index, fill_value=False)
         out["loaded_intervals"] = int(loaded.sum())
         out["load_floor_amps"] = round(floor, 3)
         out["il_amps"] = round(il_amps, 2)
@@ -839,6 +1065,98 @@ def fundamental_current(
     return np.sqrt(squared)
 
 
+def demand_current_il(
+    df: pd.DataFrame,
+    thresh: Optional[Thresholds] = None,
+) -> Tuple[Optional[float], Dict[str, pd.Series], Dict[str, pd.Series],
+           Dict[str, str]]:
+    """IL, and the per-phase harmonic and fundamental series behind it.
+
+    IEEE 519-2022 defines IL as the maximum demand current at the fundamental,
+    so it is derived per phase from the RMS and the harmonic RMS rather than
+    read straight off the RMS channel, which is larger by sqrt(1 + THD²).
+
+    Every check that normalises against IL has to use this same one.  Grading
+    TDD against a fundamental IL while the per-order table divides by an RMS IL
+    puts two different denominators in one report and invites exactly the
+    comparison a reader cannot make.
+
+    At a generation-only site there is no demand load to take IL from, so an
+    entered AC rating is used when there is one.  Without it IL falls back to
+    the largest export actually measured, which grades the plant against the
+    week it happened to have rather than against what it can do -- a cloudy
+    recording then shrinks the denominator and inflates every percentage taken
+    against it.  Which of the two was used is reported alongside the number.
+    """
+    i_cols = [c for c in ["current_a", "current_b", "current_c"] if c in df.columns]
+    harm_rms: Dict[str, pd.Series] = {}
+    harm_source: Dict[str, str] = {}
+    fundamental: Dict[str, pd.Series] = {}
+    for ph in (c[-1] for c in i_cols):
+        h, src = harmonic_current_rms(df, ph)
+        if h is not None:
+            harm_rms[ph], harm_source[ph] = h, src
+        f1 = fundamental_current(df, ph, h)
+        if f1 is not None and not f1.empty:
+            fundamental[ph] = f1
+
+    # Order of preference, strongest reference first. Billing IL is the only
+    # one that is the standard's own quantity rather than a stand-in for it.
+    if thresh is not None and thresh.il_amps_billing:
+        return float(thresh.il_amps_billing), harm_rms, fundamental, harm_source
+
+    rated = (rated_output_amps(thresh, service_geometry(thresh, df.columns))
+             if thresh is not None and is_generation_only(thresh) else None)
+    if rated:
+        return rated, harm_rms, fundamental, harm_source
+
+    if fundamental:
+        il_amps = float(max(f1.max() for f1 in fundamental.values()))
+    elif i_cols:
+        il_amps = float(df[i_cols].max(axis=1).max())
+    else:
+        return None, harm_rms, fundamental, harm_source
+    return ((il_amps if il_amps > 0 else None),
+            harm_rms, fundamental, harm_source)
+
+
+def tdd_by_phase(
+    df: pd.DataFrame,
+    il_amps: float,
+    harm_rms: Dict[str, pd.Series],
+    fundamental: Dict[str, pd.Series],
+) -> Dict[str, pd.Series]:
+    """Per-phase TDD(t) = 100 × Ih(t) / IL, in percent.
+
+    TDD divides by IL, a fixed number; THD divides by the fundamental at that
+    instant.  On a service whose output falls to nothing -- a solar site at
+    night -- the THD denominator approaches zero and the ratio runs away while
+    the harmonic amperes behind it stay trivial.  That is why the standard
+    grades current on TDD, and why a THD channel must never be handed to a TDD
+    limit unconverted.
+    """
+    out: Dict[str, pd.Series] = {}
+    if not il_amps or il_amps <= 0:
+        return out
+    for ph in ("a", "b", "c"):
+        h = harm_rms.get(ph)
+        if h is not None and not h.empty:
+            out[ph] = h * 100.0 / il_amps
+            continue
+        # No harmonic RMS for this phase: recover the harmonic amperes from the
+        # THD channel and the fundamental (Ih = THD% × I1 / 100) rather than
+        # dropping the phase, which would silently shrink the assessment.
+        col  = f"thd_current_{ph}"
+        base = fundamental.get(ph)
+        if col not in df.columns or base is None:
+            continue
+        aligned = pd.concat([df[col].rename("thd"), base.rename("i1")],
+                            axis=1, join="inner").dropna()
+        if not aligned.empty:
+            out[ph] = aligned["thd"] * aligned["i1"] / il_amps
+    return out
+
+
 def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """IEEE 519-2022 compliance: voltage THD and current TDD.
 
@@ -869,23 +1187,19 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     # fundamental frequency, so it is derived per phase from the RMS and the
     # harmonic RMS rather than read straight off the RMS channel.
     i_cols = [c for c in ["current_a", "current_b", "current_c"] if c in df.columns]
-    phases = [c[-1] for c in i_cols]
-    harm_rms: Dict[str, pd.Series] = {}
-    harm_source: Dict[str, str] = {}
-    fundamental: Dict[str, pd.Series] = {}
-    for ph in phases:
-        h, src = harmonic_current_rms(df, ph)
-        if h is not None:
-            harm_rms[ph], harm_source[ph] = h, src
-        f1 = fundamental_current(df, ph, h)
-        if f1 is not None and not f1.empty:
-            fundamental[ph] = f1
+    il_amps, harm_rms, fundamental, harm_source = demand_current_il(df, thresh)
 
-    il_amps: Optional[float] = None
-    if fundamental:
-        il_amps = float(max(f1.max() for f1 in fundamental.values()))
-    elif i_cols:
-        il_amps = float(df[i_cols].max(axis=1).max())
+    # Where IL came from. At a generation site the two answers differ by
+    # however cloudy the week was, so the page has to say which it used rather
+    # than printing a bare denominator.
+    if thresh.il_amps_billing:
+        il_basis = "billing"
+    elif is_generation_only(thresh):
+        il_basis = ("rated_output"
+                    if rated_output_amps(thresh, service_geometry(thresh, df.columns))
+                    else "measured_export")
+    else:
+        il_basis = "measured_demand"
 
     if il_amps and il_amps > 0:
         use_tdd = True
@@ -900,6 +1214,8 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "tdd_limit_pct": current_limit,
                 "isc_source":    thresh.isc_source,
                 "isc_provided":  True,
+                "il_basis":      il_basis,
+                "rated_ac_kw":   thresh.rated_ac_kw,
             }
             log.info(
                 "IEEE 519 TDD: ISC=%.0f A  IL=%.0f A  ISC/IL=%.1f  class %s  limit=%.1f%%",
@@ -919,6 +1235,8 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "tdd_limit_pct": current_limit,
                 "isc_source":    None,
                 "isc_provided":  False,
+                "il_basis":      il_basis,
+                "rated_ac_kw":   thresh.rated_ac_kw,
             }
             log.info(
                 "IEEE 519 TDD: ISC not provided — IL=%.0f A, most restrictive class "
@@ -1129,6 +1447,116 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
     }
 
 
+def check_trd(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """IEEE 1547-2018 Clause 7.3 current distortion, for a DER installation.
+
+        %TRD = sqrt(I_rms² − I₁²) / I_rated × 100
+
+    The numerator is the harmonic RMS current this module already derives; what
+    makes TRD a different measurement from TDD is the denominator and the
+    limits.  Irated is the plant's nameplate, so unlike IL it cannot be
+    approximated from the recording at all -- without it there is no assessment
+    to make, and the check declines rather than substituting a measured peak
+    and calling the result 1547.
+
+    Two caveats travel with every number here and are carried in the result so
+    the report cannot state one without them:
+
+      * 1547 sets these limits "exclusive of any harmonic currents due to
+        harmonic voltage distortion present in the Area EPS without the DER
+        connected".  Separating the plant's own injection from what the
+        background voltage drives through it needs a measurement taken with
+        the plant offline, which a single site visit does not have.
+      * TRD includes interharmonics.  A meter reporting only integer orders
+        understates it, so a pass close to the limit is not a comfortable one.
+    """
+    result: dict = {
+        "available": False, "orders": {}, "trd_pct": None,
+        "trd_limit_pct": _TRD_LIMIT, "overall_pass": True,
+        "irated_amps": None, "worst_order": None, "worst_margin": None,
+        "excludes_background": False, "interharmonics_measured": False,
+    }
+
+    geometry = service_geometry(thresh, df.columns)
+    irated = rated_output_amps(thresh, geometry)
+    if not irated:
+        result["note"] = (
+            "IEEE 1547 states its limits as a percentage of the plant's rated "
+            "current, which is a nameplate quantity: no recording establishes "
+            "it. Enter the combined site rated generation to assess against "
+            "1547."
+        )
+        return result
+
+    il_amps, harm_rms, fundamental, _src = demand_current_il(df, thresh)
+    if not harm_rms and not fundamental:
+        result["note"] = ("No current channels to measure harmonic distortion "
+                          "from.")
+        return result
+
+    result["irated_amps"] = round(irated, 1)
+    result["available"] = True
+
+    # Aggregate TRD, on the worst phase: the limit applies per phase, so an
+    # average across three would hide the one that fails.
+    trd_by_phase = {ph: (h * 100.0 / irated) for ph, h in harm_rms.items()}
+    if trd_by_phase:
+        worst_phase = max(trd_by_phase, key=lambda p: float(trd_by_phase[p].max()))
+        series = trd_by_phase[worst_phase].dropna()
+        result["trd_pct"]   = round(float(series.max()), 2)
+        result["trd_phase"] = worst_phase
+        result["trd_mean_pct"] = round(float(series.mean()), 2)
+        result["trd_pass"] = result["trd_pct"] <= _TRD_LIMIT
+        result["pct_exceeding"] = round(float((series > _TRD_LIMIT).mean() * 100), 2)
+        if not result["trd_pass"]:
+            result["overall_pass"] = False
+
+    # Per order, against Table 26 and Table 27.
+    worst_margin = 0.0
+    for h in _H1547_ORDERS:
+        limit = _h1547_limit(h)
+        if limit <= 0:
+            continue
+        pcts = []
+        for ph in ("a", "b", "c"):
+            col = f"h{h}_current_{ph}"
+            if col in df.columns:
+                s = df[col].dropna()
+                if not s.empty:
+                    pcts.append(float(s.max()) * 100.0 / irated)
+        if not pcts:
+            continue
+        worst = max(pcts)
+        passes = worst <= limit
+        result["orders"][h] = {
+            "max_pct_irated": round(worst, 3),
+            "limit_pct":      limit,
+            "pass":           passes,
+            "even":           h % 2 == 0,
+        }
+        if not passes:
+            result["overall_pass"] = False
+        ratio = worst / limit
+        if ratio > worst_margin:
+            worst_margin = ratio
+            result["worst_order"]  = h
+            result["worst_margin"] = round(ratio, 3)
+
+    result["excludes_background"] = False
+    result["interharmonics_measured"] = False
+    result["caveats"] = [
+        "IEEE 1547 excludes harmonic current caused by voltage distortion "
+        "already present without the plant connected. That background was not "
+        "measured with the plant offline, so the figures here include whatever "
+        "part of the distortion the system drives through the inverters and "
+        "are, to that extent, conservative against the plant.",
+        "TRD includes interharmonics. This meter reports integer harmonic "
+        "orders only, so the true TRD is at least the figure given and a "
+        "narrow pass should not be read as clearance.",
+    ]
+    return result
+
+
 def check_individual_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """
     IEEE 519-2022 Table 2 per-order harmonic check.
@@ -1143,8 +1571,8 @@ def check_individual_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
     if not i_cols:
         return result
 
-    il_amps = float(df[i_cols].max(axis=1).max())
-    if il_amps <= 0:
+    il_amps, _harm_rms, _fundamental, _harm_source = demand_current_il(df, thresh)
+    if not il_amps:
         return result
 
     if thresh.isc_amps is None:
@@ -1693,6 +2121,18 @@ def harmonic_direction_from_intervals(df: pd.DataFrame, thresh: Thresholds) -> d
     waveform capture covers, which is what makes it worth having alongside the
     phasor method even though it infers direction instead of measuring it.
     """
+    # The same population the capture method reads, so that the agreement
+    # between the two means something. Left unscoped, this method regressed
+    # over whichever intervals survived the light-load gate -- the exporting
+    # ones on a solar service -- while the captures were split to the importing
+    # ones, and the two were then reported as corroborating each other.
+    direction = primary_flow_direction(thresh)
+    scoped, flow_info = flow_scope(df, thresh, direction)
+    if scoped is None:
+        return {"available": False, "orders": {}, "overall": "not_assessed",
+                "flow": flow_info, "note": flow_info["reason"]}
+    df = scoped
+
     significance = harmonic_spectrum_significance(df, thresh)
     orders: Dict[int, dict] = {}
 
@@ -1742,7 +2182,7 @@ def harmonic_direction_from_intervals(df: pd.DataFrame, thresh: Thresholds) -> d
         }
 
     if not orders:
-        return {"available": False,
+        return {"available": False, "flow": flow_info,
                 "note": "No order has both a harmonic voltage and a harmonic "
                         "current channel with enough aligned intervals."}
 
@@ -1751,7 +2191,7 @@ def harmonic_direction_from_intervals(df: pd.DataFrame, thresh: Thresholds) -> d
             od["indication"] = "not_assessed"
         return {
             "available": True, "orders": orders, "overall": "not_assessed",
-            "significance": significance,
+            "significance": significance, "flow": flow_info,
             "note": ("Direction was not assessed: " + significance["reason"]
                      + " The regressions above are reported as measured data only."),
         }
@@ -1782,13 +2222,53 @@ def harmonic_direction_from_intervals(df: pd.DataFrame, thresh: Thresholds) -> d
         "overall":      _direction_consensus(
             [od["indication"] for od in orders.values()]),
         "significance": significance,
+        "flow":         flow_info,
         "note": (
             "Direction inferred from how the harmonic voltage at the meter "
-            "moves with the harmonic current drawn through it, over the whole "
-            "recording. It indicates where the distortion appears to originate, "
+            "moves with the harmonic current drawn through it, over "
+            + ("the whole recording. " if not flow_info["split"] else
+               f"the {flow_info['direction']} intervals of the recording "
+               f"({flow_info['intervals']} of {len(df)}), which is the same "
+               "population the capture method reads so the two are comparable. ")
+            + "It indicates where the distortion appears to originate, "
             "not responsibility for it."
         ),
     }
+
+
+def _direction_orders(samples: Dict[int, List[dict]], sign: float) -> Dict[int, dict]:
+    """Grade per-order harmonic power samples into an up/downstream indication.
+
+    `sign` flips the whole set for reversed CTs.  It is +1 wherever the CT
+    orientation is taken on faith rather than measured, because a harmonic
+    power sign already means "the way the CT arrow points"; the inversion
+    exists only to undo clamps installed backwards.
+    """
+    orders: Dict[int, dict] = {}
+    for h in _SOURCE_ORDERS:
+        group = samples.get(h) or []
+        if len(group) < _WAVE_MIN_SAMPLES:
+            continue
+        vals = [sign * s["p"] for s in group]
+        toward_customer = sum(1 for p in vals if p > 0)
+        toward_system = len(vals) - toward_customer
+        share_out = toward_system / len(vals)
+        if share_out >= _WAVE_AGREEMENT:
+            indication = "downstream"
+        elif (1.0 - share_out) >= _WAVE_AGREEMENT:
+            indication = "upstream"
+        else:
+            indication = "mixed"
+        orders[h] = {
+            "samples":          len(vals),
+            "toward_system":    toward_system,
+            "toward_customer":  toward_customer,
+            "median_p_w":       round(float(np.median(vals)), 4),
+            "median_angle_deg": round(float(np.median(
+                [s["angle_deg"] for s in group])), 1),
+            "indication":       indication,
+        }
+    return orders
 
 
 def harmonic_direction_from_waveforms(ds: PQDataset, thresh: Thresholds) -> dict:
@@ -1869,7 +2349,12 @@ def harmonic_direction_from_waveforms(ds: PQDataset, thresh: Thresholds) -> dict
             if abs(i1) / np.sqrt(2.0) < _MIN_LOADED_AMPS:
                 continue
             used_any = True
-            samples[1].append({"p": 0.5 * float(np.real(v1 * np.conj(i1)))})
+            # Carried onto every harmonic sample from this capture-phase: on a
+            # generating service the two directions of fundamental flow have to
+            # be separated, and that can only be done per capture, not from the
+            # median over all of them.
+            p1_ph = 0.5 * float(np.real(v1 * np.conj(i1)))
+            samples[1].append({"p": p1_ph, "p1": p1_ph})
             for h in _SOURCE_ORDERS:
                 vh = _phasor(v, window, fs, f0 * h)
                 ih = _phasor(i, window, fs, f0 * h)
@@ -1879,6 +2364,7 @@ def harmonic_direction_from_waveforms(ds: PQDataset, thresh: Thresholds) -> dict
                     continue
                 samples[h].append({
                     "p": 0.5 * float(np.real(vh * np.conj(ih))),
+                    "p1": p1_ph,
                     # Wrapped to ±180° by construction: an unwrapped
                     # difference of -249° is the same angle as +111° and
                     # medians of the two say opposite things.
@@ -1891,51 +2377,84 @@ def harmonic_direction_from_waveforms(ds: PQDataset, thresh: Thresholds) -> dict
             out["excluded_light_load"] += 1
 
     if not out["captures_used"]:
+        # At a plant the same exclusion means the inverters were off, not that
+        # a customer was drawing little -- there is no load there to be light.
+        quiet = (f"{out['excluded_light_load']} while the plant was not "
+                 f"producing (under {_MIN_LOADED_AMPS:.0f} A)"
+                 if is_generation_only(thresh) else
+                 f"{out['excluded_light_load']} at less than "
+                 f"{_MIN_LOADED_AMPS:.0f} A of load")
         out["note"] = (
             f"None of the {len(captures)} capture(s) were usable: "
             f"{out['excluded_event']} were taken during a voltage event, "
-            f"{out['excluded_light_load']} at less than {_MIN_LOADED_AMPS:.0f} A "
-            f"of load, {out['excluded_short']} too short to resolve the orders, "
+            f"{quiet}, {out['excluded_short']} too short to resolve the orders, "
             f"{out['excluded_no_fundamental']} with no steady fundamental to "
             "measure against."
         )
         return out
 
-    # CT polarity, from the fundamental: a load service imports real power, so
-    # a negative P1 means the clamps went on backwards. Only worth reading
+    # CT polarity, from the fundamental. Which sign is the wrong one depends on
+    # what the service is: a load imports, a plant exports, and a service that
+    # does both cannot be told from reversed clamps at all. Only worth reading
     # when there is enough real power for its sign to mean anything.
     p1 = float(np.median([s["p"] for s in samples[1]])) if samples[1] else 0.0
     polarity_floor = 0.5 * _MIN_LOADED_AMPS * thresh.nominal_voltage
     polarity_verified = abs(p1) >= polarity_floor
-    inverted = polarity_verified and p1 < 0
-    sign = -1.0 if inverted else 1.0
 
-    orders: Dict[int, dict] = {}
-    for h in _SOURCE_ORDERS:
-        vals = [sign * s["p"] for s in samples[h]]
-        if len(vals) < _WAVE_MIN_SAMPLES:
-            continue
-        toward_customer = sum(1 for p in vals if p > 0)
-        toward_system = len(vals) - toward_customer
-        share_out = toward_system / len(vals)
-        if share_out >= _WAVE_AGREEMENT:
-            indication = "downstream"
-        elif (1.0 - share_out) >= _WAVE_AGREEMENT:
-            indication = "upstream"
-        else:
-            indication = "mixed"
-        orders[h] = {
-            "samples":          len(vals),
-            "toward_system":    toward_system,
-            "toward_customer":  toward_customer,
-            "median_p_w":       round(float(np.median(vals)), 4),
-            "median_angle_deg": round(float(np.median(
-                [s["angle_deg"] for s in samples[h]])), 1),
-            "indication":       indication,
+    if is_generation_only(thresh):
+        # A plant exports whenever it is running, so the expectation is simply
+        # the load one with its sign flipped: P1 positive here is the anomaly.
+        # The check is not lost at a generation site -- it is lost in the
+        # middle, where both signs are legitimate.
+        inverted = polarity_verified and p1 > 0
+        orders   = _direction_orders(samples, -1.0 if inverted else 1.0)
+    elif exports_power(thresh):
+        # A generating service exports, so the sign of P1 no longer tells the
+        # clamps apart from the flow: reversed CTs on an importing service and
+        # correct CTs on an exporting one read the same. The inversion is
+        # therefore not applied at all -- it would silently invert every
+        # direction below on any capture taken while the site was generating.
+        # Instead the captures are split on their own P1 and each half read on
+        # its own terms, with the CTs assumed installed arrow-toward-load.
+        # Sorted on their own P1, but only where that sign carries a direction.
+        # A capture taken while generation was matching load has a fundamental
+        # near zero, and filing it by the sign of the residue sorts it by
+        # noise -- on an unbalanced service that can even put two phases of one
+        # capture on opposite sides. The floor is the same one that decides
+        # whether P1 is worth reading for polarity at all.
+        importing = {h: [s for s in v if s["p1"] >= polarity_floor]
+                     for h, v in samples.items()}
+        exporting = {h: [s for s in v if s["p1"] <= -polarity_floor]
+                     for h, v in samples.items()}
+        near_zero = sum(1 for s in samples[1] if abs(s["p1"]) < polarity_floor)
+        inverted = False
+        polarity_verified = False
+        orders = _direction_orders(importing, 1.0)
+        out["export_split"] = {
+            "importing": {
+                "capture_phases": len(importing[1]),
+                "orders":         orders,
+                "overall":        _direction_consensus(
+                    [od["indication"] for od in orders.values()]),
+            },
+            "exporting": {
+                "capture_phases": len(exporting[1]),
+                "orders":         (exp_orders := _direction_orders(exporting, 1.0)),
+                "overall":        _direction_consensus(
+                    [od["indication"] for od in exp_orders.values()]),
+            },
+            "near_crossover": near_zero,
+            "deadband_w":     round(polarity_floor, 1),
         }
+    else:
+        inverted = polarity_verified and p1 < 0
+        orders   = _direction_orders(samples, -1.0 if inverted else 1.0)
 
     out.update({
-        "available":            bool(orders),
+        # On a generating service the exporting captures are a result in their
+        # own right, so the block is available on either half.
+        "available":            bool(orders or (out.get("export_split") or {})
+                                     .get("exporting", {}).get("orders")),
         "orders":               orders,
         "fundamental_hz":       round(float(np.median(f0_seen)), 3) if f0_seen else None,
         "ct_polarity_inverted": inverted,
@@ -1953,7 +2472,63 @@ def harmonic_direction_from_waveforms(ds: PQDataset, thresh: Thresholds) -> dict
             "comparable (Xu, Liu & Liu, IEEE T-PWRD 18(1), 2003)."
         ),
     })
-    if inverted:
+    if is_generation_only(thresh):
+        if inverted:
+            out["polarity_note"] = (
+                "The fundamental real power measured as flowing into the "
+                "premises while the plant was producing, which at a generating "
+                "site means the CTs were installed reversed. Every direction "
+                "here is stated with that inversion corrected."
+            )
+        elif not polarity_verified:
+            out["polarity_note"] = (
+                f"The captures carried only {abs(p1):.0f} W of fundamental real "
+                "power, too little for its sign to confirm the CT orientation, "
+                "so the directions below assume the CTs were installed with "
+                "the arrow toward the load. Reversed CTs would invert every one."
+            )
+        else:
+            out["polarity_note"] = (
+                "The fundamental real power measured as flowing out of the "
+                "premises, which is what a plant that is producing should read "
+                "and confirms the CTs are installed the right way round. Note "
+                "that at a generating site the harmonic orders are expected to "
+                "read as coming from the customer side: the plant is the only "
+                "source behind the meter, so the direction below is a check on "
+                "the measurement rather than a finding about who is "
+                "responsible. What the orders are worth reading for is their "
+                "size."
+            )
+    elif exports_power(thresh):
+        split = out["export_split"]
+        n_imp = split["importing"]["capture_phases"]
+        n_exp = split["exporting"]["capture_phases"]
+        out["polarity_note"] = (
+            f"This service carries on-site generation, so the captures were "
+            f"separated by the direction of fundamental flow at the instant "
+            f"each was taken: {n_imp} while importing, {n_exp} while "
+            f"exporting. The table states the importing captures, which are "
+            f"the ones comparable with a service that does not generate; the "
+            f"exporting captures are reported separately below and are not "
+            f"sign-corrected against them. Because the site exports, the sign "
+            f"of fundamental power cannot confirm the CT orientation, so both "
+            f"readings assume the CTs were installed with the arrow toward "
+            f"the load."
+        )
+        if split.get("near_crossover"):
+            out["polarity_note"] += (
+                f" A further {split['near_crossover']} carried less than "
+                f"{split['deadband_w']:.0f} W of fundamental real power, too "
+                f"little for its sign to say which way power was flowing, and "
+                f"are in neither half."
+            )
+        if not n_imp:
+            out["polarity_note"] += (
+                " No capture was taken while the service was importing, so "
+                "there is nothing here to compare against a non-generating "
+                "service."
+            )
+    elif inverted:
         out["polarity_note"] = (
             "The fundamental real power measured as flowing out of the "
             "premises, which at a load service means the CTs were installed "
@@ -2124,8 +2699,8 @@ def check_harmonic_statistics(df: pd.DataFrame, thresh: Thresholds) -> dict:
     if not i_cols:
         return result
 
-    il_amps = float(df[i_cols].max(axis=1).max())
-    if il_amps <= 0:
+    il_amps, harm_rms, fundamental, _harm_source = demand_current_il(df, thresh)
+    if not il_amps:
         return result
 
     if thresh.isc_amps is None:
@@ -2218,14 +2793,20 @@ def check_harmonic_statistics(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 if not d["pass"]:
                     overall_pass = False
 
+    # TDD, not the raw THD channel.  This block previously graded thd_current_*
+    # straight against the TDD limit with no conversion, so on a service that
+    # falls to no output -- a solar site at night -- it reported the runaway THD
+    # ratio as though it were TDD.  On one 3.7-day solar recording that printed
+    # a P95 of 59.70% against a maximum TDD of 4.44% elsewhere in the same
+    # report: two different series under one label, and an impossible comparison
+    # a reader could not have caught.
     tdd_lim = _tdd_limit(isc_il)
     weekly["thd"] = {}
     daily_vst["thd"] = {}
-    for ph in ("a", "b", "c"):
-        col = f"thd_current_{ph}"
-        if col not in df.columns:
+    for ph, s in tdd_by_phase(df, il_amps, harm_rms, fundamental).items():
+        s = s.dropna()
+        if s.empty:
             continue
-        s = df[col].dropna()
         w = _weekly(s, tdd_lim)
         if w:
             weekly["thd"][ph] = w
@@ -3785,7 +4366,7 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
     tdd_info = thd.get("tdd_info", {})
 
     i_cols = [c for c in ["current_a", "current_b", "current_c"] if c in df.columns]
-    il_amps = float(df[i_cols].max(axis=1).max()) if i_cols else 0.0
+    il_amps = demand_current_il(df, thresh)[0] or 0.0
     geometry = service_geometry(thresh, df.columns)
 
     # ── Harmonic signature detection ──────────────────────────────────────────

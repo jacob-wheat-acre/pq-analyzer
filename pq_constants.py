@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.42.1"
+__version__ = "0.47.1"
 
 
 @dataclass
@@ -33,6 +33,62 @@ class Thresholds:
     isc_source: Optional[str] = None     # human-readable note on how ISC was determined
     transformer_kva: Optional[float] = None  # service transformer nameplate (kVA)
     customer_class: str = "sg"            # "r" | "c" | "sg" | "pg"  (PSCo tariff schedules)
+    # On-site generation is not a rate class.  PSCo Schedule NM is "applicable
+    # as a service element under all rate schedules, including Schedule PV",
+    # and Schedule PV bills delivered energy "under the applicable Residential,
+    # Commercial or Industrial service schedule selected by the Customer" -- so
+    # a net-metered solar customer on Schedule SG is still customer_class "sg".
+    # It is a separate fact about the service, and an entered one: whether the
+    # meter can see export is not reliably recoverable from the recording, and
+    # guessing it wrong inverts every harmonic direction in the report.
+    #
+    # The question this answers is whether a generator runs in parallel *behind
+    # this meter*, not whether the customer buys solar.  PSCo has seven
+    # renewable schedules and only some of them put hardware on the premises:
+    #
+    #   "mixed"    NM   on-site DG in parallel (the rider itself)
+    #              PV   on-site photovoltaic system
+    #              RE   Recycled Energy -- waste-heat generation in parallel,
+    #                   500 kW-10 MW, and not solar at all
+    #              AVPP aggregator-controlled DERs, i.e. batteries, which
+    #                   export on dispatch rather than on sunlight
+    #
+    #   "load"     OS-NM  Off-Site Net Metering: the generator sits on
+    #                     "noncontiguous property" and this meter never sees it
+    #              RC/RCF Renewable*Connect -- a subscription, no hardware
+    #              SRCS   Solar*Rewards Community -- an allocation from someone
+    #                     else's array
+    #
+    # The three under "load" bill like solar and measure like an ordinary load,
+    # so a customer who says "I'm net metered" is not enough to go on.
+    #
+    # "generation" is a plant with no load worth the name -- a Solar*Rewards
+    # Community producer's array in a field, metered on the Company's own
+    # production meter.  Note that Schedule SRCS names the *subscribers* who
+    # buy its output, not the array; the array is the "SRCS Producer" and takes
+    # service separately.
+    #
+    # The three are not a severity scale.  Fundamental flow is one-way at both
+    # ends and two-way in the middle, which is why CT polarity is recoverable
+    # for "load" and "generation" -- with opposite expectations -- and is not
+    # recoverable at all for "mixed".
+    service_role: str = "load"            # "load" | "mixed" | "generation"
+    # Combined site rated generation, kW AC.  Two jobs: it is Irated for the
+    # IEEE 1547 limits, and it is the numerator of 519-2022 Figure 1's test for
+    # which standard applies at all.  Nothing in a recording establishes it --
+    # a plant's rating is what it can do, not what the week it was metered
+    # happened to ask of it.
+    rated_ac_kw: Optional[float] = None
+    # Annual average load demand, kW.  Figure 1's denominator, and available
+    # only from billing history.  Without it the standards test cannot be run.
+    annual_avg_load_kw: Optional[float] = None
+    # IL from billing, in amps.  519-2022 defines maximum demand load current
+    # as the twelve previous months' 15- or 30-minute maximum demands averaged,
+    # which is a records quantity and not a measurement: no recording short of
+    # a year can produce it.  Entered, this is used directly; left unset, the
+    # largest fundamental in the recording stands in for it and every number
+    # normalised against it is labelled as resting on that substitution.
+    il_amps_billing: Optional[float] = None
     # The engineer picks these at the start; they resolve how many phases the
     # service actually has, which channel presence alone can get wrong when a
     # phase is simply missing from the export.
@@ -331,6 +387,58 @@ _H519_LIMITS: List[Tuple[int, int, List[float]]] = [
 
 # Odd harmonic orders to check per IEEE 519-2022 (even harmonics limited to 25% of odd limits)
 _H519_ORDERS = [3, 5, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]
+
+
+# ── IEEE 1547-2018 Clause 7.3: current distortion limits for a DER ───────────
+#
+# These are not 519's limits under another name and must not be mixed with
+# them.  Three differences matter:
+#
+#   * the denominator is Irated, "the DER unit rated current capacity
+#     (transformed to the RPA when a transformer exists between the DER unit
+#     and the RPA)" -- not a demand current, so nothing in a recording
+#     establishes it;
+#   * the limits are fixed.  There is no ISC/IL class, so a stiff service buys
+#     a DER no headroom the way it does a load;
+#   * the aggregate is TRD, not TDD.  TRD includes interharmonics where TDD
+#     specifically excludes them, so the two are not the same measurement even
+#     where the denominators happen to agree.
+#
+# 519-2022 Figure 1 decides which of the two applies; see
+# `applicable_current_standard`.
+
+#: Table 26, odd orders: (h_min, h_max_exclusive, percent of Irated).
+_H1547_ODD_LIMITS: List[Tuple[int, int, float]] = [
+    (2,  11, 4.0),
+    (11, 17, 2.0),
+    (17, 23, 1.5),
+    (23, 35, 0.6),
+    (35, 50, 0.3),
+]
+
+#: Table 27, even orders. Below the eighth they are called out individually and
+#: are *looser* than 519's blanket 25%-of-odd rule, which the standard's own
+#: rationale (Annex) puts down to that 25% having been researched and not
+#: supported for a DER.  From the eighth up they follow the odd ranges above.
+_H1547_EVEN_LIMITS: Dict[int, float] = {2: 1.0, 4: 2.0, 6: 3.0}
+
+#: Table 26, aggregate: total rated-current distortion.
+_TRD_LIMIT = 5.0
+
+#: Orders worth reporting for a DER. 1547's tables run to h < 50 and its own
+#: footnote warns that utility instrument transformers may not reproduce the
+#: high orders faithfully, which is why nothing above 49 is claimed here.
+_H1547_ORDERS = [2, 3, 4, 5, 6, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]
+
+#: Figure 1's threshold: a site whose rated generation is below this share of
+#: its annual average load demand stays under 519 despite having a DER.
+_DER_SHARE_FOR_1547 = 0.10
+
+#: Current harmonic orders the adapter exposes.  It has to be the union of what
+#: both standards grade, not 519's list alone: 1547 Table 27 limits the second,
+#: fourth and sixth individually, and a channel that is never mapped cannot be
+#: assessed however carefully the limit is coded.
+_HARM_CURRENT_ORDERS = sorted(set(_H519_ORDERS) | set(_H1547_ORDERS))
 
 # ── Load-signature families and match thresholds ─────────────────────────────
 # Several library entries describe the same electrical topology and therefore
@@ -878,6 +986,21 @@ def _tdd_limit(isc_il: float) -> float:
         if isc_il < threshold:
             return limit
     return 20.0
+
+
+def _h1547_limit(h: int) -> float:
+    """Per-order IEEE 1547-2018 limit, in percent of Irated.
+
+    Even orders below the eighth have their own row; everything else follows
+    the odd ranges. Returns 0.0 for an order the tables do not reach, which
+    callers read as "out of scope" rather than "no headroom".
+    """
+    if h in _H1547_EVEN_LIMITS:
+        return _H1547_EVEN_LIMITS[h]
+    for h_min, h_max, limit in _H1547_ODD_LIMITS:
+        if h_min <= h < h_max:
+            return limit
+    return 0.0
 
 
 def _tdd_class(isc_il: float) -> str:

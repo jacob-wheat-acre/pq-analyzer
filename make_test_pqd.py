@@ -55,7 +55,7 @@ import struct
 import uuid
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -904,6 +904,193 @@ def make_commercial_large() -> tuple[list[str], list[np.ndarray]]:
     return labels, arrays
 
 
+def make_solar_net_metered() -> tuple[list[str], list[np.ndarray]]:
+    """3-phase 277/480 V on Schedule SG with an inverter: output collapses nightly.
+
+    Schedule NM is a service element under every rate schedule, so this is an
+    ordinary SG service that also generates -- the fixture is `--customer-class
+    sg --net-metered`, not a class of its own.
+
+    The shape is what breaks any statistic taken against the fundamental. At
+    night the inverter is off and the service draws a few amps of house load,
+    so the reported current THD runs to tens of percent while the harmonic
+    amperes behind it stay near nothing; at noon 200 A of fundamental carries
+    the same handful of amps of distortion. TDD, measured against a fixed IL,
+    barely moves across the whole day.
+    """
+    n = N_SAMPLES
+    hours = T_SEC / 3600.0
+    # One clean solar day: nothing before 06:00 or after 18:00, peak at noon.
+    day = np.clip(np.sin((hours - 6.0) / 12.0 * np.pi), 0.0, None)
+
+    # Voltage rises a little under generation, as it does at the end of a
+    # feeder carrying export at midday.
+    van = 279.0 + 4.0 * day + _noise(n, 0.4)
+    vbn = 278.0 + 4.0 * day + _noise(n, 0.4)
+    vcn = 279.5 + 4.0 * day + _noise(n, 0.4)
+
+    # Net current at the meter: house load at night, inverter output by day.
+    # The meter reports magnitude, so export and import look alike here -- it
+    # is the captures that carry the direction.
+    fund = 3.0 + 197.0 * day
+    ia = fund + _noise(n, 0.4)
+    ib = fund * 0.99 + _noise(n, 0.4)
+    ic = fund * 1.01 + _noise(n, 0.4)
+    in_ = np.full(n, 1.5) + _noise(n, 0.2)
+
+    # Real power goes negative while exporting; the sign convention here is the
+    # meter's, and the analysis reads magnitudes off these channels.
+    kw   = -60_000.0 * day + 4_000.0 + _noise(n, 200.0)
+    kvar = np.full(n, 3_000.0) + _noise(n, 100.0)
+    pf   = np.clip(np.abs(kw) / np.sqrt(kw**2 + kvar**2) + _noise(n, 0.003),
+                   0.8, 1.0)
+
+    thd_van = np.clip(3.2 + 0.8 * day + _noise(n, 0.2), 0.5, 7.9)
+    thd_vbn = np.clip(3.1 + 0.8 * day + _noise(n, 0.2), 0.5, 7.9)
+    thd_vcn = np.clip(3.3 + 0.8 * day + _noise(n, 0.2), 0.5, 7.9)
+
+    pst = np.full(n, 0.35) + _noise(n, 0.04)
+    plt = np.full(n, 0.22) + _noise(n, 0.03)
+    kfactor = np.full(n, 2.1) + _noise(n, 0.1)
+
+    def vh(base: float) -> np.ndarray:
+        return np.clip(base * (0.4 + 0.6 * day) + _noise(n, 0.08), 0.01, 15.0)
+
+    h3va = vh(1.6); h5va = vh(2.4); h7va = vh(1.7); h11va = vh(0.7); h13va = vh(0.5)
+    h3vb = vh(1.5); h5vb = vh(2.3); h7vb = vh(1.6); h11vb = vh(0.7); h13vb = vh(0.5)
+    h3vc = vh(1.6); h5vc = vh(2.4); h7vc = vh(1.7); h11vc = vh(0.7); h13vc = vh(0.5)
+
+    def ih(vals: list[float]) -> list[np.ndarray]:
+        # Harmonic amperes follow the inverter, with a small floor that does
+        # not: the night-time residue is what makes the THD ratio explode while
+        # the amperes behind it stay trivial.
+        return [np.clip(0.15 + v * day + _noise(n, 0.05), 0.01, 50.0)
+                for v in vals]
+
+    # Inverter signature: H5 and H7 dominant, H3 small on a three-wire tie.
+    ia_h = ih([0.2, 0.6, 0.2, 4.5, 0.2, 2.8, 0.1, 0.5, 0.1, 1.4, 0.1, 0.9])
+    ib_h = ih([0.2, 0.6, 0.2, 4.4, 0.2, 2.7, 0.1, 0.5, 0.1, 1.4, 0.1, 0.9])
+    ic_h = ih([0.2, 0.6, 0.2, 4.6, 0.2, 2.9, 0.1, 0.5, 0.1, 1.4, 0.1, 0.9])
+    in_h = ih([0.05, 0.2, 0.05, 0.1, 0.05, 0.1, 0.05, 0.1, 0.05, 0.1, 0.05, 0.1])
+
+    labels = [
+        'Harm 1 of Van', 'Harm 1 of Vbn', 'Harm 1 of Vcn',
+        'Harm 1 of Ia', 'Harm 1 of Ib', 'Harm 1 of Ic', 'Harm 1 of In',
+        f'3{PHI} 4w Real Power', f'3{PHI} 4w VA Reactive', f'3{PHI} 4w Power Factor',
+        'THD Van (V1)', 'THD Vbn (V2)', 'THD Vcn (V3)',
+        'K-Factor Ia', 'Flicker PST Van (V1)', 'Flicker PLT Van (V1)',
+        *_harm_labels('Van', _H_VOLT),
+        *_harm_labels('Vbn', _H_VOLT),
+        *_harm_labels('Vcn', _H_VOLT),
+        *_harm_labels('Ia',  _H_CURR),
+        *_harm_labels('Ib',  _H_CURR),
+        *_harm_labels('Ic',  _H_CURR),
+        *_harm_labels('In',  _H_CURR),
+    ]
+    arrays = [
+        van, vbn, vcn,
+        ia, ib, ic, in_,
+        kw, kvar, pf,
+        thd_van, thd_vbn, thd_vcn,
+        kfactor, pst, plt,
+        h3va, h5va, h7va, h11va, h13va,
+        h3vb, h5vb, h7vb, h11vb, h13vb,
+        h3vc, h5vc, h7vc, h11vc, h13vc,
+        *ia_h, *ib_h, *ic_h, *in_h,
+    ]
+    return labels, arrays
+
+
+def make_producer_array() -> tuple[list[str], list[np.ndarray]]:
+    """A Solar*Rewards Community producer's array: generation and nothing else.
+
+    Schedule SRCS names the subscribers who buy the output; the array itself is
+    the "SRCS Producer" and sits on the Company's own production meter. There
+    is no load behind it beyond trackers and SCADA, so between dusk and dawn
+    the recording is not a lightly loaded service -- it is a plant that is off.
+
+    Rated 250 kW AC at 277/480 V, which is 301 A. The recording peaks at 240 A
+    because the week was not a clear one, which is exactly the gap between
+    grading against the nameplate and grading against the recording.
+    """
+    n = N_SAMPLES
+    hours = T_SEC / 3600.0
+    clear = np.clip(np.sin((hours - 6.0) / 12.0 * np.pi), 0.0, None)
+    # Cloud cover across the afternoon, so the peak sits below the nameplate.
+    haze = 1.0 - 0.35 * np.clip((hours - 12.0) / 6.0, 0.0, 1.0)
+    day = clear * haze
+
+    van = 279.0 + 5.0 * day + _noise(n, 0.4)
+    vbn = 278.5 + 5.0 * day + _noise(n, 0.4)
+    vcn = 279.5 + 5.0 * day + _noise(n, 0.4)
+
+    # Overnight is auxiliary load only: trackers parked, SCADA, inverter
+    # standby. Under the 1 A floor, which is the correct answer for a ratio and
+    # the wrong word for a plant.
+    fund = 0.4 + 239.6 * day
+    ia = fund + _noise(n, 0.3)
+    ib = fund * 0.99 + _noise(n, 0.3)
+    ic = fund * 1.01 + _noise(n, 0.3)
+    in_ = np.full(n, 0.8) + _noise(n, 0.1)
+
+    # Export throughout; the small positive term overnight is the auxiliaries.
+    kw   = -195_000.0 * day + 600.0 + _noise(n, 300.0)
+    kvar = np.full(n, 2_000.0) + _noise(n, 100.0)
+    pf   = np.clip(np.abs(kw) / np.sqrt(kw**2 + kvar**2) + _noise(n, 0.003),
+                   0.8, 1.0)
+
+    thd_van = np.clip(2.9 + 0.9 * day + _noise(n, 0.2), 0.5, 7.9)
+    thd_vbn = np.clip(2.8 + 0.9 * day + _noise(n, 0.2), 0.5, 7.9)
+    thd_vcn = np.clip(3.0 + 0.9 * day + _noise(n, 0.2), 0.5, 7.9)
+
+    pst = np.full(n, 0.30) + _noise(n, 0.04)
+    plt = np.full(n, 0.19) + _noise(n, 0.03)
+    kfactor = np.full(n, 1.9) + _noise(n, 0.1)
+
+    def vh(base: float) -> np.ndarray:
+        return np.clip(base * (0.3 + 0.7 * day) + _noise(n, 0.08), 0.01, 15.0)
+
+    h3va = vh(1.4); h5va = vh(2.2); h7va = vh(1.5); h11va = vh(0.6); h13va = vh(0.4)
+    h3vb = vh(1.3); h5vb = vh(2.1); h7vb = vh(1.5); h11vb = vh(0.6); h13vb = vh(0.4)
+    h3vc = vh(1.4); h5vc = vh(2.2); h7vc = vh(1.6); h11vc = vh(0.6); h13vc = vh(0.4)
+
+    def ih(vals: list[float]) -> list[np.ndarray]:
+        return [np.clip(0.05 + v * day + _noise(n, 0.04), 0.01, 50.0)
+                for v in vals]
+
+    ia_h = ih([0.2, 0.5, 0.2, 5.2, 0.2, 3.1, 0.1, 0.6, 0.1, 1.6, 0.1, 1.0])
+    ib_h = ih([0.2, 0.5, 0.2, 5.1, 0.2, 3.0, 0.1, 0.6, 0.1, 1.6, 0.1, 1.0])
+    ic_h = ih([0.2, 0.5, 0.2, 5.3, 0.2, 3.2, 0.1, 0.6, 0.1, 1.6, 0.1, 1.0])
+    in_h = ih([0.05, 0.15, 0.05, 0.1, 0.05, 0.1, 0.05, 0.1, 0.05, 0.1, 0.05, 0.1])
+
+    labels = [
+        'Harm 1 of Van', 'Harm 1 of Vbn', 'Harm 1 of Vcn',
+        'Harm 1 of Ia', 'Harm 1 of Ib', 'Harm 1 of Ic', 'Harm 1 of In',
+        f'3{PHI} 4w Real Power', f'3{PHI} 4w VA Reactive', f'3{PHI} 4w Power Factor',
+        'THD Van (V1)', 'THD Vbn (V2)', 'THD Vcn (V3)',
+        'K-Factor Ia', 'Flicker PST Van (V1)', 'Flicker PLT Van (V1)',
+        *_harm_labels('Van', _H_VOLT),
+        *_harm_labels('Vbn', _H_VOLT),
+        *_harm_labels('Vcn', _H_VOLT),
+        *_harm_labels('Ia',  _H_CURR),
+        *_harm_labels('Ib',  _H_CURR),
+        *_harm_labels('Ic',  _H_CURR),
+        *_harm_labels('In',  _H_CURR),
+    ]
+    arrays = [
+        van, vbn, vcn,
+        ia, ib, ic, in_,
+        kw, kvar, pf,
+        thd_van, thd_vbn, thd_vcn,
+        kfactor, pst, plt,
+        h3va, h5va, h7va, h11va, h13va,
+        h3vb, h5vb, h7vb, h11vb, h13vb,
+        h3vc, h5vc, h7vc, h11vc, h13vc,
+        *ia_h, *ib_h, *ic_h, *in_h,
+    ]
+    return labels, arrays
+
+
 # ── Commercial Primary (pg): 3-phase 13,200 V (22.86 kV Y) ──────────────────
 
 def make_commercial_primary() -> tuple[list[str], list[np.ndarray]]:
@@ -1017,7 +1204,144 @@ SCENARIOS = [
     ("test_commercial_small.pqd",   make_commercial_small),
     ("test_commercial_large.pqd",   make_commercial_large),
     ("test_commercial_primary.pqd", make_commercial_primary),
+    ("test_solar_net_metered.pqd",  make_solar_net_metered),
+    ("test_producer_array.pqd",     make_producer_array),
 ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Point-on-wave captures
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Interval channels carry magnitudes only, so a file built from them alone can
+# never exercise the half of the direction check that needs angles.  A capture
+# is a separate observation whose channels are quantity type WAVEFORM, each
+# holding its own time base and a VAL/INSTANTANEOUS series of samples -- which
+# is what clause 5.4 calls an instantaneous-value channel and what the adapter
+# looks for when it sorts observations into interval and waveform.
+
+#: 19.2 kHz, the rate a Pronto records its steady-state captures at: 320
+#: samples per 60 Hz cycle, comfortably above the H13 the report reads.
+CAPTURE_FS_HZ = 19200.0
+CAPTURE_CYCLES = 10
+
+
+def _capture_samples(spectrum: dict[int, tuple[float, float]],
+                     fs: float = CAPTURE_FS_HZ,
+                     cycles: int = CAPTURE_CYCLES,
+                     f0: float = 60.0) -> tuple[np.ndarray, np.ndarray]:
+    """One channel's samples, from {order: (peak amplitude, phase in degrees)}.
+
+    Stating the spectrum as amplitude and angle rather than as a waveform is
+    what makes a capture fixture legible: the sign of harmonic power depends on
+    nothing but the angle between a voltage order and the current order at the
+    same frequency, so the intended answer is visible in the numbers.
+    """
+    n = int(round(fs * cycles / f0))
+    t = np.arange(n) / fs
+    out = np.zeros(n)
+    for order, (amp, deg) in spectrum.items():
+        out += amp * np.cos(2 * np.pi * f0 * order * t + np.radians(deg))
+    return t, out
+
+
+def capture_channels(voltage: dict[str, dict], current: dict[str, dict],
+                     fs: float = CAPTURE_FS_HZ,
+                     cycles: int = CAPTURE_CYCLES) -> list[Channel]:
+    """The channels of one capture, from a per-phase spectrum for V and I.
+
+    *voltage* and *current* map a phase ('a', 'b', 'c') to a spectrum in the
+    form `_capture_samples` takes.
+    """
+    channels: list[Channel] = []
+    for measured, group, units, prefix in (("voltage", voltage, "V", "V"),
+                                           ("current", current, "A", "I")):
+        for phase, spectrum in group.items():
+            t, samples = _capture_samples(spectrum, fs, cycles)
+            name = (f"{prefix}{phase}n" if measured == "voltage"
+                    else f"{prefix}{phase}")
+            channels.append(Channel(name, f"{phase}n", measured, 'WAVEFORM', [
+                Series('TIME', 'INSTANTANEOUS', 's', t),
+                Series('VAL', 'INSTANTANEOUS', units, samples),
+            ]))
+    return channels
+
+
+def _steady_capture(v_rms: float, i_rms: float, *, exporting: bool = False,
+                    h5_v: float = 4.0, h5_i: float = 2.0,
+                    phases=("a", "b", "c")) -> list[Channel]:
+    """A capture whose H5 leaves the premises: the source is on the customer side.
+
+    V5 and I5 are put in antiphase, so P5 = ½·Re(V5·I5*) is negative whichever
+    way the fundamental runs.  With *exporting* set, the fundamental current is
+    reversed against the voltage as it is on a generating service -- the case
+    that reads as reversed CTs unless the service is declared net-metered.
+    """
+    root2 = np.sqrt(2.0)
+    i1_deg = 180.0 if exporting else 0.0
+    return capture_channels(
+        {p: {1: (v_rms * root2, 0.0), 5: (h5_v, 180.0)} for p in phases},
+        {p: {1: (i_rms * root2, i1_deg), 5: (h5_i, 0.0)} for p in phases},
+    )
+
+
+def _large_captures() -> list[tuple]:
+    """An ordinary load service: every capture taken while importing."""
+    return [
+        (f"test_commercial_large - Waveform {i + 1}",
+         _steady_capture(277.0, 100.0),
+         START_TIME + timedelta(hours=3 * (i + 1)))
+        for i in range(4)
+    ]
+
+
+def _solar_captures() -> list[tuple]:
+    """A generating service, captured on both sides of the day.
+
+    Two before the inverter starts and four across the middle of the day, so
+    the file holds enough of each to grade: the split needs three phase-
+    readings per order per half, and each capture carries three phases.
+
+    Without the exporting captures the fixture would not reach the case that
+    matters -- a negative fundamental that is generation and not a reversed CT.
+    """
+    hours_importing = (2, 4)
+    hours_exporting = (10, 12, 13, 15)
+    out = []
+    for h in hours_importing:
+        out.append((f"test_solar_net_metered - Waveform {h:02d}00 (import)",
+                    _steady_capture(277.0, 6.0, exporting=False),
+                    START_TIME + timedelta(hours=h)))
+    for h in hours_exporting:
+        out.append((f"test_solar_net_metered - Waveform {h:02d}00 (export)",
+                    _steady_capture(281.0, 180.0, exporting=True),
+                    START_TIME + timedelta(hours=h)))
+    return out
+
+
+#: Which fixtures carry point-on-wave captures, and what is in them. Kept apart
+#: from SCENARIOS because a capture is a separate observation, not another
+#: interval channel.
+def _producer_captures() -> list[tuple]:
+    """A plant: every usable capture taken while exporting.
+
+    There is no importing half to compare against, which is the point -- the
+    polarity check here is the load one with its sign flipped, not the split
+    used on a mixed service.
+    """
+    return [
+        (f"test_producer_array - Waveform {h:02d}00",
+         _steady_capture(282.0, 230.0, exporting=True),
+         START_TIME + timedelta(hours=h))
+        for h in (9, 11, 13, 15)
+    ]
+
+
+CAPTURES = {
+    "test_commercial_large.pqd":  _large_captures,
+    "test_solar_net_metered.pqd": _solar_captures,
+    "test_producer_array.pqd":    _producer_captures,
+}
 
 
 #: The second session's start, three days after the first: long enough that
@@ -1073,10 +1397,12 @@ def main():
 
         site = Path(fname).stem
         avg, maxmin = scenario_channels(labels, arrays, T_SEC, INTERVAL_SEC)
-        pqd_bytes = build_file(site, [
+        observations = [
             (f"{site} (general) - Interval (avg)", avg),
             (f"{site} (general) - Interval (max-min)", maxmin),
-        ])
+        ]
+        observations.extend(CAPTURES.get(fname, lambda: [])())
+        pqd_bytes = build_file(site, observations)
         path = out_dir / fname
         path.write_bytes(pqd_bytes)
 
@@ -1085,7 +1411,9 @@ def main():
         parsed = pqdif.PQDIFFile(path)
         print(f"  wrote {path}  ({len(pqd_bytes):,} bytes, "
               f"{len(parsed.definitions)} channel definitions, "
-              f"{len(avg)} avg + {len(maxmin)} max-min channels)")
+              f"{len(avg)} avg + {len(maxmin)} max-min channels"
+              + (f", {len(observations) - 2} captures"
+                 if len(observations) > 2 else "") + ")")
 
     _write_two_session_file(out_dir)
 

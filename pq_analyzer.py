@@ -116,20 +116,58 @@ STANDARDS APPLIED
   Current THD   IEEE 519-2022 TDD when --isc is provided; raw interval THD
                 fallback otherwise (light-load intervals < 10% of peak demand
                 are automatically excluded to prevent divide-by-zero blowup)
-  Power factor  PSCo Tariff R73 (Schedules C/SG, ≥ 0.90 lag) / R121 (PG)
+  Power factor  PSCo Tariff R73 (≥ 0.90 lagging, General rules — all classes)
+                and R121 (near unity, C&I rules — Schedules C, SG and PG)
   Flicker       IEC 61000-3-3  (Pst ≤ 1.0, Plt ≤ 0.65)
   Imbalance     NEMA MG1 / IEEE 112  (voltage ≤ 3%, current ≤ 10%)
   Neutral       Split-phase only: L1+L2 sum stability, cross-leg Pearson r,
                 Vne, and coincident opposing sag/swell event detection
 
 CUSTOMER CLASSES  (--customer-class)
-  r    Residential       120 V split-phase      No PF tariff; open-neutral check active
-  c    Small Commercial  120/208 V 3-phase      Tariff R73 Schedule C
-  sg   C&I Secondary     277/480 V 3-phase      Tariff R73 Schedule SG  [default]
-  pg   C&I Primary       13,200+ V 3-phase      Tariff R121 Schedule PG
+  r    Residential       120 V split-phase      Open-neutral check active
+  c    Small Commercial  120/208 V 3-phase      Demand < 50 kW, secondary
+  sg   C&I Secondary     277/480 V 3-phase      Secondary voltage  [default]
+  pg   C&I Primary       13,200+ V 3-phase      Primary voltage
 
-IEEE 519-2022 TDD  (--isc, --transformer-kva, --service-type)
-  TDD(t) = THD%(t) × I(t) / IL   where IL = peak demand current in recording.
+  The tariff separates C from SG on the 50 kW demand in Schedule C, and SG
+  from PG on secondary versus primary voltage. SG itself states no kW floor.
+
+  Net metering is not one of these. Schedule NM applies "as a service element
+  under all rate schedules", so a solar customer keeps the class above and sets
+  --service-role.
+
+WHICH WAY POWER FLOWS  (--service-role, --rated-ac-kw)
+  Electrically there are three cases, and the schedule name does not decide it —
+  what is physically behind the meter does:
+
+    load        consumes only. Includes the solar schedules where the array is
+                somewhere else: OS-NM (other property), RC/RCF (Renewable*Connect
+                subscription), SRCS (Solar*Rewards Community share). These bill
+                like solar and measure like any other load.
+    mixed       load and generation in parallel: NM, PV, RE (recycled energy —
+                waste heat, not solar), AVPP (aggregated batteries).
+    generation  a plant with no load worth the name — a Solar*Rewards Community
+                producer's array on the Company's production meter. Note SRCS
+                names the subscribers who buy its output, not the array itself.
+
+  CT polarity is why the middle case is separate. A load should import and a
+  plant should export, so a wrong sign catches reversed clamps at either end;
+  in the middle both signs are legitimate and the check cannot be made at all.
+
+  At a generation site IL has no demand load to come from, so pass --rated-ac-kw
+  with the plant nameplate. Without it IL is the largest export measured, which
+  grades the plant against the week it happened to have rather than what it can
+  do — a cloudy recording then inflates every percentage taken against it.
+
+IEEE 519-2022 TDD  (--isc, --transformer-kva, --service-type, --il-amps)
+  Applies where 519 governs — see WHICH STANDARD below.
+  TDD(t) = 100 × Ih(t) / IL, with Ih the harmonic RMS current and IL the maximum
+  demand current at the fundamental — not the peak RMS, which is larger by
+  sqrt(1 + THD²).
+  519-2022 defines IL as the twelve previous months' 15- or 30-min maximum
+  demands averaged: a billing quantity, not a measurement. Pass --il-amps with
+  it. Without it the recording's largest fundamental stands in and every
+  percentage taken against it moves with how typical that week was.
   ISC/IL ratio selects the per-Table-2 TDD class limit (5 / 8 / 12 / 15 / 20%):
 
     ISC/IL < 20   →  5%     ISC/IL < 100  → 12%     ISC/IL ≥ 1000 → 20%
@@ -148,6 +186,21 @@ IEEE 519-2022 TDD  (--isc, --transformer-kva, --service-type)
                           carries the vector sum rather than the difference
   Use --service-type 1ph-208 for the third. Its Blue Book fault current is
   read from the three-phase rows, because it is the same transformer.
+
+WHICH STANDARD  (--rated-ac-kw, --annual-avg-load-kw)
+  519-2022 Clause 5.2 limits its own scope to a PCC "primarily with harmonic
+  producing loads" and sends inverter-based installations elsewhere. Figure 1
+  is the decision tree, and this tool follows it:
+
+    DER or IBR present?             no  → IEEE 519 at the PCC
+    rated generation < 10% of
+      annual average load demand?   yes → IEEE 519 at the PCC
+                                    no  → IEEE 1547 (Clause 7.3)
+
+  Under 1547 the metric is TRD = sqrt(I_rms² − I₁²) / I_rated, the limits are
+  fixed (4.0/2.0/1.5/0.6/0.3 by order, 5.0 aggregate) and there is no ISC/IL
+  class. Both inputs to the test come from records, so without them the tool
+  reports the standard as undetermined rather than guessing.
 
 TOPOLOGY  (--topology)
   auto          Inferred from loaded channels: no Vcn → split-phase (default)
@@ -272,6 +325,25 @@ EXAMPLES
     p.add_argument("--customer-class", default="sg",
                    choices=["r", "c", "sg", "pg"],
                    help="PSCo tariff schedule: r=Residential, c=Small Comm., sg=C&I Secondary, pg=C&I Primary")
+    p.add_argument("--service-role", default="load",
+                   choices=["load", "mixed", "generation"],
+                   help="Which way power flows at this meter: load (default), mixed "
+                        "for a service with generation in parallel behind it "
+                        "(Schedules NM, PV, RE, AVPP), or generation for a plant "
+                        "with no load worth the name (a producer's array).")
+    p.add_argument("--rated-ac-kw", type=float, default=None,
+                   help="Combined site rated generation, kW AC. This is I_rated for "
+                        "the IEEE 1547 limits and the numerator of the 519-2022 "
+                        "Figure 1 test for which standard applies.")
+    p.add_argument("--annual-avg-load-kw", type=float, default=None,
+                   help="Annual average load demand, kW, from billing history. The "
+                        "denominator of the 519-2022 Figure 1 test: at or above 10%% "
+                        "generation the installation goes to IEEE 1547.")
+    p.add_argument("--il-amps", type=float, default=None,
+                   help="Maximum demand load current from billing: the twelve "
+                        "previous months' 15- or 30-min maximum demands, averaged, "
+                        "per IEEE 519-2022. Without it the recording's largest "
+                        "fundamental stands in and is labelled as doing so.")
     p.add_argument("--verbose",   action="store_true", help="Debug logging")
     args = p.parse_args()
     # Checked here rather than in main() so it fails as a usage error, with the
@@ -339,6 +411,10 @@ def main():
         isc_source=isc_source,
         transformer_kva=args.transformer_kva,
         customer_class=args.customer_class,
+        service_role=args.service_role,
+        rated_ac_kw=args.rated_ac_kw,
+        annual_avg_load_kw=args.annual_avg_load_kw,
+        il_amps_billing=args.il_amps,
         service_type=args.service_type,
         topology=args.topology,
         conductor_key=args.conductor,

@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 import pqdif
-from pq_constants import _H519_ORDERS
+from pq_constants import _H519_ORDERS, _HARM_CURRENT_ORDERS
 
 # PQDIF parsing is handled by pqdif.py (this repo), written directly from
 # IEEE Std 1159.3-2019 -- see ProntoAdapter.  pqdifpy is optional and only
@@ -51,7 +51,7 @@ CANONICAL = [
     "thd_voltage_a", "thd_voltage_b", "thd_voltage_c",
     "thd_current_a", "thd_current_b", "thd_current_c",
     # Individual harmonic current magnitudes (Amps) — IEEE 519-2022 per-order checks
-    *[f"h{h}_current_{ph}" for ph in ("a", "b", "c") for h in _H519_ORDERS],
+    *[f"h{h}_current_{ph}" for ph in ("a", "b", "c") for h in _HARM_CURRENT_ORDERS],
     # Individual harmonic voltage magnitudes (Volts) — key odd orders
     *[f"h{h}_voltage_{ph}" for ph in ("a", "b", "c") for h in (3, 5, 7, 11, 13)],
     # Neutral current harmonics — triplens accumulate in neutral for zero-sequence diagnosis
@@ -123,11 +123,11 @@ _TAG_MAP: Dict[str, Dict[str, Set[str]]] = {
     # Note: standard PQDIF files use QuantityCharacteristic.Spectra with SeriesNominalQuantity
     # for the harmonic order; the h{n}/harmonic{n} strings below match Pronto label-derived channels.
     **{f"h{h}_current_a": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"an","a","phase_a"}}
-       for h in _H519_ORDERS},
+       for h in _HARM_CURRENT_ORDERS},
     **{f"h{h}_current_b": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"bn","b","phase_b"}}
-       for h in _H519_ORDERS},
+       for h in _HARM_CURRENT_ORDERS},
     **{f"h{h}_current_c": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"cn","c","phase_c"}}
-       for h in _H519_ORDERS},
+       for h in _HARM_CURRENT_ORDERS},
     **{f"h{h}_current_neutral": {"qt": {"currentharmonics"}, "qm": {f"h{h}", f"harmonic{h}", "spectra"}, "ph": {"ng","neutral","n","in","i4","phase_n"}}
        for h in (3, 5, 7, 9, 11, 13)},
     # Individual harmonic voltages
@@ -961,7 +961,8 @@ class ProntoAdapter:
     _HARM_REPORT = {
         'Van': (3, 5, 7, 11, 13), 'Vbn': (3, 5, 7, 11, 13),
         'Vcn': (3, 5, 7, 11, 13),
-        'Ia': _H519_ORDERS, 'Ib': _H519_ORDERS, 'Ic': _H519_ORDERS,
+        'Ia': _HARM_CURRENT_ORDERS, 'Ib': _HARM_CURRENT_ORDERS,
+        'Ic': _HARM_CURRENT_ORDERS,
         'In': (3, 5, 7, 9, 11, 13),
     }
 
