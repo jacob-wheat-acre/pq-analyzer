@@ -1366,6 +1366,30 @@ def _solar_captures() -> list[tuple]:
 #: Which fixtures carry point-on-wave captures, and what is in them. Kept apart
 #: from SCENARIOS because a capture is a separate observation, not another
 #: interval channel.
+def adaptive_frequency_channel(excursions: list[tuple], span_s: float = 900.0,
+                               step_s: float = 1.0) -> Channel:
+    """A variable-rate frequency trace, which is what Clause 6.5.2 needs.
+
+    *excursions* are ``(offset_seconds, hz, duration_seconds)``. Everything
+    else sits at nominal.
+
+    One sample a second rather than one a cycle: Table 19 counts cumulative
+    seconds within a ten-minute window, so a per-second trace resolves it
+    exactly while a per-cycle one would be sixty times the data for no more
+    answer. What a five-minute average cannot do is any of it -- twenty
+    seconds at 57.5 Hz leaves the mean at 60.0.
+    """
+    n = int(round(span_s / step_s)) + 1
+    t = np.arange(n, dtype=float) * step_s
+    hz = np.full(n, 60.0, dtype=float)
+    for off, value, dur in excursions:
+        hz[(t >= off) & (t < off + dur)] = value
+    return Channel("Frequency adaptive", "none", "voltage", 'VALUELOG', [
+        Series('TIME', 'INSTANTANEOUS', 's', t),
+        Series('AVG', 'FREQUENCY', 'Hz', hz),
+    ])
+
+
 def _producer_adaptive() -> list[tuple]:
     """Three events the ride-through table grades differently, on one plant.
 
@@ -1381,7 +1405,13 @@ def _producer_adaptive() -> list[tuple]:
             [(1.0, 0.85, 0.30, "a"),
              (4.0, 0.25, 0.10, "b"),
              (7.0, 1.12, 0.50, "c")],
-            nominal=277.0),
+            nominal=277.0)
+        # Two frequency excursions the clause treats oppositely: 58.2 Hz for
+        # 40 s is mandatory operation well inside the 299 s allowance, so the
+        # plant owes the system continued operation. 56.5 Hz is below 57.0,
+        # where Table 19 has no ride-through requirement at all.
+        + [adaptive_frequency_channel([(120.0, 58.2, 40.0),
+                                       (400.0, 56.5, 5.0)])],
         START_TIME + timedelta(hours=11),
     )]
 

@@ -2264,6 +2264,134 @@ class TestRideThroughAgainstMeasuredEvents:
         assert depths == pytest.approx([25.0, 85.0, 112.0], abs=0.5)
 
 
+class TestFrequencyRideThrough:
+    """IEEE 1547-2018 Clause 6.5.2 and Table 19.
+
+    Two things about this clause are easy to encode backwards, so both are
+    pinned. The 299 s is a condition on the requirement rather than a limit on
+    the plant -- past it the obligation lapses and tripping is allowed. And
+    continuous operation needs V/f <= 1.1 as well as the frequency band, so
+    frequency alone does not establish it.
+    """
+
+    @staticmethod
+    def _ds(freq_series=None, interval_freq=None):
+        """A dataset carrying frequency in one record or the other."""
+        import pandas as pd
+
+        class _DS:
+            pass
+
+        ds = _DS()
+        idx = pd.date_range("2025-06-25", periods=12, freq="5min", tz="UTC")
+        ds.df = pd.DataFrame({
+            "voltage_a": [277.0] * 12,
+            "frequency": interval_freq if interval_freq is not None else [60.0] * 12,
+        }, index=idx)
+        if freq_series is None:
+            ds.adaptive_df = None
+        else:
+            n = len(freq_series)
+            aidx = pd.date_range("2025-06-25", periods=n, freq="1s", tz="UTC")
+            ds.adaptive_df = pd.DataFrame({"adap_freq": freq_series}, index=aidx)
+        return ds
+
+    @staticmethod
+    def _t(**kw):
+        kw.setdefault("service_role", "generation")
+        return Thresholds(nominal_voltage=277.0, **kw)
+
+    def test_table_19_is_the_same_for_every_category(self):
+        # Unlike the voltage tables. The category changes only how much active
+        # power must be held (Table 20), not whether to ride through.
+        from pq_constants import frequency_ride_through_region
+        a = frequency_ride_through_region(58.0)
+        assert a["mode"] == "mandatory" and a["min_ride_s"] == 299.0
+
+    def test_the_band_above_61_8_is_reported_as_unspecified(self):
+        # No Table 19 row covers 61.8 to 62.0, and 6.5.2.4.1 puts the
+        # high-frequency requirement at "greater than 61.2 and at most 61.8".
+        # Resolving the gap silently either way would be inventing a rule.
+        from pq_constants import frequency_ride_through_region
+        assert frequency_ride_through_region(61.9)["mode"] == "unspecified"
+        assert frequency_ride_through_region(62.5)["mode"] == "none"
+
+    def test_an_excursion_inside_the_allowance_obliges_the_plant(self):
+        from pq_analysis import check_frequency_ride_through
+        r = check_frequency_ride_through(
+            self._ds([60.0] * 30 + [58.2] * 40 + [60.0] * 30), self._t())
+        assert r["source"] == "variable-rate" and r["assessable"] is True
+        e = r["excursions"][0]
+        assert e["region"] == "Mandatory Operation"
+        assert e["must_not_trip"] is True
+        assert e["cumulative_s"] == pytest.approx(40.0, abs=1.5)
+
+    def test_past_the_allowance_the_obligation_lapses(self):
+        # 299 s is a condition on the requirement, not a limit on the plant.
+        from pq_analysis import check_frequency_ride_through
+        r = check_frequency_ride_through(
+            self._ds([60.0] * 5 + [58.2] * 320 + [60.0] * 5), self._t())
+        e = r["excursions"][0]
+        assert e["cumulative_s"] > 299.0
+        assert e["within_allowance"] is False
+        assert e["must_not_trip"] is False
+        assert r["n_beyond_requirement"] == 1
+
+    def test_below_57_hz_carries_no_ride_through_requirement(self):
+        from pq_analysis import check_frequency_ride_through
+        r = check_frequency_ride_through(
+            self._ds([60.0] * 10 + [56.5] * 5 + [60.0] * 10), self._t())
+        assert r["excursions"][0]["mode"] == "none"
+        assert r["excursions"][0]["must_not_trip"] is False
+
+    def test_a_quiet_recording_says_so_from_the_right_record(self):
+        from pq_analysis import check_frequency_ride_through
+        r = check_frequency_ride_through(self._ds([60.0] * 60), self._t())
+        assert r["assessable"] is True
+        assert r["n_excursions"] == 0
+        assert "variable-rate" in r["note"]
+
+    def test_interval_averages_are_not_allowed_to_read_as_a_pass(self):
+        # The whole point of the tier: an average cannot rule an excursion out.
+        from pq_analysis import check_frequency_ride_through
+        r = check_frequency_ride_through(self._ds(freq_series=None), self._t())
+        assert r["available"] is True
+        assert r["assessable"] is False
+        assert r["source"] == "interval-average"
+        assert "does not establish it" in r["note"]
+        assert r["excursions"] == []
+
+    def test_the_v_over_f_condition_on_continuous_operation_is_checked(self):
+        # 6.5.2.2 requires V/f <= 1.1 as well as the band.
+        from pq_analysis import check_frequency_ride_through
+        r = check_frequency_ride_through(self._ds([60.0] * 60), self._t())
+        assert r["v_over_f"]["limit"] == 1.1
+        assert r["v_over_f"]["within"] is True
+        # Push the voltage up and the ratio should follow it out of bounds.
+        ds = self._ds([60.0] * 60)
+        ds.df["voltage_a"] = 277.0 * 1.15
+        assert check_frequency_ride_through(ds, self._t())["v_over_f"]["within"] is False
+
+    def test_a_service_without_generation_is_not_assessed(self):
+        from pq_analysis import check_frequency_ride_through
+        r = check_frequency_ride_through(self._ds([60.0] * 10),
+                                         Thresholds(nominal_voltage=277.0))
+        assert r["available"] is False
+
+    def test_it_runs_end_to_end_from_the_fixture(self):
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pq_analysis import check_frequency_ride_through
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        assert "adap_freq" in ds.adaptive_df.columns
+        r = check_frequency_ride_through(ds, self._t(der_category="II"))
+        assert r["source"] == "variable-rate"
+        assert r["n_excursions"] == 2
+        assert r["n_required_to_ride_through"] == 1
+        assert r["active_power_capability"] == "the pre-disturbance active power output"
+
+
 class TestTheLetterToAProducer:
     """A plant is not a customer with unusual load, and reads nothing like one.
 

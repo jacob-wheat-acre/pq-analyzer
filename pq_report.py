@@ -31,7 +31,7 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
-from pq_analysis import (check_ride_through,
+from pq_analysis import (check_ride_through, check_frequency_ride_through,
                          _IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
                          _MIN_LOADED_AMPS, _VOLTAGE_RESOLUTION_V,
                          applicable_current_standard, check_trd, exports_power,
@@ -438,6 +438,7 @@ def generate_report(
         # The plant-side counterpart of ITIC. Derived here rather than passed
         # in: it needs only the events and the thresholds, both already to hand.
         "ride_through":                 check_ride_through(event_result, thresh),
+        "frequency_ride_through":       check_frequency_ride_through(ds, thresh),
         "neutral_health":               neutral_health_result or {"available": False, "reason": "not run"},
         "service_impedance":            impedance_result or {"available": False,
                                                              "reason": "not evaluated"},
@@ -6133,6 +6134,56 @@ def _customer_conditions(report: dict, thresh: Thresholds) -> List[dict]:
                 "supplier; one that lines up with an event outside it is the "
                 "plant behaving as the standard expects."),
         })
+
+    # ── Frequency ride-through, for a plant ───────────────────────────────
+    frt = report.get("frequency_ride_through") or {}
+    if vocab["register"].get("generating") and frt.get("available"):
+        if frt.get("assessable") and frt.get("n_excursions"):
+            worst = frt["worst"]
+            obliged = frt["n_required_to_ride_through"]
+            power = frt.get("active_power_capability")
+            out.append({
+                "headline": "System frequency left the continuous operation band",
+                "measured": (
+                    f"{frt['n_excursions']} frequency excursion"
+                    f"{'s' if frt['n_excursions'] != 1 else ''} outside "
+                    f"58.8-61.2 Hz, the furthest reaching "
+                    f"{_m(worst['extreme_hz'], '.2f', ' Hz')} for "
+                    f"{_m(worst['duration_s'], '.0f', ' s')}. "
+                    f"{obliged} fell in the mandatory operation region of IEEE "
+                    f"1547-2018 Table 19."),
+                "means": (
+                    "Frequency is a property of the interconnection rather than "
+                    "of your service or ours, so this is not something either "
+                    "of us caused locally. What it bears on is your plant: in "
+                    "the mandatory operation region the plant is required to "
+                    "stay synchronised and keep exchanging power"
+                    + (f", holding active power at {power}, per Table 20."
+                       if power else ".")
+                    + " Table 19 is the same for all three performance "
+                    "categories, so the category does not change whether the "
+                    "plant must ride through, only how much power it must hold."),
+                "symptom": (
+                    "If the plant came off line during one of these, the "
+                    "under-frequency and over-frequency protection settings are "
+                    "the place to look. Note that an excursion past 299 s "
+                    "cumulative in a ten-minute window releases the plant from "
+                    "the obligation, so a long event is not the same case as a "
+                    "short one."),
+            })
+        elif frt.get("assessable") is False:
+            out.append({
+                "headline": "Frequency was not assessed against Clause 6.5.2",
+                "measured": (
+                    f"Frequency was recorded only as interval averages, ranging "
+                    f"{_m(frt.get('min_hz'), '.2f')} to "
+                    f"{_m(frt.get('max_hz'), '.2f', ' Hz')}."),
+                "means": frt.get("note", ""),
+                "symptom": (
+                    "If you have reason to think the plant tripped on "
+                    "frequency, a recording with the variable-rate record "
+                    "enabled would settle it; this one cannot."),
+            })
 
     # ── Load balance across the service ───────────────────────────────────
     if ci.get("available") and ci.get("pct_exceeding", 0) > 0:

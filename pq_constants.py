@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.50.0"
+__version__ = "0.51.0"
 
 
 @dataclass
@@ -565,6 +565,87 @@ def ride_through_region(category: str, v_pu: float) -> Optional[dict]:
             "v_high_pu":   high,
         }
     return None
+
+
+# ── IEEE 1547-2018 Clause 6.5.2: frequency ride-through ──────────────────────
+#
+# Table 19, and unlike the voltage tables it is the same for all three
+# categories -- the category only changes how much active power the plant must
+# hold up during the excursion (Table 20), not whether it must stay on.
+#
+# The scale is nothing like the voltage side: the minimum times are 299 s and
+# the continuous band is indefinite.  This is a minutes-long requirement, which
+# is why a recording can speak to it at all.
+#
+# Two things are easy to encode backwards:
+#
+#   * The 299 s is not a limit on the plant.  6.5.2.3.1 and 6.5.2.4.1 make it a
+#     *precondition on the requirement*: the plant must ride through an
+#     excursion "having a cumulative duration below 58.8 Hz of less than 299 s
+#     in any ten-minute period".  Past that, the obligation lapses and the
+#     plant may trip.
+#   * Continuous operation carries a second condition -- 6.5.2.2 requires
+#     58.8 to 61.2 Hz *and* a per-unit V/f ratio of 1.1 or less.  Frequency
+#     alone does not establish it.
+
+#: Table 19, as ``(f_low, f_high, low_closed, high_closed, mode, minimum s)``.
+#: "none" is the table's "No ride-through requirements apply to this range".
+#: The band above 61.8 Hz to 62.0 Hz is left unspecified by the table: no row
+#: covers it, and 6.5.2.4.1 puts the high-frequency requirement at "greater
+#: than 61.2 Hz and less than or equal to 61.8 Hz".  It is reported as
+#: unspecified rather than quietly resolved either way.
+_FREQ_RIDE_THROUGH: List[tuple] = [
+    (62.0, None, False, False, "none",        None),
+    (61.8, 62.0, False, True,  "unspecified", None),
+    (61.2, 61.8, False, True,  "mandatory",   299.0),
+    (58.8, 61.2, True,  True,  "continuous",  math.inf),
+    (57.0, 58.8, True,  False, "mandatory",   299.0),
+    (None, 57.0, False, False, "none",        None),
+]
+
+#: 6.5.2.2 / Table 19 footnote c: the continuous region holds only while the
+#: per-unit voltage-to-frequency ratio stays at or below this.
+FREQ_CONTINUOUS_MAX_V_OVER_F = 1.1
+
+#: The window the cumulative duration is counted over, and the allowance in it.
+FREQ_CUMULATIVE_WINDOW_S = 600.0
+FREQ_CUMULATIVE_ALLOWANCE_S = 299.0
+
+#: Table 20: active power the plant must hold during a low-frequency
+#: excursion. The one place the category matters on the frequency side.
+FREQ_ACTIVE_POWER_CAPABILITY = {
+    "I":   ("80% of nameplate active power rating, or the pre-disturbance "
+            "active power output, whichever is less"),
+    "II":  "the pre-disturbance active power output",
+    "III": "the pre-disturbance active power output",
+}
+
+
+def frequency_ride_through_region(hz: float) -> dict:
+    """The Table 19 row a frequency falls in.
+
+    Frequency alone does not settle the continuous region -- 6.5.2.2 also
+    requires V/f <= 1.1 -- so the caller checks that separately.
+    """
+    for low, high, low_closed, high_closed, mode, minimum in _FREQ_RIDE_THROUGH:
+        if low is not None:
+            if hz < low or (hz == low and not low_closed):
+                continue
+        if high is not None:
+            if hz > high or (hz == high and not high_closed):
+                continue
+        return {
+            "mode":       mode,
+            "label":      RIDE_THROUGH_MODES.get(mode, {
+                "none":        "No ride-through requirement",
+                "unspecified": "Not specified by Table 19",
+            }.get(mode, mode)),
+            "min_ride_s": minimum,
+            "f_low_hz":   low,
+            "f_high_hz":  high,
+        }
+    return {"mode": "none", "label": "No ride-through requirement",
+            "min_ride_s": None, "f_low_hz": None, "f_high_hz": None}
 
 
 #: Current harmonic orders the adapter exposes.  It has to be the union of what

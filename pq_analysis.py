@@ -41,6 +41,11 @@ from pq_constants import (
     _h519_limit,
     _h1547_limit,
     ride_through_region,
+    frequency_ride_through_region,
+    FREQ_ACTIVE_POWER_CAPABILITY,
+    FREQ_CONTINUOUS_MAX_V_OVER_F,
+    FREQ_CUMULATIVE_ALLOWANCE_S,
+    FREQ_CUMULATIVE_WINDOW_S,
     _impedance_range,
     expected_service_impedance,
     _itic_lower_v,
@@ -4474,6 +4479,186 @@ def check_ride_through(event_result: dict, thresh: Thresholds) -> dict:
         ],
     })
     return result
+
+
+def check_frequency_ride_through(ds: PQDataset, thresh: Thresholds) -> dict:
+    """Measured frequency against IEEE 1547-2018 Clause 6.5.2 and Table 19.
+
+    The frequency counterpart of `check_ride_through`, and it needs a different
+    kind of data.  Table 19 is a minutes-long requirement -- 299 s minimum
+    times, continuous operation indefinitely -- so unlike the voltage side it
+    is not defeated by a coarse record outright.  What defeats it is averaging:
+    twenty seconds at 57.5 Hz vanishes inside a five-minute mean of 60.0, and
+    the standard counts cumulative time outside the band, which a mean cannot
+    reconstruct.
+
+    So which record this ran on is part of the answer and is reported with it.
+    The variable-rate record carries frequency sample by sample and supports
+    the clause properly; interval averages can show the averages never left the
+    continuous band, which is a weaker statement and is labelled as one rather
+    than being allowed to read as a pass.
+    """
+    result: dict = {
+        "available": False, "source": None, "excursions": [],
+        "n_excursions": 0, "n_required_to_ride_through": 0,
+        "n_beyond_requirement": 0,
+    }
+
+    if not exports_power(thresh):
+        result["note"] = ("Clause 6.5 applies to a distributed energy resource. "
+                          "This service has none.")
+        return result
+
+    adf = ds.adaptive_df
+    series = None
+    if adf is not None and "adap_freq" in getattr(adf, "columns", []):
+        series = adf["adap_freq"].dropna()
+        source = "variable-rate"
+    if series is None or len(series) < 2:
+        if "frequency" not in ds.df.columns or ds.df["frequency"].notna().sum() == 0:
+            result["note"] = "No frequency channel in this recording."
+            return result
+        series = ds.df["frequency"].dropna()
+        source = "interval-average"
+    result["source"] = source
+
+    lo, hi = 58.8, 61.2
+    outside = (series < lo) | (series > hi)
+
+    if source == "interval-average":
+        # An average cannot rule an excursion out, so it does not get to say
+        # one did not happen -- only that nothing survived the averaging.
+        result.update({
+            "available": True,
+            "assessable": False,
+            "n_intervals_outside": int(outside.sum()),
+            "min_hz": round(float(series.min()), 3),
+            "max_hz": round(float(series.max()), 3),
+            "note": (
+                "This recording carries frequency only as interval averages. "
+                "IEEE 1547 Clause 6.5.2 counts cumulative time outside "
+                f"{lo}-{hi} Hz within a ten-minute window, which an average "
+                "cannot reconstruct: a twenty-second excursion to 57.5 Hz "
+                "leaves a five-minute mean sitting at 60.0. The averages "
+                + ("stayed within the continuous operation band, which is "
+                   "consistent with compliance but does not establish it."
+                   if not outside.any() else
+                   f"left the continuous band in {int(outside.sum())} "
+                   "interval(s), which is enough to warrant a variable-rate "
+                   "recording but not enough to grade against Table 19.")
+            ),
+        })
+        return result
+
+    # Variable-rate: the clause can be applied as written.
+    idx = series.index
+    step = pd.Series(idx).diff().dt.total_seconds()
+    step.iloc[0] = step.iloc[1] if len(step) > 1 else 1.0
+    step = step.to_numpy()
+
+    # Cumulative seconds outside the band in any ten-minute window, counted
+    # separately below and above: 6.5.2.3.1 and 6.5.2.4.1 each say "cumulative
+    # duration below 58.8 Hz" / "above 61.2 Hz", not the two combined.
+    def _rolling_seconds(mask) -> np.ndarray:
+        secs = pd.Series(np.where(mask.to_numpy(), step, 0.0), index=idx)
+        return secs.rolling(f"{int(FREQ_CUMULATIVE_WINDOW_S)}s").sum().to_numpy()
+
+    below, above = series < lo, series > hi
+    roll_below, roll_above = _rolling_seconds(below), _rolling_seconds(above)
+
+    # Contiguous runs outside the band become excursions.
+    excursions: List[dict] = []
+    run_start = None
+    arr, values = outside.to_numpy(), series.to_numpy()
+    for i, flag in enumerate(list(arr) + [False]):
+        if flag and run_start is None:
+            run_start = i
+        elif not flag and run_start is not None:
+            sl = slice(run_start, i)
+            worst_i = (int(np.argmin(values[sl])) if below.to_numpy()[run_start]
+                       else int(np.argmax(values[sl]))) + run_start
+            hz = float(values[worst_i])
+            region = frequency_ride_through_region(hz)
+            direction = "below" if hz < lo else "above"
+            cumulative = float((roll_below if direction == "below"
+                                else roll_above)[max(sl.stop - 1, 0)])
+            within_allowance = cumulative < FREQ_CUMULATIVE_ALLOWANCE_S
+            must_not_trip = region["mode"] == "mandatory" and within_allowance
+            excursions.append({
+                "timestamp":     idx[run_start],
+                "direction":     direction,
+                "extreme_hz":    round(hz, 3),
+                "duration_s":    round(float(step[sl].sum()), 3),
+                "cumulative_s":  round(cumulative, 1),
+                "within_allowance": within_allowance,
+                "mode":          region["mode"],
+                "region":        region["label"],
+                "must_not_trip": must_not_trip,
+            })
+            run_start = None
+
+    excursions.sort(key=lambda e: abs(e["extreme_hz"] - 60.0), reverse=True)
+    obliged = [e for e in excursions if e["must_not_trip"]]
+
+    # 6.5.2.2 puts a second condition on the continuous band that frequency
+    # alone does not establish.
+    vf = _voltage_over_frequency(ds, thresh)
+
+    result.update({
+        "available":   True,
+        "assessable":  True,
+        "excursions":  excursions,
+        "n_excursions": len(excursions),
+        "n_required_to_ride_through": len(obliged),
+        "n_beyond_requirement": len(excursions) - len(obliged),
+        "worst":       excursions[0] if excursions else None,
+        "min_hz":      round(float(series.min()), 3),
+        "max_hz":      round(float(series.max()), 3),
+        "v_over_f":    vf,
+        "active_power_capability":
+            FREQ_ACTIVE_POWER_CAPABILITY.get(thresh.der_category or ""),
+        "note": (
+            "Measured from the variable-rate record, so cumulative time "
+            "outside the continuous band is counted as Clause 6.5.2 defines "
+            "it." if excursions else
+            "Frequency stayed within the 58.8-61.2 Hz continuous operation "
+            "band for the whole recording, measured from the variable-rate "
+            "record rather than from averages."),
+        "caveats": [
+            "Table 19 is the same for all three performance categories; the "
+            "category changes only how much active power the plant must hold "
+            "up during the excursion, per Table 20.",
+            "The 299 s in Table 19 is a condition on the requirement, not a "
+            "limit on the plant: past that much cumulative time outside the "
+            "band in a ten-minute window, the obligation to ride through "
+            "lapses and tripping is permitted.",
+        ],
+    })
+    return result
+
+
+def _voltage_over_frequency(ds: PQDataset, thresh: Thresholds) -> Optional[dict]:
+    """The per-unit V/f ratio 6.5.2.2 attaches to continuous operation.
+
+    Continuous operation is not frequency alone: the clause requires the ratio
+    to stay at or below 1.1 as well, and a report that checked only the band
+    would be claiming more than it measured.
+    """
+    v_cols = [c for c in ("voltage_a", "voltage_b", "voltage_c")
+              if c in ds.df.columns]
+    if not v_cols or "frequency" not in ds.df.columns or not thresh.nominal_voltage:
+        return None
+    v_pu = ds.df[v_cols].max(axis=1) / thresh.nominal_voltage
+    f_pu = ds.df["frequency"] / thresh.frequency_nominal
+    ratio = (v_pu / f_pu).dropna()
+    if ratio.empty:
+        return None
+    worst = float(ratio.max())
+    return {
+        "max_ratio": round(worst, 3),
+        "limit":     FREQ_CONTINUOUS_MAX_V_OVER_F,
+        "within":    worst <= FREQ_CONTINUOUS_MAX_V_OVER_F,
+    }
 
 
 def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List[dict]:
