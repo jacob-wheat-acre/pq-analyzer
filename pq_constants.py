@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.51.1"
+__version__ = "0.52.0"
 
 
 @dataclass

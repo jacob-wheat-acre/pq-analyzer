@@ -4354,6 +4354,124 @@ def check_itic(event_result: dict, thresh: Thresholds) -> dict:
     }
 
 
+#: PSCo Sheet R123: the spread between the highest and lowest phase at which
+#: the Company may recompute billing demand from the worst phase.
+_R123_SPREAD_PCT = 15.0
+
+#: The power factor the same clause converts kVA to kW at, whatever the
+#: customer's actual one is. The figure matches Sheet R73's "rates contemplate
+#: ... not less than ninety percent (90%) lagging".
+_R123_ASSUMED_PF = 0.90
+
+
+def check_billing_demand_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """PSCo Sheet R123's phase-spread provision, evaluated at the peak interval.
+
+    Not a power quality finding and not a compliance test -- nothing here is
+    being violated. It is a cost the customer may already be paying without
+    knowing why, and which balancing the panel would remove.
+
+    The clause reads: where the load on any one phase exceeds the load on any
+    other by more than fifteen percent, the Company *may* take as the billing
+    demand "the three-phase equivalent of the maximum kilovolt-amperes in any
+    phase adjusted to a ninety percent (90%) Power Factor" -- that is,
+    3 x the worst phase's kVA x 0.90.
+
+    Only the peak matters. Billing demand is set by the maximum demand interval
+    of the month, so imbalance at 3 a.m. costs nothing and imbalance at the
+    peak costs the whole uplift. Averaging the spread across a recording would
+    answer a question nobody is billed on, which is why this looks only at the
+    interval that set the peak, and reports the recording-wide count separately
+    as context rather than as the finding.
+
+    The uplift works out to the worst phase over the mean phase, so the trigger
+    and the cost are measured differently: 100/100/120 A trips a 20% spread but
+    carries a 12.5% uplift.
+    """
+    result: dict = {"available": False, "applies": False}
+
+    geometry = service_geometry(thresh, df.columns)
+    if geometry != "three-phase":
+        result["note"] = ("Sheet R123's phase provision applies to three-phase "
+                          "service.")
+        return result
+    # Schedule C has no demand charge -- only service, facility and energy --
+    # so there is no billing demand for the clause to recompute. Raising it
+    # with a customer who cannot be billed on it would be a false alarm.
+    if thresh.customer_class not in ("sg", "pg"):
+        result["note"] = ("This schedule carries no demand charge, so there is "
+                          "no billing demand for Sheet R123 to recompute.")
+        return result
+
+    i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
+    if len(i_cols) < 3:
+        result["note"] = "Three-phase currents are needed to evaluate the spread."
+        return result
+
+    # The peak demand interval, on the same apparent-power basis check_demand
+    # uses, so the two sections cannot disagree about when the peak was.
+    if "power_real" in df.columns and "power_reactive" in df.columns:
+        apparent = np.sqrt(df["power_real"] ** 2 + df["power_reactive"] ** 2)
+    elif "power_real" in df.columns and "power_factor" in df.columns:
+        apparent = df["power_real"] / df["power_factor"].replace(0, np.nan)
+    else:
+        apparent = df[i_cols].sum(axis=1) * thresh.nominal_voltage
+    apparent = apparent.dropna()
+    if apparent.empty:
+        result["note"] = "No demand data to locate the peak interval."
+        return result
+
+    peak_ts = apparent.abs().idxmax()
+    phases = df.loc[peak_ts, i_cols].astype(float)
+    if phases.isna().any() or float(phases.min()) <= 0:
+        result["note"] = "The peak interval has no usable per-phase current."
+        return result
+
+    hi, lo = float(phases.max()), float(phases.min())
+    spread = (hi - lo) / lo * 100.0
+    mean_a = float(phases.mean())
+
+    # How often the spread is exceeded at all. Context, not the finding: a
+    # different month's peak may land on one of these intervals.
+    all_hi, all_lo = df[i_cols].max(axis=1), df[i_cols].min(axis=1)
+    valid = all_lo > 0
+    over = ((all_hi - all_lo) / all_lo * 100.0)[valid] > _R123_SPREAD_PCT
+
+    v_ln = thresh.nominal_voltage
+    measured_kva = float(phases.sum()) * v_ln / 1000.0
+    clause_kva   = 3.0 * hi * v_ln / 1000.0
+
+    result.update({
+        "available":       True,
+        "applies":         spread > _R123_SPREAD_PCT,
+        "peak_timestamp":  peak_ts,
+        "phase_amps":      {c[-1]: round(float(phases[c]), 1) for c in i_cols},
+        "spread_pct":      round(spread, 1),
+        "threshold_pct":   _R123_SPREAD_PCT,
+        "worst_phase":     str(phases.idxmax())[-1],
+        "measured_kva":    round(measured_kva, 1),
+        "measured_kw":     round(measured_kva * _R123_ASSUMED_PF, 1),
+        "clause_kva":      round(clause_kva, 1),
+        "clause_kw":       round(clause_kva * _R123_ASSUMED_PF, 1),
+        # The uplift is the worst phase over the mean phase, which is why the
+        # trigger (max against min) and the cost do not match.
+        "uplift":          round(hi / mean_a, 3),
+        "uplift_pct":      round((hi / mean_a - 1.0) * 100.0, 1),
+        "assumed_pf":      _R123_ASSUMED_PF,
+        "intervals_over":  int(over.sum()),
+        "intervals_total": int(valid.sum()),
+        "caveats": [
+            "Billing demand is set by the peak demand interval, so this is "
+            "evaluated there rather than averaged over the recording. A month "
+            "whose peak falls on a different interval may read differently.",
+            "This recording's intervals may not be the interval the bill is "
+            "computed on, and the clause is discretionary \u2014 it says the "
+            "Company may take billing demand this way, not that it does.",
+        ],
+    })
+    return result
+
+
 def check_ride_through(event_result: dict, thresh: Thresholds) -> dict:
     """Measured voltage events against IEEE 1547-2018 Clause 6.4.2.
 

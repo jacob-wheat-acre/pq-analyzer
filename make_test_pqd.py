@@ -904,6 +904,80 @@ def make_commercial_large() -> tuple[list[str], list[np.ndarray]]:
     return labels, arrays
 
 
+def make_commercial_imbalanced() -> tuple[list[str], list[np.ndarray]]:
+    """A 277/480 SG service whose single-phase load is spread unevenly.
+
+    The ordinary way a panel ends up imbalanced: lighting and receptacle
+    circuits added over years, each landed on whichever phase was convenient.
+    Nothing here is a fault. It exists so the Sheet R123 billing provision has
+    something to act on -- the spread has to be present at the peak interval,
+    because that is the only interval billing demand is taken from.
+    """
+    n = N_SAMPLES
+    hours = T_SEC / 3600.0
+    # A weekday shape peaking mid-afternoon.
+    duty = 0.35 + 0.65 * np.clip(np.sin((hours - 6.0) / 14.0 * np.pi), 0, None)
+
+    van = np.full(n, 279.0) + _noise(n, 0.5)
+    vbn = np.full(n, 277.5) + _noise(n, 0.5)
+    vcn = np.full(n, 274.0) + _noise(n, 0.5)   # sags under the heavier phase
+
+    # Phase C carries the extra single-phase load throughout, so the spread is
+    # there at the peak and not only on average.
+    ia = 100.0 * duty + _noise(n, 0.8)
+    ib = 105.0 * duty + _noise(n, 0.8)
+    ic = 148.0 * duty + _noise(n, 0.8)
+    in_ = 38.0 * duty + _noise(n, 0.5)         # the imbalance returns here
+
+    kw   = 92_000.0 * duty + _noise(n, 400.0)
+    kvar = 26_000.0 * duty + _noise(n, 200.0)
+    pf   = np.clip(kw / np.sqrt(kw**2 + kvar**2) + _noise(n, 0.003), 0.8, 1.0)
+
+    thd_van = np.clip(2.6 + _noise(n, 0.3), 0.5, 7.9)
+    thd_vbn = np.clip(2.5 + _noise(n, 0.3), 0.5, 7.9)
+    thd_vcn = np.clip(2.8 + _noise(n, 0.3), 0.5, 7.9)
+
+    pst = np.full(n, 0.32) + _noise(n, 0.04)
+    plt = np.full(n, 0.20) + _noise(n, 0.03)
+    kfactor = np.full(n, 2.0) + _noise(n, 0.1)
+
+    def vh(base: float) -> np.ndarray:
+        return np.clip(base + _noise(n, 0.08), 0.01, 15.0)
+
+    h3va = vh(1.2); h5va = vh(1.9); h7va = vh(1.3); h11va = vh(0.5); h13va = vh(0.4)
+    h3vb = vh(1.2); h5vb = vh(1.9); h7vb = vh(1.3); h11vb = vh(0.5); h13vb = vh(0.4)
+    h3vc = vh(1.4); h5vc = vh(2.1); h7vc = vh(1.4); h11vc = vh(0.6); h13vc = vh(0.4)
+
+    def ih(vals, scale=1.0):
+        return [np.clip(v * scale * duty + _noise(n, 0.05), 0.01, 50.0)
+                for v in vals]
+
+    base = [0.3, 0.8, 0.3, 2.6, 0.3, 1.7, 0.2, 0.5, 0.2, 0.9, 0.2, 0.6]
+    ia_h = ih(base); ib_h = ih(base, 1.05); ic_h = ih(base, 1.45)
+    in_h = ih([0.2, 1.4, 0.2, 0.3, 0.2, 0.3, 0.1, 0.2, 0.1, 0.2, 0.1, 0.2])
+
+    labels = [
+        'Harm 1 of Van', 'Harm 1 of Vbn', 'Harm 1 of Vcn',
+        'Harm 1 of Ia', 'Harm 1 of Ib', 'Harm 1 of Ic', 'Harm 1 of In',
+        f'3{PHI} 4w Real Power', f'3{PHI} 4w VA Reactive', f'3{PHI} 4w Power Factor',
+        'THD Van (V1)', 'THD Vbn (V2)', 'THD Vcn (V3)',
+        'K-Factor Ia', 'Flicker PST Van (V1)', 'Flicker PLT Van (V1)',
+        *_harm_labels('Van', _H_VOLT), *_harm_labels('Vbn', _H_VOLT),
+        *_harm_labels('Vcn', _H_VOLT),
+        *_harm_labels('Ia', _H_CURR), *_harm_labels('Ib', _H_CURR),
+        *_harm_labels('Ic', _H_CURR), *_harm_labels('In', _H_CURR),
+    ]
+    arrays = [
+        van, vbn, vcn, ia, ib, ic, in_, kw, kvar, pf,
+        thd_van, thd_vbn, thd_vcn, kfactor, pst, plt,
+        h3va, h5va, h7va, h11va, h13va,
+        h3vb, h5vb, h7vb, h11vb, h13vb,
+        h3vc, h5vc, h7vc, h11vc, h13vc,
+        *ia_h, *ib_h, *ic_h, *in_h,
+    ]
+    return labels, arrays
+
+
 def make_solar_net_metered() -> tuple[list[str], list[np.ndarray]]:
     """3-phase 277/480 V on Schedule SG with an inverter: output collapses nightly.
 
@@ -1206,6 +1280,7 @@ SCENARIOS = [
     ("test_commercial_primary.pqd", make_commercial_primary),
     ("test_solar_net_metered.pqd",  make_solar_net_metered),
     ("test_producer_array.pqd",     make_producer_array),
+    ("test_commercial_imbalanced.pqd", make_commercial_imbalanced),
 ]
 
 

@@ -32,6 +32,7 @@ from pq_constants import (
 )
 from pq_adapter import PQDataset
 from pq_analysis import (check_ride_through, check_frequency_ride_through,
+                         check_billing_demand_imbalance,
                          _IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
                          _MIN_LOADED_AMPS, _VOLTAGE_RESOLUTION_V,
                          applicable_current_standard, check_trd, exports_power,
@@ -439,6 +440,7 @@ def generate_report(
         # in: it needs only the events and the thresholds, both already to hand.
         "ride_through":                 check_ride_through(event_result, thresh),
         "frequency_ride_through":       check_frequency_ride_through(ds, thresh),
+        "billing_demand_imbalance":     check_billing_demand_imbalance(ds.df, thresh),
         "neutral_health":               neutral_health_result or {"available": False, "reason": "not run"},
         "service_impedance":            impedance_result or {"available": False,
                                                              "reason": "not evaluated"},
@@ -6402,6 +6404,84 @@ def generate_customer_letter(
             rr = cells[3].paragraphs[0].add_run(chk["result"])
             rr.font.size = Pt(9.5)
             rr.bold = chk["result"] == "Outside limits"
+        doc.add_paragraph()
+
+    # ── Billing demand and the phase spread ───────────────────────────────
+    # Its own section, deliberately after the compliance table and outside it.
+    # Nothing here is a limit and nothing is being violated -- this is a cost
+    # the customer may be carrying without knowing the cause, and one that
+    # balancing the panel removes. Putting it among the standards would read as
+    # a failure; leaving it out entirely keeps a fixable charge invisible.
+    bdi = report.get("billing_demand_imbalance") or {}
+    if bdi.get("available"):
+        _section_heading(doc, "Phase balance and your billing demand", level=1)
+        if bdi["applies"]:
+            _body(doc,
+                f"This one is about cost rather than power quality, and it is "
+                f"worth raising because it is straightforward to fix.")
+            _body(doc,
+                f"Billing demand is set by the single highest demand interval "
+                f"in the month. At the peak in this recording, on "
+                f"{str(bdi['peak_timestamp'])[:16]}, your three phases were "
+                f"carrying "
+                + ", ".join(f"{p.upper()} {a:.0f} A"
+                            for p, a in sorted(bdi["phase_amps"].items()))
+                + f" — a spread of {bdi['spread_pct']:.0f}% between the highest "
+                f"and lowest.")
+            _body(doc,
+                f"PSCo Electric Tariff Sheet R123 provides that where the load "
+                f"on any one phase exceeds another by more than "
+                f"{bdi['threshold_pct']:.0f}%, the Company may take as the "
+                f"billing demand the three-phase equivalent of the highest "
+                f"phase, adjusted to a {bdi['assumed_pf']:.2f} power factor. "
+                f"In other words, you can be billed as though all three phases "
+                f"carried what phase {bdi['worst_phase'].upper()} was carrying.")
+            tbl = doc.add_table(rows=1, cols=3)
+            tbl.style = "Table Grid"
+            _set_col_widths(tbl, [6.0, 5.0, 5.5])
+            for cell, text in zip(tbl.rows[0].cells,
+                                  ["Basis", "Apparent power", "Billing demand"]):
+                _cell_shade(cell, _CHROME_BAND)
+                cell.paragraphs[0].add_run(text).bold = True
+                cell.paragraphs[0].runs[0].font.size = Pt(9)
+            for basis, kva, kw in (
+                ("Your measured demand at the peak",
+                 bdi["measured_kva"], bdi["measured_kw"]),
+                (f"Sheet R123, from phase {bdi['worst_phase'].upper()}",
+                 bdi["clause_kva"], bdi["clause_kw"]),
+            ):
+                cells = tbl.add_row().cells
+                for cell, text in zip(cells, [basis, f"{kva:,.1f} kVA",
+                                              f"{kw:,.1f} kW"]):
+                    cell.paragraphs[0].add_run(text).font.size = Pt(9)
+            _body(doc,
+                f"That is about {bdi['uplift_pct']:.0f}% more billed demand for "
+                f"the same electricity. Note the uplift is the highest phase "
+                f"against the average of the three, so it is smaller than the "
+                f"{bdi['spread_pct']:.0f}% spread that triggers the clause.")
+            _body(doc,
+                f"Moving some single-phase load off phase "
+                f"{bdi['worst_phase'].upper()} onto the lighter phases would "
+                f"bring the spread under {bdi['threshold_pct']:.0f}% and remove "
+                f"the exposure. {register['fix_agent'].capitalize()} can do this "
+                f"from your panel schedule; it does not need new equipment. It "
+                f"also reduces neutral current and the heating that goes with "
+                f"it, which is the power quality side of the same measurement.")
+            for caveat in bdi.get("caveats", []):
+                _body(doc, caveat)
+            _body(doc,
+                "We are not billing you differently on the strength of this "
+                "recording, and this is not a notice that we intend to. It is "
+                "here so you know the provision exists and can act on it.")
+        else:
+            _body(doc,
+                f"PSCo Electric Tariff Sheet R123 allows billing demand to be "
+                f"taken from the highest phase where the phases differ by more "
+                f"than {bdi['threshold_pct']:.0f}%. At your peak demand "
+                f"interval the spread was {bdi['spread_pct']:.0f}%, so the "
+                f"provision does not arise. No action needed — it is noted "
+                f"because it is a cost that catches people out, and yours is "
+                f"comfortably clear of it.")
         doc.add_paragraph()
 
     # ── What we found ─────────────────────────────────────────────────────

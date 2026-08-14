@@ -2105,6 +2105,133 @@ class TestGenerationIL:
         assert td["il_amps"] < 300.0
 
 
+class TestBillingDemandPhaseSpread:
+    """PSCo Sheet R123, reported as a cost rather than as a compliance finding.
+
+    Nothing here is violated: the clause says the Company *may* take billing
+    demand from the worst phase above a 15% spread. It is in the letter because
+    it is a charge a customer can be carrying without knowing the cause, and
+    which balancing the panel removes.
+    """
+
+    @staticmethod
+    def _ds(name):
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / f"{name}.pqd"
+        return extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+
+    @staticmethod
+    def _t(cls="sg", nominal=277.0):
+        return Thresholds(nominal_voltage=nominal, customer_class=cls)
+
+    def test_it_is_evaluated_at_the_peak_not_averaged(self):
+        # Billing demand is set by the peak interval, so imbalance at 3 a.m.
+        # costs nothing. Averaging the spread would answer a question nobody
+        # is billed on.
+        from pq_analysis import check_billing_demand_imbalance
+        ds = self._ds("test_commercial_imbalanced")
+        r = check_billing_demand_imbalance(ds.df, self._t())
+        assert r["available"] and r["applies"]
+        # The reported phases are the ones present at that timestamp.
+        at_peak = ds.df.loc[r["peak_timestamp"],
+                            ["current_a", "current_b", "current_c"]]
+        assert r["phase_amps"]["c"] == pytest.approx(float(at_peak["current_c"]), abs=0.1)
+
+    def test_the_uplift_is_worst_over_mean_not_worst_over_least(self):
+        # The trigger and the cost are measured differently, which is the part
+        # that surprises people: a 46% spread carries a 26% uplift.
+        from pq_analysis import check_billing_demand_imbalance
+        r = check_billing_demand_imbalance(
+            self._ds("test_commercial_imbalanced").df, self._t())
+        amps = r["phase_amps"]
+        expected = max(amps.values()) / (sum(amps.values()) / 3)
+        assert r["uplift"] == pytest.approx(expected, rel=0.01)
+        assert r["uplift_pct"] < r["spread_pct"]
+
+    def test_the_clause_demand_is_three_times_the_worst_phase(self):
+        from pq_analysis import check_billing_demand_imbalance
+        r = check_billing_demand_imbalance(
+            self._ds("test_commercial_imbalanced").df, self._t())
+        worst_a = max(r["phase_amps"].values())
+        assert r["clause_kva"] == pytest.approx(3 * worst_a * 277.0 / 1000, rel=0.01)
+        assert r["clause_kw"] == pytest.approx(r["clause_kva"] * 0.90, rel=0.01)
+
+    def test_a_balanced_service_does_not_trigger_it(self):
+        from pq_analysis import check_billing_demand_imbalance
+        r = check_billing_demand_imbalance(
+            self._ds("test_commercial_large").df, self._t())
+        assert r["available"] is True
+        assert r["applies"] is False
+
+    def test_schedule_c_has_no_demand_charge_so_no_finding(self):
+        # Schedule C is service, facility and energy only. There is no billing
+        # demand for the clause to recompute, so raising it would be a false
+        # alarm on a customer who cannot be billed that way.
+        from pq_analysis import check_billing_demand_imbalance
+        r = check_billing_demand_imbalance(
+            self._ds("test_commercial_imbalanced").df, self._t(cls="c"))
+        assert r["available"] is False
+        assert "no demand charge" in r["note"]
+
+    def test_a_single_phase_service_is_out_of_scope(self):
+        from pq_analysis import check_billing_demand_imbalance
+        r = check_billing_demand_imbalance(
+            self._ds("test_residential").df, self._t(cls="sg", nominal=120.0))
+        assert r["available"] is False
+        assert "three-phase" in r["note"]
+
+    def test_the_letter_carries_it_as_cost_not_as_a_violation(self, tmp_path):
+        from docx import Document
+        from pq_report import generate_customer_letter
+        import pq_analysis as An
+        from pq_report import generate_report
+        ds = self._ds("test_commercial_imbalanced")
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                        isc_amps=40000.0)
+        df = ds.df
+        ev = An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th))
+        out = generate_customer_letter(rep, th, "1 Trade St", "Eng", tmp_path, "t")
+        text = " ".join(p.text for p in Document(str(out)).paragraphs)
+        assert "Phase balance and your billing demand" in text
+        assert "R123" in text
+        # It must not read as an accusation or a billing notice.
+        assert "not billing you differently" in text
+        assert "cost rather than power quality" in text
+
+    def test_the_compliance_table_still_says_nothing_about_it(self):
+        # The whole reason it has its own section: a billing provision in a
+        # table of standards reads as something the customer is failing.
+        from pq_report import _customer_checks
+        import pq_analysis as An
+        from pq_report import generate_report
+        ds = self._ds("test_commercial_imbalanced")
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg")
+        df = ds.df
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), An.detect_events(ds, th), th)
+        joined = " ".join(f"{c['item']} {c['against']}"
+                          for c in _customer_checks(rep, th))
+        assert "R123" not in joined and "R12" not in joined
+
+
 class TestRideThroughTables:
     """IEEE 1547-2018 Tables 14, 15 and 16, transcribed and spot-checked.
 

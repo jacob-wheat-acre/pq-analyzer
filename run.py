@@ -2459,7 +2459,26 @@ class PQApp(tk.Tk):
             "above 15% their billing demand may be computed from the worst phase.\n"
             "\n"
             "The 10% figure the tool flags against is the PSCo Blue Book and NEMA MG1\n"
-            "guidance for equipment health, which is a separate matter from billing.",
+            "guidance for equipment health, which is a separate matter from billing.\n"
+            "\n"
+            "The customer letter carries this in its own section, \"Phase balance and\n"
+            "your billing demand\", deliberately outside the compliance table — a\n"
+            "billing provision sitting among the standards reads as something the\n"
+            "customer is failing. It appears only for three-phase SG and PG services,\n"
+            "because Schedule C has no demand charge for the clause to recompute.\n"
+            "\n"
+            "It is evaluated at the PEAK demand interval, not averaged: billing demand\n"
+            "is set by the single highest interval of the month, so imbalance at 3 a.m.\n"
+            "costs nothing and imbalance at the peak costs the whole uplift.\n"
+            "\n"
+            "The arithmetic, worth knowing before a customer asks:\n"
+            "\n"
+            "    billing demand = 3 x (worst phase kVA) x 0.90\n"
+            "\n"
+            "which works out to their measured demand x (worst phase / mean phase).\n"
+            "So the trigger and the cost are measured differently — 100/100/148 A is\n"
+            "a 46% spread but only a 26% uplift. The 0.90 is the same figure as Sheet\n"
+            "R73 and is applied whatever their actual power factor is.",
         )
 
         concept(
