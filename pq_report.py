@@ -1931,16 +1931,14 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
 
     # Current imbalance — a limit on three-phase service, a reported
     # measurement on two legs, where no PSCo or standard limit exists.
-    if thresh.customer_class in ("c", "sg", "pg"):
-        # Sheet R123 is a billing-demand provision, not a limit: above 15%
-        # between phases the Company "may take as the Billing Demand" the
-        # three-phase equivalent of the worst phase. Calling it a limit told a
-        # customer they were in breach of something they were not.
-        ci_label = ("Current imbalance < 10% (NEMA MG1); above 15% between "
-                    "phases PSCo Sheet R123 allows billing demand to be taken "
-                    "from the worst phase")
-    else:
-        ci_label = "Current imbalance < 10% (NEMA MG1)"
+    #
+    # The tariff's 15% phase clause (Sheet R123) is deliberately not cited
+    # here. This table states each measurement and the standard it was judged
+    # against, and R123 is neither: it sits in the billing demand provisions
+    # and its whole effect is on how a bill is computed. It sets no limit on
+    # the customer's electricity and nothing physical turns on it. The limit
+    # that does apply to imbalance is NEMA MG1, which is what this grades.
+    ci_label = "Current imbalance < 10% (NEMA MG1)"
     if ci["available"] and ci.get("limit_pct") is None:
         add_row("Leg current difference (reported, no limit applies)",
                 f"Max {_m(ci['max_imbalance_pct'], '.2f', '%')}  /  "

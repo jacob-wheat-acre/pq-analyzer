@@ -2548,12 +2548,23 @@ class TestTariffScopingIsNotMisstated:
         text = self._sources()["run.py"]
         assert "Residential customers are not contractually required" not in text
 
-    def test_the_imbalance_row_cites_r123_as_a_billing_provision(self):
-        # The compliance row a customer reads. It named R121 and called 15% a
-        # limit; the clause is R123 and it sets a charge, not a limit.
+    def test_the_imbalance_row_cites_no_tariff_sheet_at_all(self):
+        """The compliance table states measurements and the standards they
+        were judged against. The 15% phase clause is neither.
+
+        It first named R121 and called 15% a limit, which was wrong twice
+        over. Correcting it to R123 fixed the citation but left a billing
+        provision sitting in a table of power quality standards, where a
+        customer reads it as something they are failing. The limit that does
+        apply to imbalance is NEMA MG1.
+        """
         text = self._sources()["pq_report.py"]
         assert "PSCo Tariff Sheet R121 ≤ 15% for C&I" not in text
-        assert "Sheet R123" in text and "billing demand" in text.lower()
+        assert 'ci_label = "Current imbalance < 10% (NEMA MG1)"' in text
+        # No tariff sheet reaches the customer-facing imbalance wording.
+        import re
+        for m in re.finditer(r'ci_label\s*=\s*\(?"([^"]*)"', text):
+            assert "R12" not in m.group(1), m.group(1)
 
 
 class TestMixedServicePopulations:
