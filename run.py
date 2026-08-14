@@ -568,51 +568,54 @@ class PQApp(tk.Tk):
                                font=_FONT_UI)
         rated_entry.pack(side="left")
 
-        tk.Label(nm_frame, text="Non-gen load kW", bg=_BG, fg=_LABEL_FG,
-                 font=_FONT_UI).pack(side="left", padx=(10, 4))
-        self._avg_load_var = tk.StringVar(value="")
-        avg_entry = tk.Entry(nm_frame, textvariable=self._avg_load_var, width=8,
-                             font=_FONT_UI)
-        avg_entry.pack(side="left")
-
         rated_hint = tk.Label(
             nm_frame,
-            text="(load only, before generation offsets it — the two decide 519 vs 1547; see ? Help)",
+            text="(nameplate — with the demand below, decides 519 vs 1547)",
             bg=_BG, fg="#888888", font=_FONT_UI_S)
         rated_hint.pack(side="left", padx=(8, 0))
 
         def _sync_rated(*_a):
-            # Both only mean anything where there is generation, so they are
-            # greyed out rather than silently ignored.
+            # The rating only means anything where there is generation, so it
+            # is greyed out rather than silently ignored. The demand figure
+            # below applies to every service and stays enabled.
             on = _ROLE_KEY.get(self._role_var.get(), "load") != "load"
             state = "normal" if on else "disabled"
             rated_entry.configure(state=state)
-            avg_entry.configure(state=state)
             rated_hint.configure(fg="#888888" if on else "#555555")
 
         role_combo.bind("<<ComboboxSelected>>", _sync_rated)
         _sync_rated()
 
-        # ── Billing IL row ────────────────────────────────────────────────────
+        # ── Billing demand row ────────────────────────────────────────────────
+        # One figure off billing history doing two jobs, which is why it sits
+        # on its own row with its own hint rather than sharing one. The 1547
+        # category used to live here and took the hint with it, leaving the
+        # field that needed explaining without any.
         il_frame = tk.Frame(self, bg=_BG)
         il_frame.pack(fill="x", **pad)
-        tk.Label(il_frame, text="IL from billing", width=16, anchor="w",
+        tk.Label(il_frame, text="Avg peak demand", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
-        self._il_billing_var = tk.StringVar(value="")
-        tk.Entry(il_frame, textvariable=self._il_billing_var, width=10,
+        self._avg_peak_var = tk.StringVar(value="")
+        tk.Entry(il_frame, textvariable=self._avg_peak_var, width=10,
                  font=_FONT_UI).pack(side="left")
-        tk.Label(il_frame, text="A",
+        tk.Label(il_frame, text="kW",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left", padx=(4, 0))
+        tk.Label(il_frame,
+                 text="(the 12 monthly maximum demands off billing, averaged — "
+                      "gives IL, and the load side of the 519/1547 test)",
+                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(8, 0))
 
-        tk.Label(il_frame, text="1547 category", bg=_BG, fg=_LABEL_FG,
-                 font=_FONT_UI).pack(side="left", padx=(14, 4))
+        cat_frame = tk.Frame(self, bg=_BG)
+        cat_frame.pack(fill="x", **pad)
+        tk.Label(cat_frame, text="1547 category", width=16, anchor="w",
+                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
         self._der_cat_var = tk.StringVar(value="— not specified —")
-        ttk.Combobox(il_frame, textvariable=self._der_cat_var,
+        ttk.Combobox(cat_frame, textvariable=self._der_cat_var,
                      values=["— not specified —", "I", "II", "III"],
                      width=16, font=_FONT_UI, state="readonly").pack(side="left")
-        tk.Label(il_frame,
-                 text="(12 months of 15/30-min maximum demands, averaged — "
-                      "IEEE 519's own definition; blank uses the recording peak)",
+        tk.Label(cat_frame,
+                 text="(from the interconnection agreement — sets the ride-through "
+                      "the plant owes; generation sites only)",
                  bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(8, 0))
 
         # ── Service type + nominal row ─────────────────────────────────────────
@@ -1499,8 +1502,7 @@ class PQApp(tk.Tk):
             "cclass_key":     _SCHEDULE_KEY.get(self._cclass_var.get(), "sg"),
             "service_role":   _ROLE_KEY.get(self._role_var.get(), "load"),
             "rated_ac_kw":    _float_or_none(self._rated_kw_var.get()),
-            "annual_avg_load_kw": _float_or_none(self._avg_load_var.get()),
-            "il_amps_billing":    _float_or_none(self._il_billing_var.get()),
+            "avg_peak_demand_kw": _float_or_none(self._avg_peak_var.get()),
             "der_category":       (self._der_cat_var.get()
                                    if self._der_cat_var.get() in ("I", "II", "III")
                                    else None),
@@ -1614,8 +1616,7 @@ class PQApp(tk.Tk):
             customer_class=params["cclass_key"],
             service_role=params["service_role"],
             rated_ac_kw=params["rated_ac_kw"],
-            annual_avg_load_kw=params["annual_avg_load_kw"],
-            il_amps_billing=params["il_amps_billing"],
+            avg_peak_demand_kw=params["avg_peak_demand_kw"],
             der_category=params["der_category"],
             isc_amps=isc_amps,
             isc_source=isc_source,
@@ -2341,25 +2342,44 @@ class PQApp(tk.Tk):
         )
 
         concept(
-            "IL is a billing quantity, not a measurement",
-            "This one catches everyone.  519-2022 defines maximum demand load current\n"
-            "as:\n"
+            "One number off billing, doing two jobs",
+            "Enter the average of the twelve previous months' maximum demands, in\n"
+            "kW. It is one field because it is one number, and your billing history\n"
+            "already has it: take the twelve monthly demand figures, add them, divide\n"
+            "by twelve.\n"
             "\n"
-            "    the sum of the rms currents corresponding to the 15 min or 30 min\n"
-            "    maximum demand during each of the twelve previous months divided\n"
-            "    by 12\n"
+            "IL. IEEE 519-2022 defines the maximum demand load current as exactly\n"
+            "that quantity — \"the sum of the rms currents corresponding to the 15 min\n"
+            "or 30 min maximum demand during each of the twelve previous months\n"
+            "divided by 12\". No interpretation on this side; the only step the tool\n"
+            "adds is kW to amps, at a flat 0.90 power factor.\n"
             "\n"
-            "That is a year of billing history.  No week-long recording can produce it.\n"
-            "If you leave the IL field blank, this tool substitutes the largest\n"
-            "fundamental current in the recording and says so on the page — but that\n"
-            "is a stand-in, and it moves with the weather, the season and the shift\n"
-            "pattern that happened to run while the meter was on.\n"
+            "The 0.90 is deliberate and is not the measured one. Billing IL exists to\n"
+            "be a stable annual quantity; deriving it through a power factor taken\n"
+            "from one week's recording would put the recording back into the number.\n"
+            "0.90 is Sheet R73's own assumption, so two engineers with the same\n"
+            "billing data reach the same IL. Where a site runs nearer unity this\n"
+            "overstates IL, and understates every percentage measured against it.\n"
             "\n"
-            "It matters because IL is a denominator.  A recording taken in a slow week\n"
-            "gives a small IL, which inflates every percentage measured against it and\n"
-            "can manufacture a violation that a year of data would not support.  If\n"
-            "you are about to tell a customer they are outside IEEE 519, get the\n"
-            "twelve-month figure from billing first.",
+            "THE 519 vs 1547 TEST. Figure 1 asks whether rated generation is under\n"
+            "10% of \"annual average load demand\" — and that phrase appears nowhere\n"
+            "else in the standard. It has no definition entry and no stated method;\n"
+            "it exists only inside the figure. PSCo's house reading is the same\n"
+            "average-of-twelve-maxima, which keeps the standard's two demand\n"
+            "quantities consistent with each other.\n"
+            "\n"
+            "That reading is the more permissive one. It is the larger denominator,\n"
+            "so fewer sites cross 10% and go to IEEE 1547, which is the tighter\n"
+            "standard. The alternative reading — annual kWh over 8760, the true mean\n"
+            "load — is smaller by roughly one over the load factor, so 1.4x to 2.5x\n"
+            "on a typical commercial site. The report states which reading was used,\n"
+            "so a consultant reading it can see the choice rather than guess at it.\n"
+            "\n"
+            "AT A GENERATION-ONLY SITE the field feeds the 519/1547 test only. A\n"
+            "producer's array bills a handful of kW of auxiliary load — Queensburg is\n"
+            "about 10 kW against 2,200 kW of generation — and using that as IL would\n"
+            "put the denominator near 12 A on a service exporting thousands. IL there\n"
+            "comes from the plant rating instead, and the report says so.",
         )
 
         concept(

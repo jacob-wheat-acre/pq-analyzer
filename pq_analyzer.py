@@ -332,12 +332,13 @@ EXAMPLES
                    help="Combined site rated generation, kW AC. This is I_rated for "
                         "the IEEE 1547 limits and the numerator of the 519-2022 "
                         "Figure 1 test for which standard applies.")
-    p.add_argument("--annual-avg-load-kw", type=float, default=None,
-                   help="Annual average load demand, kW, from billing history: what "
-                        "the site consumes, before its own generation offsets any of "
-                        "it — not the net at the meter. Denominator of the 519-2022 "
-                        "Figure 1 test; at or above 10%% generation the installation "
-                        "goes to IEEE 1547.")
+    p.add_argument("--avg-peak-demand-kw", type=float, default=None,
+                   help="Average of the twelve previous months' maximum demands, "
+                        "kW, from billing history. Supplies IL (converted at a "
+                        "flat 0.90 power factor) and, on a site with generation, "
+                        "the denominator of the 519-2022 Figure 1 test. At a "
+                        "generation-only site it feeds Figure 1 only — IL comes "
+                        "from the plant rating there.")
     p.add_argument("--der-category", default=None, choices=["I", "II", "III"],
                    help="IEEE 1547-2018 abnormal operating performance category, "
                         "from the interconnection agreement. Sets the voltage "
@@ -417,8 +418,7 @@ def main():
         customer_class=args.customer_class,
         service_role=args.service_role,
         rated_ac_kw=args.rated_ac_kw,
-        annual_avg_load_kw=args.annual_avg_load_kw,
-        il_amps_billing=args.il_amps,
+        avg_peak_demand_kw=args.avg_peak_demand_kw,
         der_category=args.der_category,
         service_type=args.service_type,
         topology=args.topology,

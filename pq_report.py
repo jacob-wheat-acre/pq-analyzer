@@ -31,6 +31,7 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
+from pq_constants import IL_CONVERSION_PF
 from pq_analysis import (check_ride_through, check_frequency_ride_through,
                          check_billing_demand_imbalance,
                          _IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
@@ -123,9 +124,16 @@ def _il_basis_phrase(tdd_info: dict) -> str:
                 f"did over these days rather than to what it is rated to do; "
                 f"a recording taken in poorer conditions would raise them.")
     if basis == "billing":
+        kw = tdd_info.get("avg_peak_demand_kw")
         return (f"The maximum demand load current (IL) is {amps}, taken from "
                 f"billing history as IEEE 519-2022 defines it: the twelve "
-                f"previous months' 15- or 30-minute maximum demands, averaged.")
+                f"previous months' 15- or 30-minute maximum demands, averaged"
+                + (f" — {kw:,.0f} kW" if kw else "")
+                + f", converted at a flat {IL_CONVERSION_PF:.2f} power factor. "
+                f"The power factor is fixed rather than measured so that the "
+                f"same billing data always gives the same IL; where the service "
+                f"runs nearer unity this overstates IL, and understates every "
+                f"percentage taken against it.")
     return (f"IEEE 519-2022 defines the maximum demand load current (IL) as the "
             f"twelve previous months' 15- or 30-minute maximum demands averaged, "
             f"which is a billing quantity rather than a measurement. None was "

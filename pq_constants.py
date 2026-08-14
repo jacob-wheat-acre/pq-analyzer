@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.53.0"
+__version__ = "0.54.0"
 
 
 @dataclass
@@ -81,23 +81,27 @@ class Thresholds:
     # a plant's rating is what it can do, not what the week it was metered
     # happened to ask of it.
     rated_ac_kw: Optional[float] = None
-    # Annual average load demand, kW.  Figure 1's denominator, and available
-    # only from billing history.  Without it the standards test cannot be run.
+    # The average of the twelve previous months' maximum demands, in kW,
+    # straight off billing history.  One number doing two jobs:
     #
-    # This is what the site *consumes*, before its own generation offsets any
-    # of it -- not the net at the meter, and not an average of |current|.  On a
-    # service that generates, the net is smaller than the load and can be
-    # negative for part of the day; using it here would shrink the denominator
-    # and push sites across the 10% line into the wrong standard.  The label on
-    # the form says "non-gen load" for that reason.
-    annual_avg_load_kw: Optional[float] = None
-    # IL from billing, in amps.  519-2022 defines maximum demand load current
-    # as the twelve previous months' 15- or 30-minute maximum demands averaged,
-    # which is a records quantity and not a measurement: no recording short of
-    # a year can produce it.  Entered, this is used directly; left unset, the
-    # largest fundamental in the recording stands in for it and every number
-    # normalised against it is labelled as resting on that substitution.
-    il_amps_billing: Optional[float] = None
+    #   * IL, once converted to current.  519-2022 defines the maximum demand
+    #     load current as exactly this quantity -- "the sum of the rms currents
+    #     corresponding to the 15 min or 30 min maximum demand during each of
+    #     the twelve previous months divided by 12" -- so no interpretation is
+    #     involved on this side.
+    #   * the denominator of Figure 1's 10% test.  Here it *is* an
+    #     interpretation: the figure asks for "annual average load demand", and
+    #     that phrase appears nowhere else in 519-2022, has no definition entry
+    #     and no stated method.  PSCo's house reading is the average of the
+    #     twelve monthly maxima, which keeps the two demand quantities in the
+    #     standard consistent with each other.  It is also the more permissive
+    #     reading -- a larger denominator sends fewer sites to IEEE 1547 -- so
+    #     the report states it rather than leaving it to be inferred.
+    #
+    # These are not the same number at a generation-only site: a producer's
+    # array has almost no demand, and its IL comes from the plant rating
+    # instead.  There the figure feeds Figure 1 only.
+    avg_peak_demand_kw: Optional[float] = None
     # IEEE 1547-2018 abnormal operating performance category: "I", "II" or
     # "III".  Clause 6.4.2.1 gives the choice to the Area EPS operator -- us --
     # and the DER states it on its nameplate, so it is entered, never inferred.
@@ -444,6 +448,26 @@ _TRD_LIMIT = 5.0
 #: footnote warns that utility instrument transformers may not reproduce the
 #: high orders faithfully, which is why nothing above 49 is claimed here.
 _H1547_ORDERS = [2, 3, 4, 5, 6, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]
+
+#: The power factor kW is converted to current at when IL comes from billing.
+#: Flat rather than measured, deliberately: billing IL exists to be a stable
+#: annual quantity, and deriving it through a power factor taken from one
+#: week's recording would put the recording back into the number. 0.90 is
+#: Sheet R73's own assumption, so two engineers with the same billing data
+#: reach the same IL. Where a site actually runs nearer unity this overstates
+#: IL by the ratio, and understates every percentage measured against it.
+IL_CONVERSION_PF = 0.90
+
+#: How PSCo reads Figure 1's undefined "annual average load demand", stated in
+#: the report wherever the test is applied.
+HOUSE_INTERPRETATION_NOTE = (
+    "Annual average load demand is taken as the average of the twelve monthly "
+    "maximum demands. IEEE 519-2022 uses the term in Figure 1 without defining "
+    "it anywhere in the standard, so this is a PSCo house interpretation, "
+    "chosen to match the way the same standard defines the maximum demand load "
+    "current. It is the more permissive of the readings available: a larger "
+    "denominator sends fewer installations to IEEE 1547."
+)
 
 #: Figure 1's threshold: a site whose rated generation is below this share of
 #: its annual average load demand stays under 519 despite having a DER.

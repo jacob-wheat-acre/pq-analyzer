@@ -46,6 +46,8 @@ from pq_constants import (
     FREQ_CONTINUOUS_MAX_V_OVER_F,
     FREQ_CUMULATIVE_ALLOWANCE_S,
     FREQ_CUMULATIVE_WINDOW_S,
+    HOUSE_INTERPRETATION_NOTE,
+    IL_CONVERSION_PF,
     _impedance_range,
     expected_service_impedance,
     _itic_lower_v,
@@ -266,7 +268,7 @@ def applicable_current_standard(thresh: Thresholds) -> dict:
         "der_share":    None,
         "determined":   True,
         "rated_ac_kw":  thresh.rated_ac_kw,
-        "annual_avg_load_kw": thresh.annual_avg_load_kw,
+        "avg_peak_demand_kw": thresh.avg_peak_demand_kw,
     }
     if not exports_power(thresh):
         out["reason"] = ("The installation has no distributed energy resource, "
@@ -274,13 +276,13 @@ def applicable_current_standard(thresh: Thresholds) -> dict:
         return out
 
     rated = thresh.rated_ac_kw
-    load  = thresh.annual_avg_load_kw
+    load  = thresh.avg_peak_demand_kw
     if not rated or not load or load <= 0:
         missing = []
         if not rated:
             missing.append("the combined site rated generation")
         if not load or load <= 0:
-            missing.append("the annual average load demand")
+            missing.append("the average monthly peak demand")
         out.update({
             "branch":     "undetermined",
             "determined": False,
@@ -309,7 +311,7 @@ def applicable_current_standard(thresh: Thresholds) -> dict:
                 f"{share * 100:.1f}% of the annual average load demand "
                 f"({load:,.0f} kW), below the 10% at which IEEE 519-2022 "
                 "Figure 1 hands the installation to another standard, so the "
-                "519 limits apply at the PCC."
+                "519 limits apply at the PCC. " + HOUSE_INTERPRETATION_NOTE
             ),
         })
         return out
@@ -324,30 +326,56 @@ def applicable_current_standard(thresh: Thresholds) -> dict:
             "at or above 10% to a standard with an applicable scope, so the "
             "current distortion limits below are IEEE 1547-2018 Clause 7.3 "
             "and are stated as a percentage of the plant's rated current, not "
-            "of a maximum demand load current."
+            "of a maximum demand load current. " + HOUSE_INTERPRETATION_NOTE
         ),
     })
     return out
 
 
-def rated_output_amps(thresh: Thresholds, geometry: str) -> Optional[float]:
-    """The plant's rated AC output as a current, or None if no rating was given.
+def _kw_to_amps_divisor(thresh: Thresholds, geometry: str) -> Optional[float]:
+    """Volts to divide kW by to reach amps, before any power factor.
 
-    Inverters are rated in kW AC at unity power factor, so the current follows
-    from the service geometry alone.  `nominal_voltage` is line-to-neutral
-    throughout this module, which is why the three-phase divisor is 3·V_LN
-    (that is sqrt(3)·V_LL) rather than sqrt(3)·V_LN.
+    `nominal_voltage` is line-to-neutral throughout this module, which is why
+    the three-phase divisor is 3·V_LN -- that is sqrt(3)·V_LL, with
+    V_LL = sqrt(3)·V_LN -- rather than sqrt(3)·V_LN.
     """
-    kw = getattr(thresh, "rated_ac_kw", None)
     v_ln = thresh.nominal_voltage
-    if not kw or kw <= 0 or not v_ln or v_ln <= 0:
+    if not v_ln or v_ln <= 0:
         return None
-    divisor = {
-        "three-phase": 3.0 * v_ln,      # sqrt(3) x V_LL, and V_LL = sqrt(3) x V_LN
+    return {
+        "three-phase": 3.0 * v_ln,
         "two-leg-208": np.sqrt(3.0) * v_ln,
         "split-phase": 2.0 * v_ln,      # rated across the 240 V leg pair
     }.get(geometry, v_ln)
+
+
+def rated_output_amps(thresh: Thresholds, geometry: str) -> Optional[float]:
+    """The plant's rated AC output as a current, or None if no rating was given.
+
+    Inverters are rated in kW AC at unity power factor, so no power factor
+    enters here -- unlike a billing demand figure, which does.
+    """
+    kw = getattr(thresh, "rated_ac_kw", None)
+    divisor = _kw_to_amps_divisor(thresh, geometry)
+    if not kw or kw <= 0 or not divisor:
+        return None
     amps = kw * 1000.0 / divisor
+    return amps if amps > 0 else None
+
+
+def billing_il_amps(thresh: Thresholds, geometry: str) -> Optional[float]:
+    """IL from the entered billing demand, converted at a flat power factor.
+
+    519-2022 defines IL as the twelve previous months' 15- or 30-minute
+    maximum demands averaged, which is what the entered figure is; the only
+    step added here is kW to amps.  The power factor is flat by design -- see
+    IL_CONVERSION_PF -- so the same billing data always gives the same IL.
+    """
+    kw = getattr(thresh, "avg_peak_demand_kw", None)
+    divisor = _kw_to_amps_divisor(thresh, geometry)
+    if not kw or kw <= 0 or not divisor:
+        return None
+    amps = kw * 1000.0 / (divisor * IL_CONVERSION_PF)
     return amps if amps > 0 else None
 
 
@@ -1107,15 +1135,24 @@ def demand_current_il(
         if f1 is not None and not f1.empty:
             fundamental[ph] = f1
 
-    # Order of preference, strongest reference first. Billing IL is the only
-    # one that is the standard's own quantity rather than a stand-in for it.
-    if thresh is not None and thresh.il_amps_billing:
-        return float(thresh.il_amps_billing), harm_rms, fundamental, harm_source
-
-    rated = (rated_output_amps(thresh, service_geometry(thresh, df.columns))
-             if thresh is not None and is_generation_only(thresh) else None)
-    if rated:
-        return rated, harm_rms, fundamental, harm_source
+    # Order of preference, strongest reference first.
+    #
+    # At a plant the rating wins outright. A producer's array has almost no
+    # demand -- Queensburg bills about 10 kW against 2200 kW of generation --
+    # so billing demand there would put IL near 12 A on a service exporting
+    # thousands, and every percentage measured against it would be fiction.
+    # Everywhere else billing is the standard's own quantity rather than a
+    # stand-in for it, and beats anything read off the recording.
+    if thresh is not None:
+        geometry = service_geometry(thresh, df.columns)
+        if is_generation_only(thresh):
+            rated = rated_output_amps(thresh, geometry)
+            if rated:
+                return rated, harm_rms, fundamental, harm_source
+        else:
+            billed = billing_il_amps(thresh, geometry)
+            if billed:
+                return billed, harm_rms, fundamental, harm_source
 
     if fundamental:
         il_amps = float(max(f1.max() for f1 in fundamental.values()))
@@ -1199,12 +1236,14 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     # Where IL came from. At a generation site the two answers differ by
     # however cloudy the week was, so the page has to say which it used rather
     # than printing a bare denominator.
-    if thresh.il_amps_billing:
-        il_basis = "billing"
-    elif is_generation_only(thresh):
-        il_basis = ("rated_output"
-                    if rated_output_amps(thresh, service_geometry(thresh, df.columns))
+    _geom = service_geometry(thresh, df.columns)
+    if is_generation_only(thresh):
+        # The plant rating wins here; billing demand at a producer is the
+        # auxiliary load and says nothing about what the plant exports.
+        il_basis = ("rated_output" if rated_output_amps(thresh, _geom)
                     else "measured_export")
+    elif billing_il_amps(thresh, _geom):
+        il_basis = "billing"
     else:
         il_basis = "measured_demand"
 
@@ -1223,6 +1262,7 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "isc_provided":  True,
                 "il_basis":      il_basis,
                 "rated_ac_kw":   thresh.rated_ac_kw,
+                "avg_peak_demand_kw": thresh.avg_peak_demand_kw,
             }
             log.info(
                 "IEEE 519 TDD: ISC=%.0f A  IL=%.0f A  ISC/IL=%.1f  class %s  limit=%.1f%%",
@@ -1244,6 +1284,7 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "isc_provided":  False,
                 "il_basis":      il_basis,
                 "rated_ac_kw":   thresh.rated_ac_kw,
+                "avg_peak_demand_kw": thresh.avg_peak_demand_kw,
             }
             log.info(
                 "IEEE 519 TDD: ISC not provided — IL=%.0f A, most restrictive class "

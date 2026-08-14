@@ -2142,10 +2142,10 @@ _DOCUMENT_MATRIX = [
     ("test_commercial_primary",  "pg", 13200.0, {"isc_amps": 5000.0}),
     ("test_solar_net_metered",   "sg", 277.0,
      {"isc_amps": 40000.0, "service_role": "mixed", "rated_ac_kw": 150.0,
-      "annual_avg_load_kw": 1200.0}),
+      "avg_peak_demand_kw": 1200.0}),
     ("test_producer_array",      "sg", 277.0,
      {"isc_amps": 40000.0, "service_role": "generation", "rated_ac_kw": 250.0,
-      "annual_avg_load_kw": 2.0, "der_category": "II"}),
+      "avg_peak_demand_kw": 10.0, "der_category": "II"}),
 ]
 
 
@@ -2190,7 +2190,7 @@ class TestAnalysisModeIsVisible:
         _ds, rep, th = _build_report(
             "test_producer_array", "sg", 277.0, isc_amps=40000.0,
             service_role="generation", rated_ac_kw=250.0,
-            annual_avg_load_kw=2.0, der_category="II")
+            avg_peak_demand_kw=10.0, der_category="II")
         bits = " | ".join(analysis_mode_summary(rep, th))
         assert "Generation only" in bits
         assert "1547" in bits                 # the standard actually applied
@@ -2203,7 +2203,7 @@ class TestAnalysisModeIsVisible:
         _ds, rep, th = _build_report(
             "test_producer_array", "sg", 277.0, isc_amps=40000.0,
             service_role="generation", rated_ac_kw=250.0,
-            annual_avg_load_kw=2.0)
+            avg_peak_demand_kw=10.0)
         assert any("not entered" in b for b in analysis_mode_summary(rep, th))
 
     def test_a_load_service_says_load(self):
@@ -2219,7 +2219,7 @@ class TestAnalysisModeIsVisible:
         ds, rep, th = _build_report(
             "test_producer_array", "sg", 277.0, isc_amps=40000.0,
             service_role="generation", rated_ac_kw=250.0,
-            annual_avg_load_kw=2.0, der_category="II")
+            avg_peak_demand_kw=10.0, der_category="II")
         path = generate_word_report(
             report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
             engineer_name="E", outdir=tmp_path, stem="t")
@@ -2241,7 +2241,7 @@ class TestAnalysisModeIsVisible:
 
         gen = footer_of("test_producer_array", "sg", 277.0, isc_amps=40000.0,
                         service_role="generation", rated_ac_kw=250.0,
-                        annual_avg_load_kw=2.0, der_category="II")
+                        avg_peak_demand_kw=10.0, der_category="II")
         assert "generating facility" in gen
         load = footer_of("test_commercial_large", "sg", 277.0, isc_amps=40000.0)
         assert "assessed as" not in load
@@ -2336,7 +2336,7 @@ class TestPowerFactorSignConvention:
         _ds, rep, th = _build_report(
             "test_producer_array", "sg", 277.0, isc_amps=40000.0,
             service_role="generation", rated_ac_kw=250.0,
-            annual_avg_load_kw=2.0, der_category="II")
+            avg_peak_demand_kw=10.0, der_category="II")
         pfr = rep["power_factor"]
         assert pfr["convention"] == "direction"
         assert pfr["pct_below_limit"] is None
@@ -2777,7 +2777,7 @@ class TestTheLetterToAProducer:
         ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
         th = Thresholds(nominal_voltage=277.0, customer_class=customer_class,
                         service_role=role, isc_amps=40000.0, rated_ac_kw=250.0,
-                        annual_avg_load_kw=2.0)
+                        avg_peak_demand_kw=10.0)
         df = ds.df
         ev = An.detect_events(ds, th)
         rep = generate_report(
@@ -3069,6 +3069,50 @@ class TestCaptureSplitDeadband:
         assert split["near_crossover"] == 0
 
 
+class TestTheHouseInterpretationIsStated:
+    """Figure 1's denominator is an undefined term, and the report says so.
+
+    "Annual average load demand" appears only inside Figure 1 of 519-2022 --
+    no definition entry, no method, no other use in the standard. PSCo reads
+    it as the average of the twelve monthly maxima, matching the way the same
+    standard defines IL. That is the more permissive reading, so a report that
+    used it silently would be making a choice a reader could not see.
+    """
+
+    @staticmethod
+    def _t(**kw):
+        return Thresholds(nominal_voltage=277.0, customer_class="sg", **kw)
+
+    def test_the_note_travels_with_the_test_when_it_sends_a_site_to_1547(self):
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t(
+            service_role="mixed", rated_ac_kw=150.0, avg_peak_demand_kw=1200.0))
+        assert r["standard"] == "1547"
+        assert "house interpretation" in r["reason"]
+        assert "without defining it" in r["reason"]
+
+    def test_the_note_travels_when_the_site_stays_under_519(self):
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t(
+            service_role="mixed", rated_ac_kw=40.0, avg_peak_demand_kw=1200.0))
+        assert r["standard"] == "519"
+        assert "house interpretation" in r["reason"]
+
+    def test_it_names_the_direction_the_reading_leans(self):
+        # The choice favours 519, and a reader is owed that rather than left to
+        # work it out from the arithmetic.
+        from pq_constants import HOUSE_INTERPRETATION_NOTE
+        assert "more permissive" in HOUSE_INTERPRETATION_NOTE
+        assert "fewer installations to IEEE 1547" in HOUSE_INTERPRETATION_NOTE
+
+    def test_an_ordinary_load_service_is_not_lectured_about_it(self):
+        # No generation means Figure 1 is never reached, so the note would be
+        # an explanation of a decision that was not made.
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t())
+        assert "house interpretation" not in r["reason"]
+
+
 class TestWhichCurrentStandardApplies:
     """IEEE 519-2022 Figure 1, the decision tree for an installation with DER.
 
@@ -3091,7 +3135,7 @@ class TestWhichCurrentStandardApplies:
         from pq_analysis import applicable_current_standard
         # 40 kW of solar on a service averaging 500 kW: 8%.
         r = applicable_current_standard(self._t(
-            service_role="mixed", rated_ac_kw=40.0, annual_avg_load_kw=500.0))
+            service_role="mixed", rated_ac_kw=40.0, avg_peak_demand_kw=500.0))
         assert r["standard"] == "519"
         assert r["branch"] == "der_below_threshold"
         assert r["der_share"] == pytest.approx(0.08)
@@ -3100,13 +3144,13 @@ class TestWhichCurrentStandardApplies:
         from pq_analysis import applicable_current_standard
         # Exactly 10%: the tree asks whether it is *below* the threshold.
         r = applicable_current_standard(self._t(
-            service_role="mixed", rated_ac_kw=50.0, annual_avg_load_kw=500.0))
+            service_role="mixed", rated_ac_kw=50.0, avg_peak_demand_kw=500.0))
         assert r["standard"] == "1547"
 
     def test_a_plant_with_no_load_goes_to_1547(self):
         from pq_analysis import applicable_current_standard
         r = applicable_current_standard(self._t(
-            service_role="generation", rated_ac_kw=250.0, annual_avg_load_kw=2.0))
+            service_role="generation", rated_ac_kw=250.0, avg_peak_demand_kw=10.0))
         assert r["standard"] == "1547"
         assert "1547" in r["reason"]
 
@@ -3125,7 +3169,7 @@ class TestWhichCurrentStandardApplies:
     def test_the_reason_names_both_figures_it_compared(self):
         from pq_analysis import applicable_current_standard
         r = applicable_current_standard(self._t(
-            service_role="mixed", rated_ac_kw=40.0, annual_avg_load_kw=500.0))
+            service_role="mixed", rated_ac_kw=40.0, avg_peak_demand_kw=500.0))
         assert "40 kW" in r["reason"] and "500 kW" in r["reason"]
 
 
@@ -3212,14 +3256,42 @@ class TestILFromBilling:
         path = Path(__file__).parent / "test_data" / "test_commercial_large.pqd"
         return extract_dataset(ProntoAdapter(str(path)), ChannelMapper()).df
 
-    def test_an_entered_il_is_used_over_the_recording_peak(self):
+    def test_billing_demand_is_used_over_the_recording_peak(self):
         from pq_analysis import check_thd
         df = self._df()
+        # 300 kW at 277 V L-N, three-phase, converted at the flat 0.90:
+        # 300000 / (3 x 277 x 0.90) = 401 A.
         th = Thresholds(nominal_voltage=277.0, customer_class="sg",
-                        isc_amps=40000.0, il_amps_billing=400.0)
+                        isc_amps=40000.0, avg_peak_demand_kw=300.0)
         td = check_thd(df, th)["tdd_info"]
-        assert td["il_amps"] == pytest.approx(400.0)
+        assert td["il_amps"] == pytest.approx(401.0, abs=1.0)
         assert td["il_basis"] == "billing"
+
+    def test_the_conversion_power_factor_is_flat_not_measured(self):
+        # Billing IL exists to be stable across recordings; deriving it through
+        # a power factor measured in one week would put the recording back in.
+        from pq_analysis import billing_il_amps
+        from pq_constants import IL_CONVERSION_PF
+        assert IL_CONVERSION_PF == 0.90
+        th = Thresholds(nominal_voltage=277.0, avg_peak_demand_kw=300.0)
+        assert billing_il_amps(th, "three-phase") == pytest.approx(
+            300_000.0 / (3 * 277.0 * 0.90), rel=1e-6)
+
+    def test_a_plant_keeps_its_rating_rather_than_its_auxiliary_demand(self):
+        # The trap in collapsing the two fields: a producer bills a handful of
+        # kW of auxiliary load, which would put IL near 12 A on a service
+        # exporting thousands.
+        from pq_analysis import check_thd
+        from pq_adapter import ProntoAdapter, ChannelMapper, extract_dataset
+        from pathlib import Path
+        path = Path(__file__).parent / "test_data" / "test_producer_array.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                        isc_amps=40000.0, service_role="generation",
+                        rated_ac_kw=250.0, avg_peak_demand_kw=10.0)
+        td = check_thd(ds.df, th)["tdd_info"]
+        assert td["il_basis"] == "rated_output"
+        assert td["il_amps"] > 250.0
 
     def test_without_one_the_recording_peak_stands_in_and_is_labelled(self):
         from pq_analysis import check_thd
@@ -3233,11 +3305,11 @@ class TestILFromBilling:
         # recording from a slow week can manufacture a violation.
         from pq_analysis import check_thd
         df = self._df()
-        def tdd(il):
+        def tdd(kw):
             th = Thresholds(nominal_voltage=277.0, customer_class="sg",
-                            isc_amps=40000.0, il_amps_billing=il)
+                            isc_amps=40000.0, avg_peak_demand_kw=kw)
             return check_thd(df, th)["current"]["max_thd_pct"]
-        assert tdd(50.0) > tdd(400.0)
+        assert tdd(40.0) > tdd(300.0)
 
 
 class TestKFactorByPhase:
