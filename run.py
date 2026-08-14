@@ -40,6 +40,7 @@ _ENTRY_BG           = "#ffffff"
 _ENTRY_FG           = "#1a1a1a"
 _ENTRY_DISABLED_BG  = "#ebebeb"
 _ENTRY_DISABLED_FG  = "#9a9a9a"
+_FIELD_TRIM         = "#c9c9c9"   # field borders, separators, tab edges
 _ISC_FG    = "#1a6fbf"   # blue for auto-populated ISC
 _ISC_NONE  = "#888888"   # grey when no ISC resolved
 
@@ -322,18 +323,84 @@ class PQApp(tk.Tk):
         ):
             self.option_add(f"*TCombobox*Listbox.{option}", value)
 
-        # And the closed widget itself. Aqua ignores most of this and draws its
-        # own control, which is why the entries were the visible problem and
-        # these were not; the Windows themes do honour it, and that is where
-        # this runs in the field.
+        # The ttk widgets need the theme changed, not their options set. Both
+        # the macOS "aqua" theme and the Windows native ones draw their own
+        # controls and ignore colour options entirely, taking the desktop
+        # appearance instead -- which is why the comboboxes stayed dark while
+        # the plain entries above went light. "clam" is the one bundled theme
+        # that honours colours on every platform, so it is the only way to pin
+        # a single look. It costs the native control shape; the alternative is
+        # a form whose fields are unreadable half the time.
         style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:                       # pragma: no cover - platform
+            log.debug("clam theme unavailable; leaving the platform default")
+
+        style.configure(".", background=_BG, foreground=_LABEL_FG,
+                        fieldbackground=_ENTRY_BG, font=_FONT_UI)
+        style.configure("TCombobox",
+                        fieldbackground=_ENTRY_BG, background=_FIELD_TRIM,
+                        foreground=_ENTRY_FG, arrowcolor=_LABEL_FG,
+                        bordercolor=_FIELD_TRIM, lightcolor=_FIELD_TRIM,
+                        darkcolor=_FIELD_TRIM, insertcolor=_ENTRY_FG,
+                        padding=3)
         style.map(
             "TCombobox",
-            fieldbackground=[("readonly", _ENTRY_BG), ("disabled", _ENTRY_DISABLED_BG)],
-            foreground=[("readonly", _ENTRY_FG), ("disabled", _ENTRY_DISABLED_FG)],
+            fieldbackground=[("readonly", _ENTRY_BG),
+                             ("disabled", _ENTRY_DISABLED_BG)],
+            foreground=[("readonly", _ENTRY_FG),
+                        ("disabled", _ENTRY_DISABLED_FG)],
+            arrowcolor=[("disabled", _ENTRY_DISABLED_FG)],
+            # Without these the readonly field paints itself with the selection
+            # colour the moment it takes focus, which reads as a stuck highlight.
             selectbackground=[("readonly", _ENTRY_BG)],
             selectforeground=[("readonly", _ENTRY_FG)],
         )
+        style.configure("TSeparator", background=_FIELD_TRIM)
+        style.configure("TScrollbar", background=_BG, troughcolor="#ececec",
+                        bordercolor=_BG, arrowcolor=_LABEL_FG,
+                        lightcolor=_BG, darkcolor=_BG)
+        style.configure("TNotebook", background=_BG, bordercolor=_FIELD_TRIM)
+        style.configure("TNotebook.Tab", background="#e4e4e4",
+                        foreground=_LABEL_FG, padding=(12, 6),
+                        lightcolor="#e4e4e4", bordercolor=_FIELD_TRIM)
+        style.map("TNotebook.Tab",
+                  background=[("selected", _BG)],
+                  foreground=[("selected", _BTN_RUN)],
+                  expand=[("selected", (0, 0, 0, 0))])
+
+        # Buttons carry colour, so they have to leave the native theme too --
+        # a tk.Button under aqua ignores -background the same way.
+        style.configure("Plain.TButton", background=_BG, foreground=_LABEL_FG,
+                        bordercolor=_FIELD_TRIM, lightcolor=_BG, darkcolor=_BG,
+                        focuscolor=_BG, padding=(12, 7), relief="flat")
+        style.map("Plain.TButton",
+                  background=[("pressed", "#e0e0e0"), ("active", "#ececec"),
+                              ("disabled", _BG)],
+                  foreground=[("disabled", _ENTRY_DISABLED_FG)])
+        style.configure("Quiet.TButton", background=_BG, foreground="#555555",
+                        bordercolor=_BG, lightcolor=_BG, darkcolor=_BG,
+                        focuscolor=_BG, padding=(12, 7), relief="flat")
+        style.map("Quiet.TButton",
+                  background=[("pressed", "#e0e0e0"), ("active", "#ececec")])
+        # The collapsible section header: a full-width strip of text with a
+        # disclosure arrow, so it is left-aligned and carries no border.
+        style.configure("Toggle.TButton", background=_BG, foreground="#555555",
+                        bordercolor=_BG, lightcolor=_BG, darkcolor=_BG,
+                        focuscolor=_BG, relief="flat", anchor="w",
+                        padding=(4, 4), font=_FONT_UI_S)
+        style.map("Toggle.TButton",
+                  background=[("pressed", "#e6e6e6"), ("active", "#ededed")],
+                  foreground=[("active", _LABEL_FG)])
+        style.configure("Run.TButton", background=_BTN_RUN, foreground=_BTN_TXT,
+                        bordercolor=_BTN_RUN, lightcolor=_BTN_RUN,
+                        darkcolor=_BTN_RUN, focuscolor=_BTN_RUN,
+                        padding=(20, 8), relief="flat", font=_FONT_UI_B)
+        style.map("Run.TButton",
+                  background=[("pressed", "#12508e"), ("active", "#155a9e"),
+                              ("disabled", "#a8c4e2")],
+                  foreground=[("disabled", "#f0f0f0")])
 
     def _set_icon(self):
         """Title bar, taskbar and Alt-Tab icon.
@@ -409,8 +476,8 @@ class PQApp(tk.Tk):
         self._scan_after_id = None
         tk.Entry(file_frame, textvariable=self._file_var, font=_FONT_UI,
                  width=40).pack(side="left", padx=(0, 6), fill="x", expand=True)
-        tk.Button(file_frame, text="Browse…", command=self._browse,
-                  font=_FONT_UI).pack(side="left")
+        ttk.Button(file_frame, text="Browse…", command=self._browse,
+                   style="Plain.TButton").pack(side="left")
 
         # ── Session row ───────────────────────────────────────────────────────
         # A "download all data" export holds every session the meter still had.
@@ -795,11 +862,10 @@ class PQApp(tk.Tk):
         det_hdr.pack(fill="x", padx=12, pady=(4, 0))
 
         self._details_open = tk.BooleanVar(value=False)
-        self._det_toggle_btn = tk.Button(
+        self._det_toggle_btn = ttk.Button(
             det_hdr, text="▶  Report Details (engineer sign-off)",
             command=self._toggle_details,
-            bg=_BG, fg="#555555", font=_FONT_UI_S,
-            relief="flat", cursor="hand2", anchor="w",
+            style="Toggle.TButton", cursor="hand2",
         )
         self._det_toggle_btn.pack(side="left", fill="x", expand=True)
 
@@ -841,43 +907,32 @@ class PQApp(tk.Tk):
         btn_frame = tk.Frame(self, bg=_BG)
         btn_frame.pack(fill="x", padx=12, pady=4)
 
-        self._run_btn = tk.Button(
-            btn_frame, text="Run Analysis",
-            command=self._run,
-            bg=_BTN_RUN, fg=_BTN_TXT, activebackground="#155a9e",
-            font=_FONT_UI_B,
-            relief="flat", cursor="hand2", padx=20, pady=8,
+        self._run_btn = ttk.Button(
+            btn_frame, text="Run Analysis", command=self._run,
+            style="Run.TButton", cursor="hand2",
         )
         self._run_btn.pack(side="left")
 
-        self._open_btn = tk.Button(
-            btn_frame, text="Open Output Folder",
-            command=self._open_folder,
-            font=_FONT_UI, relief="flat", cursor="hand2",
-            bg=_BG, padx=12, pady=8,
+        self._open_btn = ttk.Button(
+            btn_frame, text="Open Output Folder", command=self._open_folder,
+            style="Plain.TButton", cursor="hand2",
         )
         self._open_btn.pack(side="left", padx=(12, 0))
         self._open_btn.config(state="disabled")
 
-        tk.Button(
-            btn_frame, text="Clear All",
-            command=self._clear_all,
-            font=_FONT_UI, relief="flat", cursor="hand2",
-            bg=_BG, padx=12, pady=8,
+        ttk.Button(
+            btn_frame, text="Clear All", command=self._clear_all,
+            style="Plain.TButton", cursor="hand2",
         ).pack(side="left", padx=(8, 0))
 
-        tk.Button(
-            btn_frame, text="? Help",
-            command=self._show_help,
-            font=_FONT_UI, relief="flat", cursor="hand2",
-            bg=_BG, fg="#555555", padx=12, pady=8,
+        ttk.Button(
+            btn_frame, text="? Help", command=self._show_help,
+            style="Quiet.TButton", cursor="hand2",
         ).pack(side="right")
 
-        tk.Button(
-            btn_frame, text="✉ Feedback",
-            command=self._show_feedback,
-            font=_FONT_UI, relief="flat", cursor="hand2",
-            bg=_BG, fg="#555555", padx=12, pady=8,
+        ttk.Button(
+            btn_frame, text="✉ Feedback", command=self._show_feedback,
+            style="Quiet.TButton", cursor="hand2",
         ).pack(side="right")
 
         # ── Log window ────────────────────────────────────────────────────────
@@ -1248,9 +1303,9 @@ class PQApp(tk.Tk):
 
         btns = tk.Frame(inner, bg="#7a1c1c")
         btns.pack(fill="x")
-        tk.Button(btns, text="Show the error details",
-                  command=self._show_import_error,
-                  font=_FONT_UI_S).pack(side="left")
+        ttk.Button(btns, text="Show the error details",
+                   command=self._show_import_error,
+                   style="Plain.TButton").pack(side="left")
         tk.Label(btns, text="  (send these to the maintainer)",
                  bg="#7a1c1c", fg="#f0c0c0", font=_FONT_UI_S).pack(side="left")
 
@@ -1291,8 +1346,8 @@ class PQApp(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(detail)
 
-        tk.Button(win, text="Copy to clipboard", command=_copy,
-                  font=_FONT_UI).pack(pady=(0, 8))
+        ttk.Button(win, text="Copy to clipboard", command=_copy,
+                   style="Plain.TButton").pack(pady=(0, 8))
 
     def _open_folder(self):
         folder = _SCRIPT.parent / "pq_output"
@@ -1775,14 +1830,12 @@ class PQApp(tk.Tk):
             webbrowser.open(f"mailto:jacobbyronwhitaker@gmail.com?{params}")
             win.destroy()
 
-        tk.Button(btn_row, text="Send via Email", command=_send,
-                  font=_FONT_UI, relief="flat", cursor="hand2",
-                  bg=_BTN_RUN, fg=_BTN_TXT, padx=14, pady=7,
-                  ).pack(side="left")
-        tk.Button(btn_row, text="Cancel", command=win.destroy,
-                  font=_FONT_UI, relief="flat", cursor="hand2",
-                  bg=_BG, fg="#555555", padx=14, pady=7,
-                  ).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Send via Email", command=_send,
+                   style="Run.TButton", cursor="hand2",
+                   ).pack(side="left")
+        ttk.Button(btn_row, text="Cancel", command=win.destroy,
+                   style="Quiet.TButton", cursor="hand2",
+                   ).pack(side="left", padx=(8, 0))
 
     # ── Help window ───────────────────────────────────────────────────────
 
@@ -2956,9 +3009,8 @@ class PQApp(tk.Tk):
                     pg_concepts, pg_neutral, pg_methods):
             _pg.config(state="disabled")
 
-        tk.Button(win, text="Close", command=win.destroy,
-                  font=_FONT_UI, relief="flat", padx=20, pady=6,
-                  bg="#dddddd", cursor="hand2").pack(pady=(0, 14))
+        ttk.Button(win, text="Close", command=win.destroy,
+                   style="Plain.TButton", cursor="hand2").pack(pady=(0, 14))
 
     # ── Log helpers ───────────────────────────────────────────────────────────
 
