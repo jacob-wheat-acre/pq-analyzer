@@ -316,9 +316,6 @@ EXAMPLES
     p.add_argument("--report",    action="store_true", help="Generate Word (.docx) report")
     p.add_argument("--site-name",      default=None, help="Site name for the report header")
     p.add_argument("--site-address",   default=None, help="Site address for the report header")
-    p.add_argument("--meter-id",       default=None, help="Meter or account number for the report header")
-    p.add_argument("--feeder",         default=None, help="Feeder / circuit name for the report header")
-    p.add_argument("--substation",     default=None, help="Substation name for the report header")
     p.add_argument("--engineer",       default=None, help="Engineer name for the report sign-off")
     p.add_argument("--engineer-title", default=None, help="Engineer title (default: Electric Area Engineer)")
     p.add_argument("--engineer-email", default=None, help="Engineer email address for sign-off")
@@ -571,9 +568,6 @@ def main():
             engineer_name=args.engineer or "",
             outdir=outdir,
             stem=stem,
-            meter_id=args.meter_id or "",
-            feeder=args.feeder or "",
-            substation=args.substation or "",
             engineer_title=args.engineer_title or "",
             engineer_email=args.engineer_email or "",
         )

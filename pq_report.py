@@ -1405,7 +1405,7 @@ def _integrity_note(dq: dict, fs: dict) -> str:
     return "INCOMPLETE — " + " ".join(parts)
 
 
-def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, substation,
+def _word_site_info_table(doc, site_name, stem, site_address,
                           fs, nominal_v, nominal_ll, prepared_by="") -> None:
     rows_data = [
         ("Customer / Site", site_name or stem),
@@ -1416,12 +1416,6 @@ def _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, 
         rows_data.append(("Prepared by", prepared_by))
     if site_address:
         rows_data.append(("Address", site_address))
-    if meter_id:
-        rows_data.append(("Meter / Account #", meter_id))
-    if feeder:
-        rows_data.append(("Feeder / Circuit",  feeder))
-    if substation:
-        rows_data.append(("Substation",         substation))
     rows_data += [
         ("Recording period", f"{fs['start_time']}  →  {fs['end_time']}"),
         ("Duration",         f"{fs['duration_hours']:.2f} hours  |  {fs['sample_count']:,} intervals"),
@@ -5133,9 +5127,6 @@ def generate_word_report(
     stem: str,
     *,
     ds: Optional["PQDataset"] = None,
-    meter_id: str = "",
-    feeder: str = "",
-    substation: str = "",
     engineer_title: str = "",
     engineer_email: str = "",
 ) -> Optional[Path]:
@@ -5191,7 +5182,7 @@ def generate_word_report(
             color=RGBColor(0x66, 0x66, 0x66), size_pt=9)
     doc.add_paragraph()
 
-    _word_site_info_table(doc, site_name, stem, site_address, meter_id, feeder, substation,
+    _word_site_info_table(doc, site_name, stem, site_address,
                           fs, nominal_v, nominal_ll,
                           prepared_by=", ".join(
                               b for b in (engineer_name,

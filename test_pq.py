@@ -5604,7 +5604,7 @@ class TestRecordThatWillNotInflate:
         fs = {"start_time": "a", "end_time": "b", "duration_hours": 1.0,
               "sample_count": 12, "topology": "3-phase", "data_quality": {
                   "missing_bytes": 0, "unreadable_observations": 0}}
-        _word_site_info_table(doc, "Site", "stem", "", "", "", "", fs, 277.0, 480)
+        _word_site_info_table(doc, "Site", "stem", "", fs, 277.0, 480)
         labels = [r.cells[0].text for r in doc.tables[0].rows]
         assert "Source file integrity" not in labels
 

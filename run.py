@@ -34,6 +34,12 @@ _LOG_FG    = "#d4d4d4"
 _LOG_ERR   = "#f48771"
 _LOG_INFO  = "#4ec9b0"
 _LABEL_FG  = "#333333"
+# Text fields state their own colours so the desktop appearance cannot invert
+# them; see PQApp._force_light_entries.
+_ENTRY_BG           = "#ffffff"
+_ENTRY_FG           = "#1a1a1a"
+_ENTRY_DISABLED_BG  = "#ebebeb"
+_ENTRY_DISABLED_FG  = "#9a9a9a"
 _ISC_FG    = "#1a6fbf"   # blue for auto-populated ISC
 _ISC_NONE  = "#888888"   # grey when no ISC resolved
 
@@ -276,9 +282,58 @@ class PQApp(tk.Tk):
         self.resizable(True, True)
         self.configure(bg=_BG)
         self.minsize(680, 520)
+        self._force_light_entries()
         self._set_icon()
         self._build_ui()
         self._running = False
+
+    def _force_light_entries(self):
+        """Keep text fields light whatever the desktop appearance is set to.
+
+        Every frame and label here names its own colour, but a bare tk.Entry
+        does not, so on a Mac in dark mode the fields came back with a black
+        background inside an otherwise light window -- unreadable, and looking
+        like a rendering fault rather than a theme.  There is no dark mode to
+        support here: one appearance, stated explicitly.
+
+        Set as an option database default rather than on each widget so a field
+        added later cannot quietly reintroduce it.  The log pane is deliberately
+        dark and names its own colours, so it is unaffected.
+        """
+        for option, value in (
+            ("background",           _ENTRY_BG),
+            ("foreground",           _ENTRY_FG),
+            ("insertBackground",     _ENTRY_FG),   # the caret
+            ("readonlyBackground",   _ENTRY_BG),
+            ("disabledBackground",   _ENTRY_DISABLED_BG),
+            ("disabledForeground",   _ENTRY_DISABLED_FG),
+            ("highlightBackground",  _BG),         # focus ring surround
+        ):
+            self.option_add(f"*Entry.{option}", value)
+
+        # The combobox dropdown is a classic Listbox behind a ttk widget, so it
+        # takes options rather than styles. Left alone it opens dark on a dark
+        # desktop while the closed widget above it is light.
+        for option, value in (
+            ("background",       _ENTRY_BG),
+            ("foreground",       _ENTRY_FG),
+            ("selectBackground", _BTN_RUN),
+            ("selectForeground", _BTN_TXT),
+        ):
+            self.option_add(f"*TCombobox*Listbox.{option}", value)
+
+        # And the closed widget itself. Aqua ignores most of this and draws its
+        # own control, which is why the entries were the visible problem and
+        # these were not; the Windows themes do honour it, and that is where
+        # this runs in the field.
+        style = ttk.Style(self)
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", _ENTRY_BG), ("disabled", _ENTRY_DISABLED_BG)],
+            foreground=[("readonly", _ENTRY_FG), ("disabled", _ENTRY_DISABLED_FG)],
+            selectbackground=[("readonly", _ENTRY_BG)],
+            selectforeground=[("readonly", _ENTRY_FG)],
+        )
 
     def _set_icon(self):
         """Title bar, taskbar and Alt-Tab icon.
@@ -741,7 +796,7 @@ class PQApp(tk.Tk):
 
         self._details_open = tk.BooleanVar(value=False)
         self._det_toggle_btn = tk.Button(
-            det_hdr, text="▶  Report Details (site address, engineer, feeder…)",
+            det_hdr, text="▶  Report Details (engineer sign-off)",
             command=self._toggle_details,
             bg=_BG, fg="#555555", font=_FONT_UI_S,
             relief="flat", cursor="hand2", anchor="w",
@@ -765,27 +820,10 @@ class PQApp(tk.Tk):
                          font=_FONT_UI_S).pack(side="left", padx=(6, 0))
             return e
 
-        # ── Site details ───────────────────────────────────────────────────────
-        tk.Label(self._details_frame,
-                 text="  Site", bg=_BG, fg="#555555", font=_FONT_UI_S,
-                 ).pack(anchor="w", padx=12, pady=(6, 0))
-
-        self._meter_id_var = tk.StringVar()
-        self._feeder_var   = tk.StringVar()
-        self._subst_var    = tk.StringVar()
-
-        _detail_row("Meter / Account #", self._meter_id_var, "(Pronto meter ID or account #)")
-        _detail_row("Feeder / Circuit", self._feeder_var,   "(e.g. FDR-4203)")
-        _detail_row("Substation",       self._subst_var,    "(e.g. Sheridan 115/13 kV)")
-
-        ttk.Separator(self._details_frame, orient="horizontal").pack(
-            fill="x", padx=12, pady=(6, 0))
-
         # ── Engineer / sign-off ────────────────────────────────────────────────
-        tk.Label(self._details_frame,
-                 text="  Engineer sign-off", bg=_BG, fg="#555555", font=_FONT_UI_S,
-                 ).pack(anchor="w", padx=12, pady=(4, 0))
-
+        # Meter/account number, feeder and substation used to sit above this.
+        # They identify the service to us and mean nothing to the customer, so
+        # they were taking room on the form to reach a header nobody read.
         self._eng_name_var  = tk.StringVar()
         self._eng_title_var = tk.StringVar()
         self._eng_email_var = tk.StringVar()
@@ -894,7 +932,7 @@ class PQApp(tk.Tk):
                 "Clear all entries?",
                 f"This resets {len(dirty)} entr"
                 f"{'y' if len(dirty) == 1 else 'ies'} — including the file, "
-                "the transformer and conductor pickers, and the site details "
+                "the transformer and conductor pickers "
                 "— back to their defaults.\n\nYour engineer name, title and "
                 "email are kept.\n\nClear the rest?"):
             return
@@ -923,12 +961,12 @@ class PQApp(tk.Tk):
             self._details_frame.pack_forget()
             self._details_open.set(False)
             self._det_toggle_btn.config(
-                text="▶  Report Details (site address, engineer, feeder…)")
+                text="▶  Report Details (engineer sign-off)")
         else:
             self._details_frame.pack(fill="x", before=self._sep_before_run)
             self._details_open.set(True)
             self._det_toggle_btn.config(
-                text="▼  Report Details (site address, engineer, feeder…)")
+                text="▼  Report Details (engineer sign-off)")
 
     # ── Transformer cascade callbacks ─────────────────────────────────────────
 
@@ -1403,9 +1441,6 @@ class PQApp(tk.Tk):
             "il_amps_billing":    _float_or_none(self._il_billing_var.get()),
             "site":           self._site_var.get().strip(),
             "address":        self._address_var.get().strip(),
-            "meter_id":       self._meter_id_var.get().strip(),
-            "feeder":         self._feeder_var.get().strip(),
-            "substation":     self._subst_var.get().strip(),
             "engineer":       self._eng_name_var.get().strip(),
             "engineer_title": self._eng_title_var.get().strip(),
             "engineer_email": self._eng_email_var.get().strip(),
@@ -1618,9 +1653,6 @@ class PQApp(tk.Tk):
             engineer_name=params["engineer"],
             outdir=outdir,
             stem=stem,
-            meter_id=params["meter_id"],
-            feeder=params["feeder"],
-            substation=params["substation"],
             engineer_title=params["engineer_title"],
             engineer_email=params["engineer_email"],
         )
