@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.58.0"
+__version__ = "0.59.0"
 
 
 @dataclass
@@ -550,6 +550,77 @@ PF_DIRECTION_LABELS = {
     "injecting": "injecting reactive power (overexcited)",
     "unity":     "at unity, neither absorbing nor injecting",
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PSCo Technical Specifications Manual (01/01/2025) — DER settings
+#
+# The TSM is explicit that it governs where it differs from IEEE 1547-2018
+# ("When performance and settings identified in this manual differ from IEEE
+# 1547-2018, this manual shall be the reference for requirements"), so these are
+# transcribed from the manual rather than from the standard's own defaults.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: TSM §6.1 Table 1 — which autonomous functions are on by default. Carried so
+#: the report can say what a plant was *expected* to be doing, which is often
+#: not what the site was set up to do: §8.1 of the same manual says fixed power
+#: factor is all that is currently allowed, which contradicts this table.
+TSM_DEFAULT_FUNCTIONS = {
+    "Constant power factor":            "disabled",
+    "Volt-VAR (voltage-reactive power)": "enabled",
+    "Volt-Watt (voltage-active power)":  "enabled",
+    "Watt-VAR (active-reactive power)":  "disabled",
+    "Constant reactive power":           "disabled",
+    "Limit maximum active power":        "disabled",
+    "Voltage disturbance ride-through":  "enabled",
+    "Frequency disturbance ride-through": "enabled",
+    "Dynamic voltage support":           "disabled",   # §6.4.3
+}
+
+#: TSM §6.3.4 Table 3 — voltage-active power (volt-watt), Category B defaults.
+#: Curtailment begins at 1.06 p.u., which is the top of ANSI C84.1 Range A, and
+#: runs to 0.2·Prated at 1.10 p.u.  The manual's own footnote makes the point
+#: that nothing is curtailed inside the normal voltage range.
+VOLT_WATT_V1_PU   = 1.06
+VOLT_WATT_V2_PU   = 1.10
+VOLT_WATT_P2_FRAC = 0.20          # of Prated, for a DER that only generates
+VOLT_WATT_RESPONSE_S = 10.0
+
+#: TSM §6.3.3 Table 2 — voltage-reactive power (volt-VAR), inverter-based DER.
+#: Offsets are from VRef, which is not the nominal: the DER tracks it as a low
+#: pass filtered measurement with a 300 s time constant, so the curve moves with
+#: the service over the course of a day.
+VOLT_VAR_DEADBAND_PU   = 0.02     # V2 = VRef − 0.02·VN, V3 = VRef + 0.02·VN
+VOLT_VAR_ENDPOINT_PU   = 0.08     # V1 = VRef − 0.08·VN, V4 = VRef + 0.08·VN
+VOLT_VAR_Q_FRAC        = 0.44     # of nameplate apparent power, at V1 and V4
+VOLT_VAR_VREF_TAU_S    = 300.0
+VOLT_VAR_RESPONSE_S    = 5.0
+
+#: TSM §6.4.1.1 Table 4 — shall-trip settings, inverter-based DER (Category III
+#: assignment).  Each row is (label, comparison, per-unit threshold, clearing
+#: time in seconds).  These are the complement of the ride-through tables: below
+#: UV1 or above OV1 the plant is required to *leave*, and an event that crossed
+#: one is a different finding from an event it was obliged to ride through.
+TSM_VOLTAGE_TRIP = [
+    ("OV2", "above", 1.20, 0.16),
+    ("OV1", "above", 1.10, 2.0),
+    ("UV1", "below", 0.70, 5.0),
+    ("UV2", "below", 0.45, 0.32),
+]
+
+#: TSM §6.4.2.1 Table 6 — shall-trip settings for abnormal frequency. Identical
+#: for inverter and synchronous DER in this manual (Tables 6 and 8 agree).
+TSM_FREQUENCY_TRIP = [
+    ("OF2", "above", 62.0, 0.16),
+    ("OF1", "above", 61.2, 300.0),
+    ("UF1", "below", 58.5, 300.0),
+    ("UF2", "below", 56.5, 0.16),
+]
+
+#: TSM §4.1 — the lowest underfrequency load shedding step. Generation is
+#: required not to separate until every UFLS step has operated, which is why
+#: the underfrequency trip sits below it rather than above.
+TSM_UFLS_LOWEST_STEP_HZ = 58.3
+
 
 #: How PSCo reads Figure 1's undefined "annual average load demand", stated in
 #: the report wherever the test is applied.

@@ -51,6 +51,17 @@ from pq_constants import (
     REACTIVE_MODES,
     PF_DIRECTION_LABELS,
     TSM_PF_TEST_MIN_OUTPUT,
+    TSM_DEFAULT_FUNCTIONS,
+    TSM_VOLTAGE_TRIP,
+    TSM_FREQUENCY_TRIP,
+    TSM_UFLS_LOWEST_STEP_HZ,
+    VOLT_WATT_V1_PU,
+    VOLT_WATT_V2_PU,
+    VOLT_WATT_P2_FRAC,
+    VOLT_VAR_DEADBAND_PU,
+    VOLT_VAR_ENDPOINT_PU,
+    VOLT_VAR_Q_FRAC,
+    VOLT_VAR_VREF_TAU_S,
     IL_CONVERSION_PF,
     _impedance_range,
     expected_service_impedance,
@@ -1949,6 +1960,278 @@ def check_der_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "the agreement actually states."),
         })
     return out
+
+
+def _service_v_pu(df: pd.DataFrame, thresh: Thresholds) -> Optional[pd.Series]:
+    """Service voltage in per unit of nominal, averaged across the phases.
+
+    The volt-watt and volt-VAR curves are written against "the voltage", which
+    at the reference point of applicability is one number.  Averaging the
+    phases is the reading that matches a three-phase inverter's own sensing;
+    the worst phase is the right choice for a ride-through table and the wrong
+    one here, because an inverter does not curtail on one leg.
+    """
+    v_cols = [c for c in ("voltage_a", "voltage_b", "voltage_c") if c in df.columns]
+    if not v_cols or not thresh.nominal_voltage:
+        return None
+    v = df[v_cols].mean(axis=1).dropna()
+    return (v / thresh.nominal_voltage) if not v.empty else None
+
+
+def volt_watt_limit_pu(v_pu: float) -> float:
+    """Fraction of rated active power the volt-watt curve permits at a voltage.
+
+    TSM 6.3.4 Table 3: full output up to 1.06 p.u., then a straight line down
+    to 0.2 Prated at 1.10 p.u., and no further reduction above that.
+    """
+    if v_pu <= VOLT_WATT_V1_PU:
+        return 1.0
+    if v_pu >= VOLT_WATT_V2_PU:
+        return VOLT_WATT_P2_FRAC
+    span = VOLT_WATT_V2_PU - VOLT_WATT_V1_PU
+    return 1.0 - (1.0 - VOLT_WATT_P2_FRAC) * (v_pu - VOLT_WATT_V1_PU) / span
+
+
+def check_volt_watt(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """Voltage-active power control, IEEE 1547-2018 5.4.2 / PSCo TSM 6.3.4.
+
+    Volt-watt is enabled by default at PSCo (TSM Table 1) and the DER may need
+    a settings change to get there, because 1547's own default is disabled.
+    Above 1.06 p.u. -- the top of ANSI C84.1 Range A -- the plant is required to
+    reduce active power on a straight line to 0.2 of rating at 1.10 p.u.
+
+    This reads in two directions at once, which is why it is worth having:
+
+      * Towards the plant.  Output above the curve while the voltage was high
+        says the function was not doing what it was required to do.  That is
+        the witness-test question, asked over a week rather than an afternoon.
+      * Towards us.  Every interval spent above 1.06 p.u. is production the
+        customer did not get, and the cause of the high voltage is usually on
+        the Area EPS side of the meter.  A plant curtailing correctly is
+        compliant and still losing money, and the operator will want the
+        number.
+
+    What this cannot do is separate curtailment from a passing cloud.  Output
+    below the curve is consistent with the function working and equally
+    consistent with the sun going in, and nothing in a revenue recording tells
+    them apart.  So a plant at or under the curve is reported as "consistent
+    with", never as verified, and only output *above* the curve is a finding.
+    """
+    out: dict = {"available": False, "assessed": False, "error": None,
+                 "n_high_voltage": 0, "violation_timestamps": pd.DatetimeIndex([])}
+
+    if not exports_power(thresh):
+        out["error"] = ("Voltage-active power control applies to a distributed "
+                        "energy resource. This service has none.")
+        return out
+    if not thresh.rated_ac_kw or thresh.rated_ac_kw <= 0:
+        out["error"] = ("The curve is a fraction of the plant's rating, so the "
+                        "nameplate is needed before anything can be compared "
+                        "against it.")
+        return out
+
+    v_pu = _service_v_pu(df, thresh)
+    if v_pu is None or "power_real" not in df.columns:
+        out["error"] = ("Needs service voltage and real power together; one of "
+                        "them is missing from this recording.")
+        return out
+
+    rated = float(thresh.rated_ac_kw)
+    export_kw = (-df["power_real"] / 1000.0).reindex(v_pu.index)
+    frame = pd.concat([v_pu.rename("v"), export_kw.rename("kw")],
+                      axis=1, join="inner").dropna()
+    frame = frame[frame["kw"] > 0]                      # exporting only
+    if frame.empty:
+        out.update({"available": True,
+                    "error": "The plant did not export during this recording."})
+        return out
+
+    high = frame[frame["v"] > VOLT_WATT_V1_PU]
+    out.update({
+        "available":       True,
+        "assessed":        True,
+        "rated_kw":        rated,
+        "v1_pu":           VOLT_WATT_V1_PU,
+        "v2_pu":           VOLT_WATT_V2_PU,
+        "n_exporting":     int(len(frame)),
+        "n_high_voltage":  int(len(high)),
+        "pct_high_voltage": float(len(high) / len(frame) * 100),
+        "max_v_pu":        float(frame["v"].max()),
+    })
+    if high.empty:
+        out["note"] = (
+            f"The service voltage stayed at or below {VOLT_WATT_V1_PU:.2f} p.u. "
+            f"whenever the plant was exporting, peaking at "
+            f"{frame['v'].max():.3f} p.u., so the volt-watt curve was never "
+            f"reached and no curtailment was called for. The function cannot be "
+            f"confirmed active from a recording in which it was never asked to "
+            f"act.")
+        return out
+
+    allowed_kw = high["v"].map(volt_watt_limit_pu) * rated
+    over = high["kw"] > allowed_kw * 1.02          # 2% for metering tolerance
+    # Production the curve required the plant to give up, which is the number
+    # the operator wants: it is the cost of the high voltage, not of the plant.
+    forgone = (rated - allowed_kw).clip(lower=0.0)
+    hours = _interval_hours(frame.index)
+    out.update({
+        "n_above_curve":       int(over.sum()),
+        "pct_above_curve":     float(over.mean() * 100),
+        "worst_excess_kw":     float((high["kw"] - allowed_kw).max()),
+        "curtailment_kwh":     float(forgone.sum() * hours),
+        "interval_hours":      hours,
+        "min_allowed_frac":    float(high["v"].map(volt_watt_limit_pu).min()),
+        "violation_timestamps": high.index[over],
+        "curve_respected":     bool(not over.any()),
+    })
+    return out
+
+
+def volt_var_required_q_frac(v_pu: float, vref_pu: float) -> float:
+    """Reactive power the volt-VAR curve calls for, as a fraction of rated kVA.
+
+    Positive is absorption, matching the load sign convention used throughout.
+    TSM 6.3.3 Table 2, inverter-based DER: flat zero within +/-0.02 of VRef,
+    then straight to +/-44% of nameplate apparent power at +/-0.08, and flat
+    beyond.  Voltage above VRef calls for absorption, which pulls it back down.
+    """
+    d = v_pu - vref_pu
+    if abs(d) <= VOLT_VAR_DEADBAND_PU:
+        return 0.0
+    span = VOLT_VAR_ENDPOINT_PU - VOLT_VAR_DEADBAND_PU
+    frac = min(1.0, (abs(d) - VOLT_VAR_DEADBAND_PU) / span) * VOLT_VAR_Q_FRAC
+    return frac if d > 0 else -frac
+
+
+def check_volt_var(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """Voltage-reactive power control, IEEE 1547-2018 5.3.3 / PSCo TSM 6.3.3.
+
+    The mode TSM Table 1 makes the default, and the one a fixed power factor
+    setpoint is the legacy alternative to.  The curve is written against VRef
+    rather than nominal, and VRef is not a setting: the DER tracks it as a low
+    pass filtered measurement with a 300 s time constant, so the whole curve
+    slides with the service over a day.
+
+    **That time constant is why this check is bounded.**  At a 5-minute
+    interval the filter has already settled between one sample and the next, so
+    the reconstructed VRef sits almost on top of the measured voltage, the
+    deadband swallows the difference, and the curve asks for approximately zero
+    reactive power at every interval.  Verifying the curve properly needs data
+    at or below the 5 s open-loop response time -- a commissioning capture, not
+    a revenue recording.  Rather than compute a comparison that is arithmetic
+    against itself, this reports:
+
+      * the reconstructed VRef and required Q where the interval is short
+        enough for them to mean anything, and
+      * in every case, the two things interval data *can* answer: whether the
+        reactive flow moved with voltage in the direction the curve requires,
+        and whether it stayed inside the +/-44% capability the plant owes.
+
+    A plant whose reactive power does not track voltage at all is either not in
+    this mode or has the function disabled, and that is worth saying even when
+    the curve itself cannot be checked.
+    """
+    out: dict = {"available": False, "assessed": False, "error": None,
+                 "curve_assessable": False,
+                 "violation_timestamps": pd.DatetimeIndex([])}
+
+    if not exports_power(thresh):
+        out["error"] = ("Voltage-reactive power control applies to a "
+                        "distributed energy resource. This service has none.")
+        return out
+    if not thresh.rated_ac_kw or thresh.rated_ac_kw <= 0:
+        out["error"] = ("The curve is a fraction of nameplate apparent power, "
+                        "so the plant rating is needed to evaluate it.")
+        return out
+
+    v_pu = _service_v_pu(df, thresh)
+    if v_pu is None or "power_reactive" not in df.columns:
+        out["error"] = ("Needs service voltage and reactive power together; "
+                        "one of them is missing from this recording.")
+        return out
+
+    kvar = (df["power_reactive"] / 1000.0).reindex(v_pu.index)
+    frame = pd.concat([v_pu.rename("v"), kvar.rename("q")],
+                      axis=1, join="inner").dropna()
+    if "power_real" in df.columns:
+        exporting = (df["power_real"] < 0).reindex(frame.index).fillna(False)
+        frame = frame[exporting]
+    if len(frame) < 3:
+        out.update({"available": True,
+                    "error": "Too few exporting intervals to read a trend."})
+        return out
+
+    # Inverters are rated in kW AC at unity, so the nameplate stands in for the
+    # apparent power rating. Stated, because at a plant specified in kVA the
+    # capability envelope below would be that much wider.
+    rated = float(thresh.rated_ac_kw)
+    step_s = _interval_hours(frame.index) * 3600.0
+    out.update({
+        "available":     True,
+        "assessed":      True,
+        "rated_kva_basis": "kW AC nameplate (inverters are rated at unity)",
+        "rated_kva":     rated,
+        "interval_s":    step_s,
+        "vref_tau_s":    VOLT_VAR_VREF_TAU_S,
+        "capability_kvar": rated * VOLT_VAR_Q_FRAC,
+    })
+
+    # What interval data can answer. The curve asks for absorption above VRef,
+    # so a plant following it shows reactive power rising with voltage.
+    # A constant reactive output against a varying voltage is not an undefined
+    # correlation, it is the answer: the plant is not following the curve. Only
+    # a voltage that never moved leaves the question genuinely open, and the
+    # two cases have to be told apart because one is a finding and one is not.
+    v_moves = bool(frame["v"].std() > 0)
+    q_moves = bool(frame["q"].std() > 0)
+    if not v_moves:
+        out["v_q_correlation"], out["tracks_voltage"] = None, None
+    elif not q_moves:
+        out["v_q_correlation"], out["tracks_voltage"] = 0.0, False
+    else:
+        corr = float(frame["v"].corr(frame["q"]))
+        out["v_q_correlation"] = None if pd.isna(corr) else round(corr, 3)
+        out["tracks_voltage"] = (None if pd.isna(corr) else bool(corr > 0.3))
+
+    beyond = frame["q"].abs() > rated * VOLT_VAR_Q_FRAC * 1.02
+    out.update({
+        "n_intervals":        int(len(frame)),
+        "max_abs_kvar":       float(frame["q"].abs().max()),
+        "n_beyond_capability": int(beyond.sum()),
+        "within_capability":  bool(not beyond.any()),
+        "violation_timestamps": frame.index[beyond],
+    })
+
+    # The curve itself, only where the sampling can resolve it.
+    if step_s and step_s <= VOLT_VAR_VREF_TAU_S / 10.0:
+        alpha = 1.0 - math.exp(-step_s / VOLT_VAR_VREF_TAU_S)
+        vref = frame["v"].ewm(alpha=alpha, adjust=False).mean()
+        required = [volt_var_required_q_frac(v, r) * rated
+                    for v, r in zip(frame["v"], vref)]
+        err = (frame["q"] - pd.Series(required, index=frame.index)).abs()
+        out.update({
+            "curve_assessable":  True,
+            "mean_abs_error_kvar": float(err.mean()),
+            "max_abs_error_kvar":  float(err.max()),
+        })
+    else:
+        out["curve_note"] = (
+            f"VRef is a 300 s low-pass filter of the measured voltage, and this "
+            f"recording is at {step_s / 60:.0f}-minute intervals — the filter "
+            f"has settled between one sample and the next, so a reconstructed "
+            f"VRef would sit on top of the measured voltage and the curve would "
+            f"ask for no reactive power at any interval. Verifying the curve "
+            f"needs data at or below its 5 s response time. What is reported "
+            f"above is what this resolution can answer.")
+    return out
+
+
+def _interval_hours(index: pd.DatetimeIndex) -> float:
+    """Hours per interval, from the index rather than from an assumed 5 min."""
+    if len(index) < 2:
+        return 0.0
+    step = pd.Series(index).diff().dropna().median()
+    return float(step.total_seconds() / 3600.0) if pd.notna(step) else 0.0
 
 
 def check_trd(df: pd.DataFrame, thresh: Thresholds) -> dict:
@@ -4996,6 +5279,130 @@ def check_billing_demand_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict
         ],
     })
     return result
+
+
+def check_trip_settings(event_result: dict, ds, thresh: Thresholds) -> dict:
+    """Measured disturbances against the shall-trip settings, TSM 6.4.1 / 6.4.2.
+
+    `check_ride_through` asks which events the plant was obliged to survive.
+    This asks the opposite: which it was obliged to leave for.  The two are
+    complementary halves of the same tables and neither is the other's
+    negation -- between the ride-through region and the trip threshold there is
+    a band where the plant may do either.
+
+    Voltage settings are Table 4 (UV2 0.45 p.u./0.32 s, UV1 0.70/5.0, OV1
+    1.10/2.0, OV2 1.20/0.16) and frequency Table 6 (OF2 62.0 Hz/0.16 s, OF1
+    61.2/300, UF1 58.5/300, UF2 56.5/0.16).  The manual gives the same
+    frequency settings to inverter and synchronous machines.
+
+    A clearing time is a maximum, not a delay: an event that crossed a
+    threshold for longer than the clearing time is one the plant should no
+    longer have been connected through.  Whether it actually disconnected is
+    not in a recording taken at the meter -- what is in the recording is
+    whether the condition arose, which is the part a witness test cannot see
+    because it lasts an afternoon and these are rare.
+    """
+    out: dict = {"available": False, "voltage": [], "frequency": [],
+                 "n_trip_conditions": 0,
+                 "settings": {"voltage": TSM_VOLTAGE_TRIP,
+                              "frequency": TSM_FREQUENCY_TRIP}}
+
+    if not exports_power(thresh):
+        out["note"] = ("The shall-trip settings apply to a distributed energy "
+                       "resource. This service has none.")
+        return out
+
+    def _crossed(value, comparison, threshold):
+        return value > threshold if comparison == "above" else value < threshold
+
+    def _worst(value, table):
+        """The most severe threshold this value crossed, and its clearing time."""
+        hit = [row for row in table if _crossed(value, row[1], row[2])]
+        if not hit:
+            return None
+        # The most severe threshold crossed is the one furthest from nominal --
+        # the lowest of the undervoltage rows, the highest of the overvoltage
+        # ones -- which is also the one with the shortest clearing time. Not
+        # the threshold this value is furthest *from*: a sag to 0.30 p.u. is
+        # further below UV1 at 0.70 than below UV2 at 0.45, and picking that
+        # way reported the 5-second clearing time for an event that owed 0.32.
+        return max(hit, key=lambda r: abs(r[2] - 1.0))
+
+    # ── Voltage ───────────────────────────────────────────────────────────────
+    ev = (event_result or {}).get("events")
+    if ev is not None and len(ev):
+        vs = ev[ev["type"].isin(["voltage_sag", "voltage_swell"])]
+        vs = vs.dropna(subset=["value_v"]) if "value_v" in vs.columns else vs
+        for _, row in vs.iterrows():
+            v_pu = float(row["value_v"]) / thresh.nominal_voltage
+            hit = _worst(v_pu, TSM_VOLTAGE_TRIP)
+            if hit is None:
+                continue
+            label, _cmp, threshold, clearing = hit
+            secs = (float(row["duration_ms"]) / 1000.0
+                    if row.get("duration_ms") is not None
+                    and pd.notna(row.get("duration_ms")) else None)
+            out["voltage"].append({
+                "timestamp":   row.get("timestamp"),
+                "phase":       row.get("phase"),
+                "v_pu":        round(v_pu, 3),
+                "function":    label,
+                "threshold_pu": threshold,
+                "clearing_s":  clearing,
+                "duration_s":  None if secs is None else round(secs, 3),
+                # None where the recording carries no duration: the threshold
+                # was crossed, and for how long is the half that decides it.
+                "should_have_tripped": (None if secs is None
+                                        else bool(secs > clearing)),
+            })
+
+    # ── Frequency ─────────────────────────────────────────────────────────────
+    adaptive = getattr(ds, "adaptive_df", None) if ds is not None else None
+    freq = None
+    if adaptive is not None and "adap_freq" in getattr(adaptive, "columns", []):
+        freq = adaptive["adap_freq"].dropna()
+    if freq is not None and not freq.empty:
+        step_s = _interval_hours(freq.index) * 3600.0
+        for label, comparison, threshold, clearing in TSM_FREQUENCY_TRIP:
+            mask = (freq > threshold) if comparison == "above" else (freq < threshold)
+            if not mask.any():
+                continue
+            # Longest unbroken excursion, which is what a clearing time bounds.
+            run = mask.ne(mask.shift()).cumsum()[mask]
+            longest = int(run.value_counts().max()) if len(run) else 0
+            secs = longest * step_s
+            out["frequency"].append({
+                "function":     label,
+                "threshold_hz": threshold,
+                "clearing_s":   clearing,
+                "n_samples":    int(mask.sum()),
+                "worst_hz":     float(freq[mask].max() if comparison == "above"
+                                      else freq[mask].min()),
+                "longest_s":    round(secs, 3),
+                "should_have_tripped": bool(secs > clearing),
+            })
+        out["frequency_basis"] = f"continuous frequency at {step_s:.1f} s"
+    else:
+        out["frequency_note"] = (
+            "No continuous frequency record, so the frequency trip settings "
+            "were not evaluated. Interval averages cannot resolve them: a "
+            "20-second excursion to 57 Hz leaves a 5-minute mean at 60.")
+
+    fired = [e for e in out["voltage"] + out["frequency"]
+             if e.get("should_have_tripped")]
+    out.update({
+        "available":          True,
+        "n_trip_conditions":  len(fired),
+        "n_thresholds_crossed": len(out["voltage"]) + len(out["frequency"]),
+        "caveats": [
+            "A clearing time is a maximum, not a delay. Whether the plant "
+            "actually disconnected is not recoverable from a recording at the "
+            "revenue meter; what is recorded is that the condition arose.",
+            "PSCo's Technical Specifications Manual governs where it differs "
+            "from IEEE 1547-2018, and these are its Tables 4 and 6.",
+        ],
+    })
+    return out
 
 
 def check_ride_through(event_result: dict, thresh: Thresholds) -> dict:

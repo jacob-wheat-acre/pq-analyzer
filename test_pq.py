@@ -2354,6 +2354,236 @@ class TestFixedPowerFactorAgainstTheAgreement:
         assert r["mean_pf"] == pytest.approx(0.98, abs=0.001)
 
 
+class TestVoltWattCurtailment:
+    """TSM 6.3.4 Table 3 — the function that reads in both directions.
+
+    A plant above the curve is not doing what it was required to do. A plant
+    on the curve is compliant and losing production to a voltage that is
+    usually ours. Both are findings, for different people.
+    """
+
+    @staticmethod
+    def _df(v_pu, kw, nominal=277.0):
+        import pandas as pd
+        n = len(v_pu)
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame({
+            "voltage_a": [v * nominal for v in v_pu],
+            "voltage_b": [v * nominal for v in v_pu],
+            "voltage_c": [v * nominal for v in v_pu],
+            "power_real": [-x * 1000.0 for x in kw],
+        }, index=idx)
+
+    @staticmethod
+    def _t(**kw):
+        base = dict(nominal_voltage=277.0, customer_class="sg",
+                    service_role="generation", rated_ac_kw=1000.0)
+        base.update(kw)
+        return Thresholds(**base)
+
+    def test_the_curve_is_the_manuals_and_not_the_standards_default(self):
+        from pq_analysis import volt_watt_limit_pu
+        assert volt_watt_limit_pu(1.00) == 1.0        # nothing inside Range A
+        assert volt_watt_limit_pu(1.06) == 1.0        # knee
+        assert volt_watt_limit_pu(1.10) == pytest.approx(0.20)
+        assert volt_watt_limit_pu(1.20) == pytest.approx(0.20)   # flat beyond
+        assert volt_watt_limit_pu(1.08) == pytest.approx(0.60, abs=0.001)
+
+    def test_normal_voltage_never_calls_for_curtailment(self):
+        from pq_analysis import check_volt_watt
+        r = check_volt_watt(self._df([1.02] * 20, [1000.0] * 20), self._t())
+        assert r["assessed"] is True
+        assert r["n_high_voltage"] == 0
+        # And it says so rather than claiming the function was verified.
+        assert "cannot be confirmed active" in r["note"]
+
+    def test_output_above_the_curve_is_a_finding(self):
+        from pq_analysis import check_volt_watt
+        # 1.10 p.u. permits 200 kW of a 1000 kW plant. This one held 900.
+        r = check_volt_watt(self._df([1.10] * 20, [900.0] * 20), self._t())
+        assert r["n_above_curve"] == 20
+        assert r["curve_respected"] is False
+        assert r["worst_excess_kw"] == pytest.approx(700.0, abs=25.0)
+
+    def test_output_on_the_curve_is_consistent_but_never_verified(self):
+        from pq_analysis import check_volt_watt
+        r = check_volt_watt(self._df([1.10] * 20, [200.0] * 20), self._t())
+        assert r["curve_respected"] is True
+        assert r["n_above_curve"] == 0
+
+    def test_it_counts_the_production_the_high_voltage_cost(self):
+        from pq_analysis import check_volt_watt
+        # 20 intervals of 5 min at 1.10 p.u.: the curve gives up 800 kW each,
+        # so 800 kW x (20/12) h.
+        r = check_volt_watt(self._df([1.10] * 20, [200.0] * 20), self._t())
+        assert r["curtailment_kwh"] == pytest.approx(800.0 * 20 / 12, rel=0.02)
+
+    def test_no_nameplate_means_no_curve_to_compare_against(self):
+        from pq_analysis import check_volt_watt
+        r = check_volt_watt(self._df([1.10] * 20, [900.0] * 20),
+                            self._t(rated_ac_kw=None))
+        assert r["assessed"] is False
+        assert "nameplate" in r["error"]
+
+
+class TestVoltVarWithinWhatIntervalDataCanSay:
+    """TSM 6.3.3 Table 2, and the honest limit on checking it.
+
+    VRef is a 300 s low-pass filter of the measured voltage, so at 5-minute
+    intervals the filter has settled between samples and the curve asks for
+    nothing at every point. Saying that plainly is worth more than computing a
+    comparison that is arithmetic against itself.
+    """
+
+    @staticmethod
+    def _df(v_pu, kvar, nominal=277.0):
+        import pandas as pd
+        n = len(v_pu)
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame({
+            "voltage_a": [v * nominal for v in v_pu],
+            "voltage_b": [v * nominal for v in v_pu],
+            "voltage_c": [v * nominal for v in v_pu],
+            "power_real": [-500_000.0] * n,
+            "power_reactive": [q * 1000.0 for q in kvar],
+        }, index=idx)
+
+    @staticmethod
+    def _t(**kw):
+        base = dict(nominal_voltage=277.0, customer_class="sg",
+                    service_role="generation", rated_ac_kw=1000.0)
+        base.update(kw)
+        return Thresholds(**base)
+
+    def test_the_curve_absorbs_above_vref_and_injects_below(self):
+        from pq_analysis import volt_var_required_q_frac
+        assert volt_var_required_q_frac(1.00, 1.00) == 0.0       # deadband
+        assert volt_var_required_q_frac(1.015, 1.00) == 0.0      # still inside
+        assert volt_var_required_q_frac(1.08, 1.00) == pytest.approx(0.44)
+        assert volt_var_required_q_frac(0.92, 1.00) == pytest.approx(-0.44)
+        assert volt_var_required_q_frac(1.20, 1.00) == pytest.approx(0.44)
+
+    def test_reactive_following_voltage_reads_as_the_function_working(self):
+        from pq_analysis import check_volt_var
+        v = [1.00, 1.02, 1.04, 1.06, 1.08] * 4
+        q = [0.0, 50.0, 150.0, 250.0, 350.0] * 4
+        r = check_volt_var(self._df(v, q), self._t())
+        assert r["tracks_voltage"] is True
+        assert r["v_q_correlation"] > 0.9
+
+    def test_a_flat_reactive_output_does_not(self):
+        from pq_analysis import check_volt_var
+        # A plant on a fixed power factor: the reactive power tracks the real
+        # power, not the voltage, which is exactly the thing worth spotting.
+        v = [1.00, 1.02, 1.04, 1.06, 1.08] * 4
+        r = check_volt_var(self._df(v, [100.0] * 20), self._t())
+        assert r["tracks_voltage"] is False
+
+    def test_the_capability_envelope_is_checked_even_when_the_curve_is_not(self):
+        from pq_analysis import check_volt_var
+        # 44% of a 1000 kW nameplate is 440 kVAR.
+        r = check_volt_var(self._df([1.02] * 20, [600.0] * 20), self._t())
+        assert r["within_capability"] is False
+        assert r["n_beyond_capability"] == 20
+        assert r["capability_kvar"] == pytest.approx(440.0)
+
+    def test_five_minute_data_declines_the_curve_and_says_why(self):
+        from pq_analysis import check_volt_var
+        r = check_volt_var(self._df([1.02] * 20, [100.0] * 20), self._t())
+        assert r["curve_assessable"] is False
+        assert "300 s" in r["curve_note"]
+        assert "5 s" in r["curve_note"]
+
+    def test_fast_data_does_evaluate_the_curve(self):
+        import pandas as pd
+        from pq_analysis import check_volt_var
+        idx = pd.date_range("2025-01-01", periods=60, freq="10s")
+        df = pd.DataFrame({
+            "voltage_a": [1.02 * 277.0] * 60,
+            "voltage_b": [1.02 * 277.0] * 60,
+            "voltage_c": [1.02 * 277.0] * 60,
+            "power_real": [-500_000.0] * 60,
+            "power_reactive": [0.0] * 60,
+        }, index=idx)
+        r = check_volt_var(df, self._t())
+        assert r["curve_assessable"] is True
+        assert "mean_abs_error_kvar" in r
+
+
+class TestShallTripSettings:
+    """TSM Tables 4 and 6 — the complement of the ride-through tables.
+
+    Between the region a plant must ride through and the threshold it must trip
+    at there is a band where either behaviour is permitted, so this is not the
+    negation of `check_ride_through` and must not be written as one.
+    """
+
+    @staticmethod
+    def _events(rows):
+        import pandas as pd
+        return {"events": pd.DataFrame(rows)}
+
+    @staticmethod
+    def _t(**kw):
+        base = dict(nominal_voltage=277.0, customer_class="sg",
+                    service_role="generation")
+        base.update(kw)
+        return Thresholds(**base)
+
+    def test_a_deep_sag_past_its_clearing_time_should_have_tripped(self):
+        from pq_analysis import check_trip_settings
+        # UV2 is 0.45 p.u. with a 0.32 s clearing time.
+        ev = self._events([{"type": "voltage_sag", "value_v": 0.30 * 277.0,
+                            "duration_ms": 500.0, "phase": "a",
+                            "timestamp": "2025-01-01 00:00"}])
+        r = check_trip_settings(ev, None, self._t())
+        assert r["voltage"][0]["function"] == "UV2"
+        assert r["voltage"][0]["should_have_tripped"] is True
+        assert r["n_trip_conditions"] == 1
+
+    def test_the_same_sag_inside_its_clearing_time_is_not_a_trip_condition(self):
+        from pq_analysis import check_trip_settings
+        ev = self._events([{"type": "voltage_sag", "value_v": 0.30 * 277.0,
+                            "duration_ms": 200.0, "phase": "a",
+                            "timestamp": "2025-01-01 00:00"}])
+        r = check_trip_settings(ev, None, self._t())
+        assert r["voltage"][0]["should_have_tripped"] is False
+        assert r["n_trip_conditions"] == 0
+
+    def test_an_event_inside_every_threshold_produces_no_row(self):
+        from pq_analysis import check_trip_settings
+        # 0.85 p.u. is above UV1's 0.70 -- a ride-through question, not a trip.
+        ev = self._events([{"type": "voltage_sag", "value_v": 0.85 * 277.0,
+                            "duration_ms": 9000.0, "phase": "a",
+                            "timestamp": "2025-01-01 00:00"}])
+        r = check_trip_settings(ev, None, self._t())
+        assert r["voltage"] == []
+
+    def test_a_missing_duration_leaves_the_verdict_open(self):
+        from pq_analysis import check_trip_settings
+        import numpy as np
+        ev = self._events([{"type": "voltage_sag", "value_v": 0.30 * 277.0,
+                            "duration_ms": np.nan, "phase": "a",
+                            "timestamp": "2025-01-01 00:00"}])
+        r = check_trip_settings(ev, None, self._t())
+        # The threshold was crossed; for how long is the half that decides it.
+        assert r["voltage"][0]["should_have_tripped"] is None
+
+    def test_a_load_service_is_not_held_to_der_trip_settings(self):
+        from pq_analysis import check_trip_settings
+        ev = self._events([{"type": "voltage_sag", "value_v": 0.30 * 277.0,
+                            "duration_ms": 500.0, "phase": "a",
+                            "timestamp": "2025-01-01 00:00"}])
+        r = check_trip_settings(ev, None, self._t(service_role="load"))
+        assert r["available"] is False
+        assert r["voltage"] == []
+
+    def test_interval_averages_decline_the_frequency_settings(self):
+        from pq_analysis import check_trip_settings
+        r = check_trip_settings({"events": None}, None, self._t())
+        assert "20-second excursion" in r["frequency_note"]
+
+
 class TestSeverityGradesTheRightQuantity:
     """The margin has to describe whatever the verdict was reached on.
 

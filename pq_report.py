@@ -34,6 +34,7 @@ from pq_adapter import PQDataset
 from pq_constants import IL_CONVERSION_PF, TSM_PF_TEST_MIN_OUTPUT
 from pq_analysis import (check_ride_through, check_frequency_ride_through,
                          check_billing_demand_imbalance, check_der_power_factor,
+                         check_volt_watt, check_volt_var, check_trip_settings,
                          _IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
                          _MIN_LOADED_AMPS, _VOLTAGE_RESOLUTION_V,
                          applicable_current_standard, check_trd, exports_power,
@@ -452,6 +453,11 @@ def generate_report(
         # in: it needs only the events and the thresholds, both already to hand.
         "ride_through":                 check_ride_through(event_result, thresh),
         "frequency_ride_through":       check_frequency_ride_through(ds, thresh),
+        # The autonomous functions the plant is required to be running, and the
+        # settings it is required to leave on. Derived here with the rest.
+        "volt_watt":                    check_volt_watt(ds.df, thresh),
+        "volt_var":                     check_volt_var(ds.df, thresh),
+        "trip_settings":                check_trip_settings(event_result, ds, thresh),
         "billing_demand_imbalance":     check_billing_demand_imbalance(ds.df, thresh),
         "neutral_health":               neutral_health_result or {"available": False, "reason": "not run"},
         "service_impedance":            impedance_result or {"available": False,
@@ -4855,6 +4861,211 @@ def _word_events(doc, report, outdir=None, stem="") -> Optional[str]:
     return None
 
 
+def _word_der_verification(doc, report, thresh) -> None:
+    """The autonomous functions a plant is required to be running.
+
+    Written as its own section, and only for a generating service. The rest of
+    the document asks what the service did to the system; this asks whether the
+    plant is set up the way its interconnection agreement and PSCo's Technical
+    Specifications Manual require -- which is the witness test's question, asked
+    over the length of a recording instead of an afternoon.
+
+    A witness test sees one configuration on one day at one irradiance. A week
+    of interval data sees the conditions that never arise on command: the
+    voltage excursion that calls for curtailment, the frequency excursion that
+    the trip settings are written for. It cannot replace the test -- it cannot
+    command a condition, and it cannot see whether the plant actually
+    disconnected -- but it covers the part the test cannot reach.
+    """
+    vw = report.get("volt_watt") or {}
+    vv = report.get("volt_var") or {}
+    ts = report.get("trip_settings") or {}
+    if not exports_power(thresh):
+        return
+    if not any(x.get("available") or x.get("error") for x in (vw, vv, ts)):
+        return
+
+    _section_heading(doc, "DER Interconnection Verification", level=1)
+    _body(doc,
+        "PSCo's Technical Specifications Manual (01/01/2025) sets which "
+        "autonomous inverter functions are enabled by default and what "
+        "settings they carry. Where the manual differs from IEEE 1547-2018 it "
+        "says the manual governs, so the figures below are the manual's. This "
+        "section reads a recording against them: it is the part of a witness "
+        "test that a single site visit cannot cover, because the conditions "
+        "these functions exist for do not arrive on demand.")
+
+    # ── Volt-Watt ─────────────────────────────────────────────────────────────
+    _section_heading(doc, "Voltage-active power (volt-watt)", level=2)
+    if not vw.get("assessed"):
+        _body(doc, vw.get("error") or vw.get("note") or "Not assessed.")
+    else:
+        _body(doc,
+            f"TSM §6.3.4 enables volt-watt by default and IEEE 1547-2018 does "
+            f"not, so a certified inverter may need a settings change to reach "
+            f"it. Above {vw['v1_pu']:.2f} p.u. the plant must reduce active "
+            f"power on a straight line to 20% of rating at {vw['v2_pu']:.2f} "
+            f"p.u. Service voltage peaked at {_m(vw['max_v_pu'], '.3f')} p.u. "
+            f"while exporting.")
+        if not vw.get("n_high_voltage"):
+            _body(doc, vw.get("note") or "")
+        else:
+            _body(doc,
+                f"The voltage was above the {vw['v1_pu']:.2f} p.u. knee for "
+                f"{vw['n_high_voltage']:,} of {vw['n_exporting']:,} exporting "
+                f"intervals ({_mp(vw['pct_high_voltage'], '.1f')}). At the "
+                f"worst of those the curve permitted "
+                f"{_mp(vw['min_allowed_frac'] * 100, '.0f')} of rating.")
+            if vw.get("curve_respected"):
+                _body(doc,
+                    f"Output stayed at or below the curve throughout, which is "
+                    f"consistent with the function being active. It is not "
+                    f"proof of it: a recording cannot separate curtailment from "
+                    f"a passing cloud, and both look like output below the "
+                    f"curve. Only output above it would be a finding.")
+            else:
+                _body(doc,
+                    f"Output exceeded the curve during {vw['n_above_curve']:,} "
+                    f"intervals, by up to "
+                    f"{_m(vw['worst_excess_kw'], ',.0f', ' kW')}. That is a "
+                    f"finding: the plant was producing more than the volt-watt "
+                    f"curve permits at the voltage measured, which is what the "
+                    f"function is there to prevent. Check whether "
+                    f"voltage-active power control is enabled at the inverter — "
+                    f"1547's own default is disabled, and a plant commissioned "
+                    f"to the standard rather than to this manual will have been "
+                    f"left that way.")
+            if vw.get("curtailment_kwh"):
+                _body(doc,
+                    f"Read the other way, the curve gave up roughly "
+                    f"{_m(vw['curtailment_kwh'], ',.0f', ' kWh')} of production "
+                    f"over this recording — energy the customer did not get "
+                    f"because the voltage at their point of interconnection was "
+                    f"above Range A. The cause of that voltage is usually on "
+                    f"the Area EPS side of the meter, and TSM §6.3.4 puts the "
+                    f"investigation on us where it is: a plant curtailing "
+                    f"correctly is compliant and still losing money.")
+
+    # ── Volt-VAR ──────────────────────────────────────────────────────────────
+    _section_heading(doc, "Voltage-reactive power (volt-VAR)", level=2)
+    if not vv.get("assessed"):
+        _body(doc, vv.get("error") or "Not assessed.")
+    else:
+        _body(doc,
+            f"TSM §6.3.3 Table 2 sets the default curve: no reactive power "
+            f"within ±0.02 p.u. of VRef, rising to ±44% of nameplate apparent "
+            f"power at ±0.08 p.u. Here that capability is "
+            f"±{_m(vv['capability_kvar'], ',.0f', ' kVAR')}, taken from the "
+            f"{vv['rated_kva_basis']}. Reactive flow reached "
+            f"{_m(vv['max_abs_kvar'], ',.0f', ' kVAR')} at most, "
+            + ("inside that envelope." if vv.get("within_capability") else
+               f"which is beyond it on {vv['n_beyond_capability']:,} "
+               f"intervals."))
+        tracks = vv.get("tracks_voltage")
+        corr = vv.get("v_q_correlation")
+        if tracks is None:
+            _body(doc, "The service voltage did not vary enough over this "
+                       "recording to say whether reactive power followed it.")
+        elif tracks:
+            _body(doc,
+                f"Reactive power moved with voltage (correlation {corr:+.2f}), "
+                f"in the direction the curve requires — absorbing as voltage "
+                f"rises. That is consistent with the function being active.")
+        else:
+            _body(doc,
+                f"Reactive power did not follow voltage (correlation "
+                f"{corr:+.2f}). Under voltage-reactive power control it should: "
+                f"the plant absorbs as voltage rises and injects as it falls. A "
+                f"flat or contrary relationship suggests the plant is in a "
+                f"different mode — a fixed power factor, most likely — or that "
+                f"the function is disabled. Worth confirming against the "
+                f"interconnection agreement.")
+        if vv.get("curve_assessable"):
+            _body(doc,
+                f"Against the reconstructed curve the reactive power differed "
+                f"by {_m(vv['mean_abs_error_kvar'], ',.1f', ' kVAR')} on "
+                f"average and {_m(vv['max_abs_error_kvar'], ',.1f', ' kVAR')} "
+                f"at worst.")
+        else:
+            _body(doc, vv.get("curve_note") or "")
+
+    # ── Shall-trip ────────────────────────────────────────────────────────────
+    _section_heading(doc, "Shall-trip settings", level=2)
+    if not ts.get("available"):
+        _body(doc, ts.get("note") or "Not assessed.")
+    else:
+        _body(doc,
+            "TSM §6.4.1.1 Table 4 and §6.4.2.1 Table 6 give the voltage and "
+            "frequency conditions the plant is required to disconnect for. "
+            "These are the complement of the ride-through tables rather than "
+            "their negation: between the region a plant must ride through and "
+            "the threshold it must trip at, either behaviour is permitted.")
+        rows = ts.get("voltage") or []
+        if rows:
+            _body(doc,
+                f"The service voltage crossed a shall-trip threshold on "
+                f"{len(rows):,} occasion(s). "
+                + (f"{sum(1 for r in rows if r['should_have_tripped'])} lasted "
+                   f"longer than the clearing time, and the plant should not "
+                   f"have remained connected through them."
+                   if any(r["should_have_tripped"] for r in rows) else
+                   "None lasted longer than its clearing time."))
+            _der_trip_table(doc, rows)
+        else:
+            _body(doc, "The service voltage did not cross any shall-trip "
+                       "threshold during this recording.")
+        frows = ts.get("frequency") or []
+        if ts.get("frequency_note"):
+            _body(doc, ts["frequency_note"])
+        elif frows:
+            _body(doc,
+                "System frequency crossed the following thresholds. The "
+                "underfrequency settings sit below the lowest underfrequency "
+                "load shedding step (58.3 Hz) by design — TSM §4.1 requires "
+                "generation to stay on until every shedding step has operated.")
+            for r in frows:
+                _body(doc,
+                    f"{r['function']}: {r['threshold_hz']:.1f} Hz, "
+                    f"clearing {r['clearing_s']:.2f} s. Reached "
+                    f"{_m(r['worst_hz'], '.2f', ' Hz')}, longest unbroken "
+                    f"excursion {_m(r['longest_s'], '.1f', ' s')}"
+                    + (" — beyond the clearing time."
+                       if r["should_have_tripped"] else "."))
+        else:
+            _body(doc, "System frequency stayed inside every shall-trip "
+                       "threshold during this recording.")
+        for c in ts.get("caveats") or []:
+            _body(doc, c)
+    doc.add_paragraph()
+
+
+def _der_trip_table(doc, rows) -> None:
+    """One row per threshold crossing, worst first."""
+    tbl = doc.add_table(rows=1, cols=5)
+    tbl.style = "Table Grid"
+    _set_col_widths(tbl, [3.8, 2.4, 3.0, 3.0, 4.3])
+    for cell, text in zip(tbl.rows[0].cells,
+                          ["When", "Phase", "Measured", "Threshold",
+                           "Duration vs clearing"]):
+        _cell_shade(cell, _CHROME_HDR)
+        r = cell.paragraphs[0].add_run(text)
+        r.bold = True
+        r.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        r.font.size = Pt(10)
+    for row in sorted(rows, key=lambda e: abs(e["v_pu"] - 1.0), reverse=True)[:20]:
+        cells = tbl.add_row().cells
+        dur = ("duration not resolved" if row["duration_s"] is None else
+               f"{row['duration_s']:.3f} s vs {row['clearing_s']:.2f} s"
+               + (" — beyond" if row["should_have_tripped"] else " — inside"))
+        for cell, text in zip(cells, [
+                str(row.get("timestamp") or "—"),
+                _phase_label(row.get("phase")) if row.get("phase") else "—",
+                f"{row['v_pu']:.3f} p.u.",
+                f"{row['function']} {row['threshold_pu']:.2f} p.u.",
+                dur]):
+            cell.paragraphs[0].add_run(text).font.size = Pt(9)
+
+
 def _word_measurement_review(doc, report, thresh, df, outdir=None, stem="") -> None:
     """Detailed Measurement Review — supporting measurements, after conclusions.
     Sections without usable data are suppressed and summarized in one line."""
@@ -5599,6 +5810,7 @@ def generate_word_report(
     _word_terms_pointer(doc, report)
     _word_measurement_review(doc, report, thresh, df, outdir, stem)
     _word_harmonics(doc, report, thresh, df, outdir, stem)
+    _word_der_verification(doc, report, thresh)
     _word_key_findings(doc, key_findings)
     _word_engineering_assessment(doc, report)
     _word_recommended_actions(doc, actions)
