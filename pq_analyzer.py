@@ -84,6 +84,7 @@ from pq_plots import (
     plot_harmonic_trend,
     plot_imbalance,
     plot_flicker,
+    plot_real_reactive,
     plot_pf_load,
     plot_waveform_capture,
 )
@@ -344,6 +345,26 @@ EXAMPLES
                         "from the interconnection agreement. Sets the voltage "
                         "ride-through the plant owes under Clause 6.4.2 — at "
                         "0.75 p.u. that is 0.9 s under I and 20 s under III.")
+    p.add_argument("--reactive-mode", default=None,
+                   choices=["fixed_pf", "volt_var", "constant_q", "watt_var"],
+                   help="IEEE 1547-2018 Clause 5 reactive power control function "
+                        "the plant is running. Only fixed_pf is assessed; the "
+                        "others are named so the report can say why it did not "
+                        "grade a varying reactive output against a fixed figure.")
+    p.add_argument("--pf-setpoint", type=float, default=None,
+                   help="Power factor magnitude the interconnection agreement "
+                        "specifies, e.g. 0.98. PSCo TSM 6.3.2 uses 0.98 "
+                        "absorbing where nothing else is specified.")
+    p.add_argument("--pf-direction", default=None,
+                   choices=["absorbing", "injecting", "unity"],
+                   help="Direction of the reactive flow the agreement requires "
+                        "while exporting. Entered separately from the magnitude "
+                        "because a signed setpoint means different things to "
+                        "different readers.")
+    p.add_argument("--pf-tolerance", type=float, default=None,
+                   help="Permitted deviation from the setpoint magnitude. Omit "
+                        "and the deviation is reported without a verdict rather "
+                        "than graded against an invented band.")
     p.add_argument("--il-amps", type=float, default=None,
                    help="Maximum demand load current from billing: the twelve "
                         "previous months' 15- or 30-min maximum demands, averaged, "
@@ -420,6 +441,10 @@ def main():
         rated_ac_kw=args.rated_ac_kw,
         avg_peak_demand_kw=args.avg_peak_demand_kw,
         der_category=args.der_category,
+        der_reactive_mode=args.reactive_mode,
+        der_pf_setpoint=args.pf_setpoint,
+        der_pf_direction=args.pf_direction,
+        der_pf_tolerance=args.pf_tolerance,
         service_type=args.service_type,
         topology=args.topology,
         conductor_key=args.conductor,
@@ -561,6 +586,7 @@ def main():
         plot_harmonic_trend(df, outdir=outdir, stem=stem)
         plot_imbalance(df, imb_result, curr_imb_result, outdir=outdir, stem=stem)
         plot_pf_load(df, pf_result, outdir=outdir, stem=stem)
+        plot_real_reactive(df, pf_result, outdir=outdir, stem=stem)
         plot_flicker(df, flicker_result, outdir=outdir, stem=stem)
         plot_waveform_capture(ds, thresh, outdir=outdir, stem=stem)
         log.info("All plots saved to %s/", outdir)

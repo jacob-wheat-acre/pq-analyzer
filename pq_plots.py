@@ -988,6 +988,101 @@ def plot_pf_load(
     _save(fig, outdir, stem, "pf_load.png")
 
 
+def plot_real_reactive(
+    df: pd.DataFrame,
+    pf_result: dict,
+    outdir: Optional[Path] = None,
+    stem: str = "",
+) -> None:
+    """Real and reactive power against time, with the zero line as the subject.
+
+    A power factor magnitude cannot say which way either flow is going, and at
+    a plant that is the whole question: an interconnection agreement written as
+    "-0.98" means exporting watts while absorbing VAR, and 0.98 injecting is
+    the same number describing the opposite behaviour.  Two traces either side
+    of zero settle it on sight, which is why this is drawn rather than
+    described -- it is what an engineer reaches for when asked to show that the
+    watts went out and the VAR came in.
+
+    Sign convention is the load convention used throughout: positive real power
+    is imported, positive reactive power is absorbed.  It is stated on both
+    axes rather than assumed, because the opposite convention is equally common
+    in the field and reading this chart under it inverts every conclusion.
+
+    Two panels rather than two traces on one axis.  At a plant holding 0.98 the
+    reactive flow is a fifth of the real one, and at 0.998 it is a fiftieth: on
+    a shared scale the VAR trace flattens onto the zero line and the one thing
+    the chart exists to show -- which side of zero it sits on -- becomes
+    unreadable at exactly the sites that need it.  A second y-axis on the same
+    panel would fix the legibility by making 2 kVAR look the size of 200 kW,
+    which is worse.  Separate panels keep each flow legible on its own scale
+    and leave the ratio to the power factor figure, which is what a ratio is.
+    """
+    if "power_real" not in df.columns or "power_reactive" not in df.columns:
+        return
+    p = _to_kilo(df["power_real"])
+    q = _to_kilo(df["power_reactive"])
+    aligned = pd.concat([p.rename("p"), q.rename("q")], axis=1).dropna()
+    if aligned.empty:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    panels = (
+        (axes[0], "p", _PH_A, "Real power (kW)",
+         "imported", "exported"),
+        (axes[1], "q", _PH_B, "Reactive power (kVAR)",
+         "absorbed", "injected"),
+    )
+    for ax, col, colour, ylabel, above, below in panels:
+        ax.plot(aligned.index, aligned[col], color=colour, lw=0.9)
+
+        # Zero is the reading, so it is drawn as a rule rather than a gridline,
+        # and each half-plane is named where the reader is already looking.
+        ax.axhline(0, color="#333333", lw=1.2)
+        # Both halves stay on the chart even when the trace never crosses:
+        # a panel auto-scaled to an all-negative trace puts zero at the top
+        # edge, and "below the line" stops being visible as a fact.
+        lo, hi = ax.get_ylim()
+        pad = 0.08 * ((hi - lo) or 1.0)
+        ax.set_ylim(min(lo, -pad), max(hi, pad))
+        lo, hi = ax.get_ylim()
+        ax.annotate(f"+ {above}", xy=(0.004, 0.0),
+                    xycoords=("axes fraction", "data"),
+                    xytext=(0.004, 0.02 * (hi - lo)),
+                    textcoords=("axes fraction", "data"),
+                    fontsize=8, color="#555555", va="bottom")
+        ax.annotate(f"− {below}", xy=(0.004, 0.0),
+                    xycoords=("axes fraction", "data"),
+                    xytext=(0.004, -0.02 * (hi - lo)),
+                    textcoords=("axes fraction", "data"),
+                    fontsize=8, color="#555555", va="top")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    # Where the quadrant was determined, say which one and how much of the time
+    # -- the same figure the report text uses, so the caption and the picture
+    # cannot disagree.
+    # Placed under the title rather than inside a panel: anywhere in the data
+    # area is a position that collides with the trace on some other recording,
+    # and this line is the conclusion, so it must not land on top of the
+    # evidence for it.
+    _fmt_time_axis(axes[1], aligned.index)
+    fig.autofmt_xdate()
+    axes[1].set_xlabel("Time")
+    quad = (pf_result or {}).get("quadrants") or {}
+    axes[0].set_title("Real and Reactive Power",
+                      pad=20 if quad.get("dominant") else None)
+    if quad.get("dominant"):
+        axes[0].text(0.5, 1.015,
+                     f"{quad['dominant_pct']:.0f}% of assessed intervals: "
+                     f"{quad['dominant_label']}",
+                     transform=axes[0].transAxes, ha="center", va="bottom",
+                     fontsize=8, color="#555555")
+    fig.tight_layout()
+
+    _save(fig, outdir, stem, "real_reactive.png")
+
+
 def plot_flicker(
     df: pd.DataFrame,
     flicker_result: dict,

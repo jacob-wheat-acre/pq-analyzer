@@ -48,6 +48,9 @@ from pq_constants import (
     FREQ_CUMULATIVE_ALLOWANCE_S,
     FREQ_CUMULATIVE_WINDOW_S,
     HOUSE_INTERPRETATION_NOTE,
+    REACTIVE_MODES,
+    PF_DIRECTION_LABELS,
+    TSM_PF_TEST_MIN_OUTPUT,
     IL_CONVERSION_PF,
     _impedance_range,
     expected_service_impedance,
@@ -285,6 +288,32 @@ def applicable_current_standard(thresh: Thresholds) -> dict:
 
     rated = thresh.rated_ac_kw
     load  = thresh.avg_peak_demand_kw
+
+    # A producer's array never needs the ratio walked. Clause 5.2 scopes 519 to
+    # a PCC "primarily with harmonic producing loads" and sends an installation
+    # that is primarily inverter-based elsewhere, which a plant is by
+    # definition; the Figure 1 ratio exists to place the services in between.
+    # Requiring a demand figure here would be worse than pointless -- a plant
+    # billed for its auxiliary load has one, it is tiny, and its absence used
+    # to fall through to "undetermined" and grade the plant against 519.
+    if is_generation_only(thresh):
+        out.update({
+            "standard": "1547",
+            "branch":   "generation_only",
+            "der_share": (rated / load) if (rated and load and load > 0) else None,
+            "reason": (
+                "This installation is a generating facility rather than a load "
+                "with generation behind it, so it is primarily inverter-based "
+                "and IEEE 519-2022 Clause 5.2 places it outside that standard's "
+                "scope without reference to the Figure 1 ratio. The current "
+                "distortion limits below are IEEE 1547-2018 Clause 7.3 and are "
+                "stated as a percentage of the plant's rated current"
+                + (f" ({rated:,.0f} kW AC nameplate)." if rated else
+                   ", which was not supplied.")
+            ),
+        })
+        return out
+
     if not rated or not load or load <= 0:
         missing = []
         if not rated:
@@ -1486,6 +1515,54 @@ def check_thd(df: pd.DataFrame, thresh: Thresholds) -> dict:
     return result
 
 
+#: The four ways a service can sit in the P–Q plane, in the load sign
+#: convention this module uses throughout: real power positive is imported,
+#: reactive power positive is absorbed.  An interconnection agreement names
+#: one of these and a power factor magnitude together -- "-0.98" at a plant
+#: means exporting and absorbing -- and the magnitude alone cannot distinguish
+#: it from its opposite.
+_QUADRANT_LABELS = {
+    "export_absorb": "exporting real power, absorbing reactive",
+    "export_inject": "exporting real power, injecting reactive",
+    "import_absorb": "importing real power, absorbing reactive",
+    "import_inject": "importing real power, injecting reactive",
+}
+
+
+def _operating_quadrants(df: pd.DataFrame, scope: pd.Series) -> dict:
+    """Share of the scoped intervals spent in each P-Q quadrant.
+
+    Returns an empty dict where either power channel is missing, which is the
+    honest answer: the quadrant is not recoverable from a power factor
+    magnitude, and guessing it from the sign of the power factor would depend
+    on a convention the meter does not declare.
+    """
+    if "power_real" not in df.columns or "power_reactive" not in df.columns:
+        return {}
+    p = df["power_real"].reindex(scope.index)
+    q = df["power_reactive"].reindex(scope.index)
+    both = scope & p.notna() & q.notna()
+    n = int(both.sum())
+    if not n:
+        return {}
+    exporting = p < 0
+    absorbing = q > 0
+    out = {
+        "intervals":     n,
+        "export_absorb": float(( exporting &  absorbing)[both].mean() * 100),
+        "export_inject": float(( exporting & ~absorbing)[both].mean() * 100),
+        "import_absorb": float((~exporting &  absorbing)[both].mean() * 100),
+        "import_inject": float((~exporting & ~absorbing)[both].mean() * 100),
+        "mean_kw":       float(p[both].mean() / 1000.0),
+        "mean_kvar":     float(q[both].mean() / 1000.0),
+    }
+    key = max(_QUADRANT_LABELS, key=lambda k: out[k])
+    out["dominant"] = key
+    out["dominant_pct"] = out[key]
+    out["dominant_label"] = _QUADRANT_LABELS[key]
+    return out
+
+
 def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
     """Displacement power factor, graded on magnitude rather than on the sign.
 
@@ -1543,9 +1620,23 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
         convention = "leading"
 
     # The population the tariff clauses actually speak to.
+    plant = is_generation_only(thresh)
     scope = pd.Series(True, index=pf_raw.index)
     scope_note = None
-    if exports_power(thresh) and exporting is not None and exporting.any():
+    if plant and exporting is not None and exporting.any():
+        # A plant is scoped the opposite way round from a mixed service, and
+        # scoping it the same way is worse than useless. R73 and R121 describe
+        # what a load presents at the point of delivery; a producer's array
+        # presents none, and its importing intervals are the SCADA cabinet
+        # overnight. Confined to those, the load gate below then discards the
+        # lot and the check reports nothing at all -- while the population that
+        # matters, the displacement the inverters held while producing, goes
+        # unread. Here the exporting intervals are the measurement, and the
+        # figure they give is reported rather than graded: what a plant holds
+        # while exporting is set by its interconnection agreement.
+        scope = exporting.fillna(False)
+        scope_note = None
+    elif exports_power(thresh) and exporting is not None and exporting.any():
         scope = ~exporting.fillna(False)
         scope_note = (
             "Assessed over the importing intervals only. The tariff power "
@@ -1585,10 +1676,28 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
         s_va = None
     if s_va is not None:
         s_va = s_va.reindex(pf_raw.index)
-        peak = float(s_va.abs().max() or 0.0)
+        # The peak comes from the population being assessed, not from the whole
+        # recording. On a net-metered service the two are different numbers
+        # pointing opposite ways: the tariff population is the importing
+        # intervals, while the peak over the whole record is the midday export.
+        # Gating a 40 kW import against a 500 kW export peak discards every
+        # interval the clause applies to and reports "nothing carried enough
+        # load" about a service that ran all night. Each population is judged
+        # light or loaded against its own peak.
+        in_scope = s_va.abs()[scope]
+        peak = float(in_scope.max() or 0.0) if not in_scope.empty else 0.0
         if peak > 0:
             load_gate = s_va.abs() >= peak * _PF_LOAD_FLOOR_FRACTION
             scope = scope & load_gate.fillna(False)
+
+    # Which quadrant the service operated in, over the population being
+    # reported. This is what a power factor magnitude cannot say on its own:
+    # 0.98 exporting while absorbing reactive power is a plant doing the
+    # voltage mitigation its interconnection agreement asked for, and 0.98
+    # exporting while injecting is the same number describing the opposite
+    # behaviour. The signs of the two power channels settle it outright, so
+    # nothing here depends on how the meter chose to sign its power factor.
+    quadrants = _operating_quadrants(df, scope)
 
     graded = magnitude[scope]
     if graded.empty:
@@ -1602,11 +1711,45 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
             "mean_pf":              float(magnitude.mean()),
             "pct_below_limit":      None,
             "scope_note": (
+                "The plant did not produce at a tenth of its peak output at "
+                "any point in this recording, so there is no interval whose "
+                "displacement means anything."
+                if plant else
                 "No interval carried enough load for its power factor to mean "
                 "anything. Displacement at a small fraction of peak demand is "
                 "arithmetic rather than a finding."),
+            "quadrants":            quadrants,
             "violation_timestamps": pd.DatetimeIndex([]),
         }
+
+    if plant:
+        # Reported, not graded. There is no limit here to fall below: the
+        # figure is what the inverters were commanded to hold, and whether it
+        # is the right figure is a question for the interconnection agreement
+        # rather than for the tariff.
+        return {
+            "available":            True,
+            "error":                None,
+            "assessed":             False,
+            "basis":                "plant_export",
+            "limit":                None,
+            "convention":           convention,
+            "min_pf":               float(graded.min()),
+            "mean_pf":              float(graded.mean()),
+            "pct_below_limit":      None,
+            "intervals_used":       int(len(graded)),
+            "scope_note": (
+                "Measured over the intervals in which the plant was exporting "
+                "above a tenth of its peak output — the displacement the "
+                "inverters held while producing. PSCo Sheets R73 and R121 "
+                "describe the power factor a load presents at the point of "
+                "delivery, and a producer's array presents none, so no tariff "
+                "finding is made. The power factor a plant is required to hold "
+                "is set by its interconnection agreement."),
+            "quadrants":            quadrants,
+            "violation_timestamps": pd.DatetimeIndex([]),
+        }
+
     low = graded < thresh.power_factor_limit
     result = {
         "available":            True,
@@ -1617,6 +1760,7 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "min_pf":               float(graded.min()),
         "mean_pf":              float(graded.mean()),
         "pct_below_limit":      float(low.mean() * 100),
+        "quadrants":            quadrants,
         "violation_timestamps": graded.index[low],
     }
     if scope_note:
@@ -1627,6 +1771,184 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
         # factor is a different condition with a different cause.
         result["pct_leading"] = round(float(negative[scope].mean() * 100), 1)
     return result
+
+
+def _producing_scope(df: pd.DataFrame, thresh: Thresholds) -> Tuple[pd.Series, dict]:
+    """The intervals in which the plant was exporting hard enough to assess.
+
+    Two conditions, and the second is PSCo's own number rather than a house
+    one.  TSM §8.1 requires that at witness testing "the system must be
+    producing at least 15% of maximum generation capacity for a test to
+    continue", and names power factor among the things the witness verifies.
+    A displacement measured below the output the utility will not itself test
+    at is not a finding, so the same floor is applied here.
+
+    The floor is taken against the plant's rating where one was entered, and
+    against the largest export in the recording otherwise -- which is stated,
+    because a week of poor conditions moves that reference and the number of
+    intervals assessed with it.
+    """
+    info = {"basis": None, "reference_kw": None, "excluded_low_output": 0}
+    if "power_real" not in df.columns:
+        return pd.Series(False, index=df.index), info
+
+    p_kw = df["power_real"] / 1000.0
+    exporting = (p_kw < 0).fillna(False)
+    if not exporting.any():
+        return exporting, info
+
+    if thresh.rated_ac_kw and thresh.rated_ac_kw > 0:
+        reference, info["basis"] = float(thresh.rated_ac_kw), "nameplate"
+    else:
+        reference, info["basis"] = float(-p_kw[exporting].min()), "measured_peak"
+    info["reference_kw"] = reference
+
+    loaded = exporting & ((-p_kw) >= reference * TSM_PF_TEST_MIN_OUTPUT)
+    info["excluded_low_output"] = int((exporting & ~loaded).sum())
+    return loaded.fillna(False), info
+
+
+def check_der_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """What the plant held against what its interconnection agreement specifies.
+
+    This is a different question from `check_power_factor`, which asks whether a
+    *load* met a tariff clause.  No tariff clause reaches a generating facility:
+    PSCo Sheets R73 and R121 bind the power factor presented at the point of
+    delivery, and a plant presents none.  What binds a plant is its
+    interconnection agreement, per site, and the Technical Specifications Manual
+    §6.3.2 gives the value used where one is not otherwise specified -- "a 0.98
+    absorbing power factor shall be used".
+
+    Two findings, deliberately separated, because one of them needs a tolerance
+    and the other does not:
+
+      * **Direction.**  Absorbing against injecting is a hard fact with no band
+        around it.  An agreement written for voltage mitigation asks the plant
+        to draw VAR while exporting; a plant that injected instead was doing the
+        opposite of what it agreed to, whatever its magnitude.  This is graded.
+      * **Magnitude.**  0.98 against a measured 0.972 is a deviation, and
+        whether it is a violation depends on a tolerance the agreement may or
+        may not state.  Where no band was entered the deviation is reported and
+        no verdict is reached, rather than a house tolerance being invented and
+        then read back as though the agreement had specified it.
+
+    Only the fixed power factor mode is assessed.  Under voltage-reactive power
+    control -- which TSM Table 1 makes the default for certified inverters --
+    the reactive output is *required* to move with voltage, and grading that
+    against a fixed setpoint would report the correct behaviour as a fault.
+    Those modes return unavailable with the reason named.
+    """
+    mode = thresh.der_reactive_mode
+    spec = REACTIVE_MODES.get(mode or "")
+    out: dict = {
+        "available": False, "error": None, "mode": mode,
+        "mode_label": spec["label"] if spec else None,
+        "assessed": False, "setpoint": thresh.der_pf_setpoint,
+        "direction": thresh.der_pf_direction,
+        "tolerance": thresh.der_pf_tolerance,
+        "violation_timestamps": pd.DatetimeIndex([]),
+    }
+
+    if not exports_power(thresh):
+        out["error"] = ("This service has no generation behind it, so there is "
+                        "no interconnection agreement setting its power factor.")
+        return out
+    if not spec:
+        out["error"] = (
+            "The reactive power control mode was not entered, so the power "
+            "factor the plant owes is not known. IEEE 1547-2018 Clause 5 "
+            "defines several, only one is enabled at a time, and they cannot be "
+            "told apart from a recording: a plant holding a steady 0.98 and a "
+            "plant on voltage-reactive power control at a steady voltage "
+            "produce the same measurement.")
+        return out
+    if not spec["implemented"]:
+        out["error"] = (
+            f"This plant is on {spec['label'].lower()} ({spec['clause']}), for "
+            f"which no assessment is implemented. Its reactive output is "
+            f"required to vary — with voltage, with active power, or by "
+            f"schedule — so comparing it against a single figure would report "
+            f"correct operation as a deviation. The measured power factor is "
+            f"reported in the section above without a verdict.")
+        return out
+    if not thresh.der_pf_setpoint or not thresh.der_pf_direction:
+        out["error"] = (
+            "This plant is on fixed power factor, but the setpoint its "
+            "interconnection agreement specifies was not entered. PSCo's "
+            "Technical Specifications Manual §6.3.2 gives 0.98 absorbing where "
+            "nothing else is specified; it is entered rather than assumed "
+            "because the agreement governs and is written per site.")
+        return out
+
+    scope, scope_info = _producing_scope(df, thresh)
+    out.update({k: scope_info[k] for k in
+                ("basis", "reference_kw", "excluded_low_output")})
+    if "power_factor" not in df.columns:
+        out["error"] = "No power factor channel found."
+        return out
+    if not scope.any():
+        out["available"] = True
+        out["error"] = (
+            f"The plant did not reach {TSM_PF_TEST_MIN_OUTPUT * 100:.0f}% of "
+            f"its output at any point in this recording, which is the level "
+            f"PSCo's own witness testing requires before power factor is "
+            f"verified (TSM §8.1). Nothing here is assessable against the "
+            f"setpoint.")
+        return out
+
+    magnitude = df["power_factor"].abs()[scope].dropna()
+    if magnitude.empty:
+        out["available"] = True
+        out["error"] = "No power factor readings while the plant was producing."
+        return out
+
+    quadrants = _operating_quadrants(df, scope)
+    setpoint  = float(thresh.der_pf_setpoint)
+    direction = thresh.der_pf_direction
+
+    # Direction: graded, and against the reactive channel rather than the sign
+    # of the power factor, which the meter chooses for itself.
+    required_quadrant = {"absorbing": "export_absorb",
+                         "injecting": "export_inject"}.get(direction)
+    pct_right_way = (quadrants.get(required_quadrant)
+                     if required_quadrant and quadrants else None)
+
+    deviation = (magnitude - setpoint).abs()
+    tol = thresh.der_pf_tolerance
+    out.update({
+        "available":        True,
+        "assessed":         True,
+        "intervals_used":   int(len(magnitude)),
+        "mean_pf":          float(magnitude.mean()),
+        "min_pf":           float(magnitude.min()),
+        "max_pf":           float(magnitude.max()),
+        "mean_deviation":   float(deviation.mean()),
+        "max_deviation":    float(deviation.max()),
+        "quadrants":        quadrants,
+        "required_quadrant": required_quadrant,
+        "direction_label":  PF_DIRECTION_LABELS.get(direction or ""),
+        "pct_in_required_direction": pct_right_way,
+        "direction_pass":   (None if pct_right_way is None
+                             else bool(pct_right_way >= 95.0)),
+    })
+    if tol and tol > 0:
+        outside = deviation > tol
+        out.update({
+            "pct_outside_tolerance": float(outside.mean() * 100),
+            "magnitude_pass":        bool(not outside.any()),
+            "violation_timestamps":  magnitude.index[outside],
+        })
+    else:
+        out.update({
+            "pct_outside_tolerance": None,
+            "magnitude_pass":        None,
+            "tolerance_note": (
+                "No tolerance was entered, so the deviation above is reported "
+                "and not graded. A band is a term of the agreement; assuming "
+                "one here would be indistinguishable, on the page, from one "
+                "the agreement actually states."),
+        })
+    return out
 
 
 def check_trd(df: pd.DataFrame, thresh: Thresholds) -> dict:

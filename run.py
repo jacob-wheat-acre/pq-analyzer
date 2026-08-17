@@ -56,6 +56,11 @@ _SCHEDULE_KEY = {
 # Not a tariff schedule: NM and PV ride on top of the schedules above, and the
 # solar schedules where the array is off-site (OS-NM, RC, SRCS) measure as
 # plain load. What matters here is what is physically behind the meter.
+#: Width of the log column. Fixed rather than proportional: the log is
+#: timestamped lines of a known length, and a column that grew with the window
+#: would take the room the form's hints need instead.
+_LOG_COL_W = 380
+
 _ROLE_LABELS = [
     "Load only",
     "Load + generation  (NM, PV, RE, AVPP)",
@@ -65,6 +70,16 @@ _ROLE_KEY = {
     _ROLE_LABELS[0]: "load",
     _ROLE_LABELS[1]: "mixed",
     _ROLE_LABELS[2]: "generation",
+}
+
+
+#: Direction of the reactive flow the agreement asks for, while exporting.
+#: Absorbing is the voltage-mitigation case and the house default.
+_PF_DIR_LABELS = ["Absorbing VAR", "Injecting VAR", "Unity"]
+_PF_DIR_KEY = {
+    _PF_DIR_LABELS[0]: "absorbing",
+    _PF_DIR_LABELS[1]: "injecting",
+    _PF_DIR_LABELS[2]: "unity",
 }
 
 
@@ -85,9 +100,11 @@ def _float_or_none(text: str):
 try:
     sys.path.insert(0, str(Path(__file__).parent))
     from pq_constants import __version__ as _ENGINE_VERSION
-    from pq_constants import ansi_bands, ll_factor
+    from pq_constants import ansi_bands, ll_factor, REACTIVE_MODES
 except Exception:
     _ENGINE_VERSION = "unknown"
+    REACTIVE_MODES = {"fixed_pf": {"label": "Fixed power factor",
+                                   "implemented": True}}
 
     def ansi_bands(nominal_v):                       # type: ignore[misc]
         # C84.1 Table 1, over-600 V group, since this fallback is only ever
@@ -96,6 +113,21 @@ except Exception:
 
     def ll_factor(service_type=None, topology="auto"):   # type: ignore[misc]
         return 2.0 if topology == "split-phase" else 3.0 ** 0.5
+
+#: The IEEE 1547-2018 Clause 5 reactive power control functions, in the order an
+#: engineer meets them: the one that has actually been applied in the field
+#: first, the rest marked so nobody picks one expecting an assessment behind it.
+#: The marker is on the label rather than left to the report, because choosing a
+#: mode and getting silence back is worse than being told up front.
+_MODE_LABELS = ["— not specified —"] + [
+    spec["label"] + ("" if spec["implemented"] else "  (not yet assessed)")
+    for spec in REACTIVE_MODES.values()
+]
+_MODE_KEY = {"— not specified —": None}
+_MODE_KEY.update({
+    spec["label"] + ("" if spec["implemented"] else "  (not yet assessed)"): key
+    for key, spec in REACTIVE_MODES.items()
+})
 
 # ── Transformer / Blue Book data ──────────────────────────────────────────────
 # Import the same lookup tables used by the analysis engine so the GUI always
@@ -145,6 +177,7 @@ try:
         plot_harmonic_trend,
         plot_imbalance,
         plot_flicker,
+    plot_real_reactive,
     plot_pf_load,
         plot_waveform_capture,
         check_neutral_health,
@@ -282,11 +315,31 @@ class PQApp(tk.Tk):
         self.title(f"PQ Analyzer v{_ENGINE_VERSION}")
         self.resizable(True, True)
         self.configure(bg=_BG)
-        self.minsize(680, 520)
+        # Height is the scarce dimension -- a work PC at 1080p leaves about
+        # 1000 px once the taskbar is out -- so the minimum is set on width,
+        # which the two columns need, and kept low on height.
+        self.minsize(1040, 460)
         self._force_light_entries()
         self._set_icon()
         self._build_ui()
         self._running = False
+        self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        """Never open taller than the display it is opening on.
+
+        The reported symptom was the window running off the bottom of a work
+        PC. Two columns fixed the cause, but Windows DPI scaling can still
+        inflate every row on a machine this was never measured on, so the
+        window is clamped rather than trusted to fit. Width is left alone --
+        a window wider than the screen is a nuisance, a window taller than the
+        screen hides the Run button.
+        """
+        self.update_idletasks()
+        want_w, want_h = self.winfo_reqwidth(), self.winfo_reqheight()
+        max_h = self.winfo_screenheight() - 120     # taskbar, title bar, margin
+        max_w = self.winfo_screenwidth() - 40
+        self.geometry(f"{min(want_w, max_w)}x{min(want_h, max_h)}")
 
     def _force_light_entries(self):
         """Keep text fields light whatever the desktop appearance is set to.
@@ -462,8 +515,27 @@ class PQApp(tk.Tk):
         if not _BOOK_AVAILABLE:
             self._build_import_error_banner()
 
+        # ── Two columns ───────────────────────────────────────────────────────
+        # The form was a single stack with the log beneath it, which asked for
+        # 914 px of height and ran off the bottom of a 1080p screen once the
+        # session row and the interconnection block were both showing. The form
+        # needs about 450 px and the log took 272 of the rest, so the log moves
+        # alongside: screens are wider than they are tall, and none of the
+        # form's own rows had to be shortened or hidden to buy the space.
+        #
+        # `columns` is what every row below packs into, via `form`. The log
+        # column is fixed-width and does not stretch, so widening the window
+        # gives the extra room to the form and its hints.
+        columns = tk.Frame(self, bg=_BG)
+        columns.pack(fill="both", expand=True)
+        form = self._form = tk.Frame(columns, bg=_BG)
+        form.pack(side="left", fill="both", expand=True)
+        self._log_col = tk.Frame(columns, bg=_BG, width=_LOG_COL_W)
+        self._log_col.pack(side="right", fill="both")
+        self._log_col.pack_propagate(False)
+
         # ── File row ──────────────────────────────────────────────────────────
-        file_frame = self._file_frame = tk.Frame(self, bg=_BG)
+        file_frame = self._file_frame = tk.Frame(form, bg=_BG)
         file_frame.pack(fill="x", **pad)
 
         tk.Label(file_frame, text="PQD File", width=16, anchor="w",
@@ -484,7 +556,7 @@ class PQApp(tk.Tk):
         # Only one is analysed per run, so which one has to be the engineer's
         # choice rather than ours; the row stays hidden for the ordinary
         # single-session file so it is not one more thing to read past.
-        self._session_frame = tk.Frame(self, bg=_BG)
+        self._session_frame = tk.Frame(form, bg=_BG)
         tk.Label(self._session_frame, text="Session", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
         self._session_var = tk.StringVar()
@@ -499,7 +571,7 @@ class PQApp(tk.Tk):
         self._sessions: list = []
 
         # ── Customer name row ─────────────────────────────────────────────────
-        site_frame = tk.Frame(self, bg=_BG)
+        site_frame = tk.Frame(form, bg=_BG)
         site_frame.pack(fill="x", **pad)
 
         tk.Label(site_frame, text="Customer", width=16, anchor="w",
@@ -511,7 +583,7 @@ class PQApp(tk.Tk):
                  font=_FONT_UI_S).pack(side="left", padx=(6, 0))
 
         # ── Address row (auto-loads from filename) ────────────────────────────
-        addr_frame = tk.Frame(self, bg=_BG)
+        addr_frame = tk.Frame(form, bg=_BG)
         addr_frame.pack(fill="x", **pad)
 
         tk.Label(addr_frame, text="Address", width=16, anchor="w",
@@ -523,7 +595,7 @@ class PQApp(tk.Tk):
                  font=_FONT_UI_S).pack(side="left", padx=(6, 0))
 
         # ── Customer class row ────────────────────────────────────────────────
-        cclass_frame = tk.Frame(self, bg=_BG)
+        cclass_frame = tk.Frame(form, bg=_BG)
         cclass_frame.pack(fill="x", **pad)
 
         tk.Label(cclass_frame, text="Customer Class", width=16, anchor="w",
@@ -550,7 +622,7 @@ class PQApp(tk.Tk):
         # Three values rather than a checkbox: a plant that only generates is
         # not a further degree of a service that also generates, and the CT
         # polarity check treats them oppositely.
-        nm_frame = tk.Frame(self, bg=_BG)
+        nm_frame = tk.Frame(form, bg=_BG)
         nm_frame.pack(fill="x", **pad)
         tk.Label(nm_frame, text="Power flow", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
@@ -574,53 +646,167 @@ class PQApp(tk.Tk):
             bg=_BG, fg="#888888", font=_FONT_UI_S)
         rated_hint.pack(side="left", padx=(8, 0))
 
+        # Bound below, once the demand row it also drives has been built.
         def _sync_rated(*_a):
-            # The rating only means anything where there is generation, so it
-            # is greyed out rather than silently ignored. The demand figure
-            # below applies to every service and stays enabled.
-            on = _ROLE_KEY.get(self._role_var.get(), "load") != "load"
+            # Each figure is greyed out where it means nothing rather than
+            # silently ignored. The rating needs generation to be rated; the
+            # demand figure needs a load to have a demand, which a producer's
+            # array does not -- there its only job, the Figure 1 ratio, is
+            # already settled by 519 Clause 5.2.
+            role = _ROLE_KEY.get(self._role_var.get(), "load")
+            on = role != "load"
             state = "normal" if on else "disabled"
             rated_entry.configure(state=state)
             rated_hint.configure(fg="#888888" if on else "#555555")
 
-        role_combo.bind("<<ComboboxSelected>>", _sync_rated)
-        _sync_rated()
+            plant = role == "generation"
+            avg_entry.configure(state="disabled" if plant else "normal")
+            avg_label.configure(fg="#555555" if plant else _LABEL_FG)
+            avg_units.configure(fg="#555555" if plant else _LABEL_FG)
+            avg_hint.configure(
+                text=("(not needed at a plant — IL is the nameplate rating, "
+                      "and 1547 governs regardless of demand)" if plant else
+                      "(the 12 monthly maximum demands off billing, averaged — "
+                      "gives IL, and the load side of the 519/1547 test)"))
+
+            # The interconnection block goes away entirely on a load-only
+            # service rather than greying out: there is no agreement, so the
+            # fields are not merely inapplicable, they are about a document that
+            # does not exist for this site.
+            if on:
+                if not self._ic_frame.winfo_ismapped():
+                    self._ic_frame.pack(fill="x", before=self._svc_frame, **pad)
+            else:
+                self._ic_frame.pack_forget()
 
         # ── Billing demand row ────────────────────────────────────────────────
         # One figure off billing history doing two jobs, which is why it sits
         # on its own row with its own hint rather than sharing one. The 1547
         # category used to live here and took the hint with it, leaving the
         # field that needed explaining without any.
-        il_frame = tk.Frame(self, bg=_BG)
+        il_frame = tk.Frame(form, bg=_BG)
         il_frame.pack(fill="x", **pad)
-        tk.Label(il_frame, text="Avg peak demand", width=16, anchor="w",
-                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
+        avg_label = tk.Label(il_frame, text="Avg peak demand", width=16, anchor="w",
+                             bg=_BG, fg=_LABEL_FG, font=_FONT_UI)
+        avg_label.pack(side="left")
         self._avg_peak_var = tk.StringVar(value="")
-        tk.Entry(il_frame, textvariable=self._avg_peak_var, width=10,
-                 font=_FONT_UI).pack(side="left")
-        tk.Label(il_frame, text="kW",
-                 bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left", padx=(4, 0))
-        tk.Label(il_frame,
-                 text="(the 12 monthly maximum demands off billing, averaged — "
-                      "gives IL, and the load side of the 519/1547 test)",
-                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(8, 0))
+        avg_entry = tk.Entry(il_frame, textvariable=self._avg_peak_var, width=10,
+                             font=_FONT_UI)
+        avg_entry.pack(side="left")
+        avg_units = tk.Label(il_frame, text="kW",
+                             bg=_BG, fg=_LABEL_FG, font=_FONT_UI)
+        avg_units.pack(side="left", padx=(4, 0))
+        avg_hint = tk.Label(
+            il_frame,
+            text="(the 12 monthly maximum demands off billing, averaged — "
+                 "gives IL, and the load side of the 519/1547 test)",
+            bg=_BG, fg="#888888", font=_FONT_UI_S)
+        avg_hint.pack(side="left", padx=(8, 0))
 
-        cat_frame = tk.Frame(self, bg=_BG)
-        cat_frame.pack(fill="x", **pad)
-        tk.Label(cat_frame, text="1547 category", width=16, anchor="w",
+        role_combo.bind("<<ComboboxSelected>>", _sync_rated)
+
+        # ── Interconnection agreement ─────────────────────────────────────────
+        # Everything here comes off one document and applies to one kind of
+        # site, so it travels together and disappears entirely on a service with
+        # no generation -- which is most of them. A load-only site is now two
+        # rows shorter than it was, which is where the room for these came from.
+        self._ic_frame = tk.Frame(form, bg=_BG)
+
+        ic_top = tk.Frame(self._ic_frame, bg=_BG)
+        ic_top.pack(fill="x")
+        tk.Label(ic_top, text="Interconnection", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
         self._der_cat_var = tk.StringVar(value="— not specified —")
-        ttk.Combobox(cat_frame, textvariable=self._der_cat_var,
+        ttk.Combobox(ic_top, textvariable=self._der_cat_var,
                      values=["— not specified —", "I", "II", "III"],
-                     width=16, font=_FONT_UI, state="readonly").pack(side="left")
-        tk.Label(cat_frame,
-                 text="(from the interconnection agreement — sets the ride-through "
-                      "the plant owes; generation sites only)",
-                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(8, 0))
+                     width=14, font=_FONT_UI, state="readonly").pack(side="left")
+        # Grey rather than a default value: most plants are Category II, but
+        # "most" is not "this one", and the category sets which ride-through
+        # table the plant is held to. A prefilled guess would be indistinguishable
+        # from a figure read off the agreement.
+        tk.Label(ic_top, text="1547 category — majority Cat II",
+                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(6, 0))
+
+        tk.Label(ic_top, text="Reactive mode", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(16, 4))
+        self._reactive_mode_var = tk.StringVar(value=_MODE_LABELS[0])
+        mode_combo = ttk.Combobox(ic_top, textvariable=self._reactive_mode_var,
+                                  values=_MODE_LABELS, width=30,
+                                  font=_FONT_UI, state="readonly")
+        mode_combo.pack(side="left")
+
+        ic_bot = tk.Frame(self._ic_frame, bg=_BG)
+        ic_bot.pack(fill="x", pady=(4, 0))
+        pf_label = tk.Label(ic_bot, text="PF setpoint", width=16, anchor="w",
+                            bg=_BG, fg=_LABEL_FG, font=_FONT_UI)
+        pf_label.pack(side="left")
+        self._pf_setpoint_var = tk.StringVar(value="")
+        pf_entry = tk.Entry(ic_bot, textvariable=self._pf_setpoint_var, width=8,
+                            font=_FONT_UI)
+        pf_entry.pack(side="left")
+        # Magnitude and direction as two fields, not one signed number. The
+        # engineers write this "-0.98" and read the minus as absorbing, but that
+        # is a local convention rather than a universal one -- the meter uses
+        # the same sign for the direction of real power -- so the form asks for
+        # the two facts separately and neither can be read the wrong way round.
+        self._pf_direction_var = tk.StringVar(value=_PF_DIR_LABELS[0])
+        dir_combo = ttk.Combobox(ic_bot, textvariable=self._pf_direction_var,
+                                 values=_PF_DIR_LABELS, width=16,
+                                 font=_FONT_UI, state="readonly")
+        dir_combo.pack(side="left", padx=(6, 0))
+        tk.Label(ic_bot, text="±", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(12, 4))
+        self._pf_tol_var = tk.StringVar(value="")
+        tol_entry = tk.Entry(ic_bot, textvariable=self._pf_tol_var, width=6,
+                             font=_FONT_UI)
+        tol_entry.pack(side="left")
+        pf_hint = tk.Label(
+            ic_bot,
+            text="(TSM §6.3.2 default is 0.98 absorbing — the agreement governs; "
+                 "leave ± blank and the deviation is reported, not graded)",
+            bg=_BG, fg="#888888", font=_FONT_UI_S)
+        pf_hint.pack(side="left", padx=(8, 0))
+
+        def _sync_reactive(*_a):
+            # The setpoint fields belong to fixed power factor alone. Under
+            # voltage-reactive power control the reactive output is required to
+            # move with voltage, so there is no single figure to enter and none
+            # to grade against.
+            mode  = _MODE_KEY.get(self._reactive_mode_var.get())
+            fixed = mode == "fixed_pf"
+            for w in (pf_entry, dir_combo, tol_entry):
+                w.configure(state="normal" if fixed else "disabled")
+            pf_label.configure(fg=_LABEL_FG if fixed else "#555555")
+            if fixed:
+                hint = ("(TSM §6.3.2 default is 0.98 absorbing — the agreement "
+                        "governs; leave ± blank and the deviation is reported, "
+                        "not graded)")
+            elif mode is None:
+                # Not the same state as a mode with no check behind it, and
+                # saying so matters: one is a field left blank, the other is a
+                # plant the tool cannot assess however carefully it is filled in.
+                hint = ("(pick the reactive mode from the interconnection "
+                        "agreement — the power factor is not assessed until "
+                        "it is known)")
+            else:
+                hint = ("(no fixed setpoint under this mode — the reactive "
+                        "output is meant to vary, and is reported without a "
+                        "verdict)")
+            pf_hint.configure(text=hint)
+
+        mode_combo.bind("<<ComboboxSelected>>", _sync_reactive)
+        _sync_reactive()
 
         # ── Service type + nominal row ─────────────────────────────────────────
-        svc_frame = tk.Frame(self, bg=_BG)
+        # Held on self because the interconnection block above packs itself
+        # relative to this one each time the power flow changes.
+        svc_frame = self._svc_frame = tk.Frame(form, bg=_BG)
         svc_frame.pack(fill="x", **pad)
+
+        # Deferred to here rather than run at the point of definition: the first
+        # call packs the interconnection block `before=` this frame, which has
+        # to exist by then.
+        _sync_rated()
 
         tk.Label(svc_frame, text="Service Type", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
@@ -637,7 +823,7 @@ class PQApp(tk.Tk):
         topo_combo.bind("<<ComboboxSelected>>", self._on_topo_change)
 
         # ── Nominal voltage row ────────────────────────────────────────────────
-        nom_frame = tk.Frame(self, bg=_BG)
+        nom_frame = tk.Frame(form, bg=_BG)
         nom_frame.pack(fill="x", **pad)
 
         tk.Label(nom_frame, text="Nominal Voltage", width=16, anchor="w",
@@ -654,16 +840,16 @@ class PQApp(tk.Tk):
         nom_combo.bind("<<ComboboxSelected>>", self._on_nominal_change)
         nom_combo.bind("<FocusOut>",            self._on_nominal_change)
 
-        ttk.Separator(self, orient="horizontal").pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Separator(form, orient="horizontal").pack(fill="x", padx=12, pady=(4, 0))
 
         # ── Transformer section label ─────────────────────────────────────────
-        xfmr_hdr = tk.Frame(self, bg=_BG)
+        xfmr_hdr = tk.Frame(form, bg=_BG)
         xfmr_hdr.pack(fill="x", padx=12, pady=(6, 2))
         tk.Label(xfmr_hdr, text="Transformer (optional — enables Blue Book ISC lookup)",
                  bg=_BG, fg="#555555", font=_FONT_UI_S).pack(side="left")
 
         # ── Transformer type row ───────────────────────────────────────────────
-        xtype_frame = tk.Frame(self, bg=_BG)
+        xtype_frame = tk.Frame(form, bg=_BG)
         xtype_frame.pack(fill="x", padx=12, pady=(0, 4))
 
         tk.Label(xtype_frame, text="Type", width=16, anchor="w",
@@ -684,7 +870,7 @@ class PQApp(tk.Tk):
         self._type_combo.bind("<<ComboboxSelected>>", self._on_type_change)
 
         # ── kVA + ISC row ──────────────────────────────────────────────────────
-        kva_frame = tk.Frame(self, bg=_BG)
+        kva_frame = tk.Frame(form, bg=_BG)
         kva_frame.pack(fill="x", padx=12, pady=(0, 2))
 
         tk.Label(kva_frame, text="Size", width=16, anchor="w",
@@ -711,7 +897,7 @@ class PQApp(tk.Tk):
         self._isc_auto_lbl.pack(side="left", fill="x", expand=True)
 
         # ── ISC override row ───────────────────────────────────────────────────
-        isc_frame = tk.Frame(self, bg=_BG)
+        isc_frame = tk.Frame(form, bg=_BG)
         isc_frame.pack(fill="x", padx=12, pady=(0, 6))
 
         tk.Label(isc_frame, text="", width=16, bg=_BG).pack(side="left")
@@ -739,7 +925,7 @@ class PQApp(tk.Tk):
         # the transformer and everything below it are the customer's and sit
         # downstream of the meter, so the path is the primary line instead and
         # asking for a conductor size would be asking about the wrong wire.
-        self._path_wrap = tk.Frame(self, bg=_BG)
+        self._path_wrap = tk.Frame(form, bg=_BG)
         self._path_wrap.pack(fill="x")
 
         self._conductor_labels = {label: key for key, label in conductor_options()}
@@ -865,10 +1051,10 @@ class PQApp(tk.Tk):
                                   "R0/X0 optional)",
                  bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(6, 0))
 
-        ttk.Separator(self, orient="horizontal").pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Separator(form, orient="horizontal").pack(fill="x", padx=12, pady=(4, 0))
 
         # ── Report details section (collapsible) ──────────────────────────────
-        det_hdr = tk.Frame(self, bg=_BG)
+        det_hdr = tk.Frame(form, bg=_BG)
         det_hdr.pack(fill="x", padx=12, pady=(4, 0))
 
         self._details_open = tk.BooleanVar(value=False)
@@ -879,7 +1065,7 @@ class PQApp(tk.Tk):
         )
         self._det_toggle_btn.pack(side="left", fill="x", expand=True)
 
-        self._details_frame = tk.Frame(self, bg=_BG)
+        self._details_frame = tk.Frame(form, bg=_BG)
         # Not packed initially — toggled by button
 
         _W = 18   # label width inside this section
@@ -911,10 +1097,10 @@ class PQApp(tk.Tk):
         tk.Frame(self._details_frame, bg=_BG, height=6).pack()  # bottom padding
 
         # ── Divider + Run button ───────────────────────────────────────────────
-        self._sep_before_run = ttk.Separator(self, orient="horizontal")
+        self._sep_before_run = ttk.Separator(form, orient="horizontal")
         self._sep_before_run.pack(fill="x", padx=12, pady=4)
 
-        btn_frame = tk.Frame(self, bg=_BG)
+        btn_frame = tk.Frame(form, bg=_BG)
         btn_frame.pack(fill="x", padx=12, pady=4)
 
         self._run_btn = ttk.Button(
@@ -946,8 +1132,11 @@ class PQApp(tk.Tk):
         ).pack(side="right")
 
         # ── Log window ────────────────────────────────────────────────────────
-        log_frame = tk.Frame(self, bg=_BG)
-        log_frame.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        # In the right-hand column rather than under the form. It is the tallest
+        # single element in the window and the one that least needs to be read
+        # while the form is being filled in.
+        log_frame = tk.Frame(self._log_col, bg=_BG)
+        log_frame.pack(fill="both", expand=True, padx=(0, 12), pady=(4, 12))
 
         self._log = tk.Text(
             log_frame, bg=_LOG_BG, fg=_LOG_FG,
@@ -1506,6 +1695,10 @@ class PQApp(tk.Tk):
             "der_category":       (self._der_cat_var.get()
                                    if self._der_cat_var.get() in ("I", "II", "III")
                                    else None),
+            "der_reactive_mode":  _MODE_KEY.get(self._reactive_mode_var.get()),
+            "der_pf_setpoint":    _float_or_none(self._pf_setpoint_var.get()),
+            "der_pf_direction":   _PF_DIR_KEY.get(self._pf_direction_var.get()),
+            "der_pf_tolerance":   _float_or_none(self._pf_tol_var.get()),
             "site":           self._site_var.get().strip(),
             "address":        self._address_var.get().strip(),
             "engineer":       self._eng_name_var.get().strip(),
@@ -1618,6 +1811,10 @@ class PQApp(tk.Tk):
             rated_ac_kw=params["rated_ac_kw"],
             avg_peak_demand_kw=params["avg_peak_demand_kw"],
             der_category=params["der_category"],
+            der_reactive_mode=params["der_reactive_mode"],
+            der_pf_setpoint=params["der_pf_setpoint"],
+            der_pf_direction=params["der_pf_direction"],
+            der_pf_tolerance=params["der_pf_tolerance"],
             isc_amps=isc_amps,
             isc_source=isc_source,
             transformer_kva=kva,
@@ -1707,6 +1904,7 @@ class PQApp(tk.Tk):
         plot_harmonic_trend(df, outdir=outdir, stem=stem)
         plot_imbalance(df, imb_result, curr_imb_result, outdir=outdir, stem=stem)
         plot_pf_load(df, pf_result, outdir=outdir, stem=stem)
+        plot_real_reactive(df, pf_result, outdir=outdir, stem=stem)
         plot_flicker(df, flicker_result, outdir=outdir, stem=stem)
         plot_waveform_capture(ds, thresh, outdir=outdir, stem=stem)
 
@@ -1990,14 +2188,18 @@ class PQApp(tk.Tk):
 
         concept(
             "2. Rated generation and average load demand",
-            "Needed on any site with generation.  IEEE 519-2022 Figure 1 compares\n"
+            "Needed on a site that has both.  IEEE 519-2022 Figure 1 compares\n"
             "them to decide whether 519 governs the service at all or whether\n"
             "IEEE 1547 does, and the two standards differ by three times in the\n"
             "aggregate current limit.\n"
             "\n"
             "Both come from records: a nameplate and a year of billing.  Left\n"
             "blank, the report says the standard is undetermined rather than\n"
-            "guessing — which is honest, but it is not an answer you can send.",
+            "guessing — which is honest, but it is not an answer you can send.\n"
+            "\n"
+            "At a plant only the nameplate is asked for.  There is no load to\n"
+            "compare it against, 1547 governs either way, and the rating is also\n"
+            "what IL is taken from.  Avg peak demand greys out there.",
         )
 
         concept(
@@ -2154,18 +2356,24 @@ class PQApp(tk.Tk):
             "               No  ─────────────────────► IEEE 1547 (or 2800)\n"
             "\n"
             "Both quantities in that test come from records, not from the recording:\n"
-            "a nameplate and a year of billing.  Enter them in the Power flow row.\n"
-            "Without them the tool says the standard is undetermined rather than\n"
-            "guessing, because the two answers are not close together.\n"
+            "a nameplate and a year of billing.  Enter them in the Power flow and\n"
+            "Avg peak demand rows.  Without them the tool says the standard is\n"
+            "undetermined rather than guessing, because the two answers are not\n"
+            "close together.\n"
+            "\n"
+            "A producer's array is the exception, and needs no demand figure.  Set\n"
+            "Power flow to \"Generation only\" and the ratio is not walked at all:\n"
+            "a plant is primarily inverter-based on its face, so Clause 5.2 puts it\n"
+            "outside 519 before Figure 1 is reached.  The field greys out to say so.\n"
             "\n"
             "\"Annual average load demand\" is what the site consumes, before its own\n"
             "generation offsets any of it.  It is not the net at the meter and it is\n"
             "not an average of |current| — on a service that generates, the net runs\n"
             "below the load all day and negative for part of it.  Feed the net in and\n"
             "the denominator shrinks, which pushes sites over the 10% line and into\n"
-            "the wrong standard.  The form calls it \"Non-gen load kW\" for that\n"
-            "reason.  Where the array is behind the same meter as the load, the load\n"
-            "figure is the billed consumption plus whatever the array supplied to it.",
+            "the wrong standard.  Where the array is behind the same meter as the\n"
+            "load, the load figure is the billed consumption plus whatever the array\n"
+            "supplied to it.",
         )
 
         concept(
@@ -2199,6 +2407,54 @@ class PQApp(tk.Tk):
             "Note the even limits are *looser* than 519's blanket 25%-of-odd rule.\n"
             "1547's rationale is that the 25% figure was researched and not found to\n"
             "be supported for a DER, though the 2nd harmonic was not relaxed.",
+        )
+
+        concept(
+            "Reactive power — what the agreement asks of a plant",
+            "No tariff sheet reaches a plant's power factor.  R73 and R121 bind the\n"
+            "power factor a *load* presents at the point of delivery, and a\n"
+            "producer's array presents none.  What binds a plant is its\n"
+            "interconnection agreement, per site.\n"
+            "\n"
+            "IEEE 1547-2018 Clause 5 defines several reactive control functions and\n"
+            "only one is enabled at a time.  Which one changes what compliance even\n"
+            "means, so the tool asks and does not assess until it is told:\n"
+            "\n"
+            "    Fixed power factor       one number, held.  Assessed.\n"
+            "    Volt-VAR                 reactive output tracks voltage.\n"
+            "    Constant reactive power  a fixed kVAR, not a fixed ratio.\n"
+            "    Watt-VAR                 reactive output tracks real power.\n"
+            "\n"
+            "Only fixed power factor is assessed today — it is what has actually\n"
+            "been applied in the field.  Under the other three the reactive output\n"
+            "is *required* to move, so grading it against one figure would report\n"
+            "correct operation as a fault.  Those report the measurement and say so.\n"
+            "\n"
+            "PSCo's Technical Specifications Manual §6.3.2 gives the value used\n"
+            "where the agreement does not state one: \"a 0.98 absorbing power factor\n"
+            "shall be used\".  Absorbing is deliberate.  An exporting plant lifts the\n"
+            "voltage at the point of interconnection; drawing VAR pulls it back down.\n"
+            "Engineers write this \"-0.98\", with the minus meaning absorbing — but\n"
+            "the meter uses the same minus for the direction of real power, so the\n"
+            "form asks for magnitude and direction as two fields.\n"
+            "\n"
+            "Two findings come out of it, and only one of them needs a tolerance:\n"
+            "\n"
+            "  Direction   Absorbing against injecting is a fact with no band around\n"
+            "              it.  A plant asked to absorb and injecting instead is\n"
+            "              raising the voltage it was interconnected to hold down.\n"
+            "              Graded, and read off the reactive channel's sign rather\n"
+            "              than the meter's power factor sign.\n"
+            "\n"
+            "  Magnitude   0.98 against a measured 0.972 is a deviation.  Whether it\n"
+            "              is a violation depends on a band the agreement may not\n"
+            "              state.  Leave ± blank and the deviation is reported\n"
+            "              without a verdict rather than judged against a number\n"
+            "              the tool invented.\n"
+            "\n"
+            "Intervals below 15% of the plant's rating are left out.  That is PSCo's\n"
+            "own threshold, not a house one: TSM §8.1 will not verify power factor\n"
+            "at witness testing below it.",
         )
 
         use(pg_ridethru)

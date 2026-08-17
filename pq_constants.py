@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.55.0"
+__version__ = "0.58.0"
 
 
 @dataclass
@@ -108,6 +108,32 @@ class Thresholds:
     # It is not a detail: the ride-through a plant owes at 0.75 p.u. is 0.9 s
     # under Category I and 20 s under Category III.
     der_category: Optional[str] = None
+    # Which IEEE 1547-2018 Clause 5 reactive power control function the plant is
+    # running.  This is not decoration: the functions answer different questions
+    # and only one is enabled at a time (TSM Table 1).  Under fixed power factor
+    # the plant owes one number and holding anything else is a deviation; under
+    # voltage-reactive power control the reactive output is *supposed* to move
+    # with voltage, and grading that against a fixed setpoint would report
+    # correct behaviour as a fault.  So no reactive assessment is made at all
+    # until the mode is known.
+    #
+    # PSCo's TSM (01/01/2025) §6.1 makes Volt-VAR the default and constant power
+    # factor disabled, while §8.1 says the opposite -- "we currently only allow
+    # fixed power factor".  Fixed power factor is what has actually been applied
+    # in the field to date, which is why it is the mode implemented first.
+    der_reactive_mode: Optional[str] = None   # "fixed_pf" | "volt_var" | ...
+    # The power factor the interconnection agreement specifies, as a magnitude
+    # and a direction rather than a signed scalar.  Engineers write this signed
+    # -- "-0.98" for a plant exporting watts while absorbing VAR -- but the sign
+    # carries the quadrant only by convention, and the conventions disagree.
+    # Split in two, neither field can be read the wrong way round.
+    der_pf_setpoint: Optional[float] = None   # magnitude, 0 < pf <= 1
+    der_pf_direction: Optional[str] = None    # "absorbing" | "injecting" | "unity"
+    # Permitted deviation from the setpoint magnitude.  Optional by design:
+    # where the agreement states no band, the tool reports the deviation and
+    # declines to call it a violation rather than inventing a tolerance that
+    # would be indistinguishable from a specified one.
+    der_pf_tolerance: Optional[float] = None
     # The engineer picks these at the start; they resolve how many phases the
     # service actually has, which channel presence alone can get wrong when a
     # phase is simply missing from the export.
@@ -466,6 +492,64 @@ _H1547_ORDERS = [2, 3, 4, 5, 6, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]
 #: reach the same IL. Where a site actually runs nearer unity this overstates
 #: IL by the ratio, and understates every percentage measured against it.
 IL_CONVERSION_PF = 0.90
+
+#: The IEEE 1547-2018 Clause 5 reactive power control functions, with the
+#: activation state PSCo's Technical Specifications Manual (01/01/2025) Table 1
+#: gives each.  Only one is enabled at a time.  `implemented` marks what this
+#: tool can actually assess: fixed power factor is what has been applied in the
+#: field to date and is the only mode with a check behind it, and a mode with no
+#: check must say so on the page rather than silently assess nothing.
+REACTIVE_MODES = {
+    "fixed_pf": {
+        "label":       "Fixed power factor",
+        "tsm_default": "disabled",
+        "clause":      "IEEE 1547-2018 Clause 5.3.1 (constant power factor)",
+        "implemented": True,
+    },
+    "volt_var": {
+        "label":       "Volt-VAR (voltage-reactive power)",
+        "tsm_default": "enabled",
+        "clause":      "IEEE 1547-2018 Clause 5.3.3 (voltage-reactive power)",
+        "implemented": False,
+    },
+    "constant_q": {
+        "label":       "Constant reactive power",
+        "tsm_default": "disabled",
+        "clause":      "IEEE 1547-2018 Clause 5.3.4 (constant reactive power)",
+        "implemented": False,
+    },
+    "watt_var": {
+        "label":       "Watt-VAR (active-reactive power)",
+        "tsm_default": "disabled",
+        "clause":      "IEEE 1547-2018 Clause 5.3.2 (active power-reactive power)",
+        "implemented": False,
+    },
+}
+
+#: PSCo TSM §6.3.2: "Where a constant power factor is otherwise specified or
+#: applied based on legacy requirements and inverter non-certification to IEEE
+#: 1547-2018, a 0.98 absorbing power factor shall be used, unless otherwise
+#: specified by the Area EPS Operator."  Offered as the form's starting value,
+#: never substituted for a blank -- the agreement governs, per site.
+TSM_DEFAULT_PF_SETPOINT  = 0.98
+TSM_DEFAULT_PF_DIRECTION = "absorbing"
+
+#: The output below which a plant's power factor is not assessed, as a fraction
+#: of its rating.  PSCo's own number rather than a house one: TSM §8.1 requires
+#: that at witness testing "the system must be producing at least 15% of maximum
+#: generation capacity for a test to continue", and power factor is named among
+#: the things the witness verifies.  A displacement measured below the threshold
+#: the utility will not itself test at is not a finding.
+TSM_PF_TEST_MIN_OUTPUT = 0.15
+
+#: Which P-Q quadrant each direction requires of a plant that is exporting.
+#: Absorbing is the voltage-mitigation case: an exporting plant raises voltage
+#: at the point of interconnection, and drawing VAR pulls it back down.
+PF_DIRECTION_LABELS = {
+    "absorbing": "absorbing reactive power (underexcited)",
+    "injecting": "injecting reactive power (overexcited)",
+    "unity":     "at unity, neither absorbing nor injecting",
+}
 
 #: How PSCo reads Figure 1's undefined "annual average load demand", stated in
 #: the report wherever the test is applied.

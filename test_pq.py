@@ -2146,7 +2146,212 @@ _DOCUMENT_MATRIX = [
     ("test_producer_array",      "sg", 277.0,
      {"isc_amps": 40000.0, "service_role": "generation", "rated_ac_kw": 250.0,
       "avg_peak_demand_kw": 10.0, "der_category": "II"}),
+    # The same plant with its interconnection agreement supplied, which is a
+    # different set of paragraphs, table rows and letter rows -- and the graded
+    # ones. Without this entry the whole fixed-power-factor feature assembled
+    # only in the unit tests.
+    ("test_producer_array",      "sg", 277.0,
+     {"isc_amps": 40000.0, "service_role": "generation", "rated_ac_kw": 250.0,
+      "der_category": "II", "der_reactive_mode": "fixed_pf",
+      "der_pf_setpoint": 0.98, "der_pf_direction": "absorbing",
+      "der_pf_tolerance": 0.01}),
+    # And on a mode with no assessment behind it, which must decline in prose
+    # rather than fall through any of the graded paths.
+    ("test_solar_net_metered",   "sg", 277.0,
+     {"isc_amps": 40000.0, "service_role": "mixed", "rated_ac_kw": 150.0,
+      "avg_peak_demand_kw": 1200.0, "der_reactive_mode": "volt_var"}),
 ]
+
+
+class TestOperatingQuadrant:
+    """Which way each power flowed, which a power factor magnitude cannot say.
+
+    An interconnection agreement specifies a plant's power factor as a signed
+    setpoint -- "-0.98" meaning real power out while reactive power is drawn in,
+    for voltage mitigation. The magnitude 0.98 describes that and its opposite
+    equally well, so the quadrant has to come from the signs of the two power
+    channels. It must not come from the sign of the power factor: the meter
+    picks that convention itself and does not declare which one it used.
+    """
+
+    @staticmethod
+    def _df(pf, watts, vars_):
+        import pandas as pd
+        n = len(pf)
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame({"power_factor": pf, "power_real": watts,
+                             "power_reactive": vars_}, index=idx)
+
+    def test_a_plant_absorbing_vars_is_named_as_such(self):
+        from pq_analysis import check_power_factor
+        # The Queensburg setpoint: exporting watts, absorbing VAR.
+        df = self._df([0.98] * 20, [-500_000.0] * 20, [101_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="generation"))
+        q = r["quadrants"]
+        assert q["dominant"] == "export_absorb"
+        assert q["dominant_pct"] == 100.0
+        assert q["mean_kw"] < 0 and q["mean_kvar"] > 0
+
+    def test_the_opposite_quadrant_is_told_apart_at_the_same_magnitude(self):
+        from pq_analysis import check_power_factor
+        # Same 0.98, VAR the other way: injecting rather than absorbing. The
+        # power factor cannot distinguish these and the signs must.
+        df = self._df([0.98] * 20, [-500_000.0] * 20, [-101_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="generation"))
+        assert r["quadrants"]["dominant"] == "export_inject"
+        assert r["mean_pf"] == pytest.approx(0.98, abs=0.001)
+
+    def test_the_quadrant_does_not_follow_the_power_factor_sign(self):
+        from pq_analysis import check_power_factor
+        # A direction-signing meter reports -0.98 while exporting. That minus
+        # sign is the real-power direction and carries nothing about the
+        # reactive flow, which here is being absorbed.
+        df = self._df([-0.98] * 20, [-500_000.0] * 20, [101_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="generation"))
+        assert r["quadrants"]["dominant"] == "export_absorb"
+
+    def test_no_reactive_channel_means_no_quadrant_rather_than_a_guess(self):
+        import pandas as pd
+        from pq_analysis import check_power_factor
+        idx = pd.date_range("2025-01-01", periods=20, freq="5min")
+        df = pd.DataFrame({"power_factor": [0.95] * 20,
+                           "power_real": [50_000.0] * 20}, index=idx)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg"))
+        assert r["quadrants"] == {}
+
+
+class TestFixedPowerFactorAgainstTheAgreement:
+    """What a plant owes, which no tariff sheet states.
+
+    PSCo's Technical Specifications Manual (01/01/2025) 6.3.2: "Where a
+    constant power factor is otherwise specified or applied based on legacy
+    requirements ... a 0.98 absorbing power factor shall be used". Absorbing is
+    voltage mitigation -- an exporting plant lifts the voltage at the point of
+    interconnection and drawing VAR pulls it back. A plant injecting instead is
+    doing the opposite of what it agreed to, at the same magnitude.
+    """
+
+    @staticmethod
+    def _df(pf, watts, vars_):
+        import pandas as pd
+        n = len(pf)
+        idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+        return pd.DataFrame({"power_factor": pf, "power_real": watts,
+                             "power_reactive": vars_}, index=idx)
+
+    @staticmethod
+    def _t(**kw):
+        base = dict(nominal_voltage=277.0, customer_class="sg",
+                    service_role="generation", rated_ac_kw=500.0,
+                    der_reactive_mode="fixed_pf", der_pf_setpoint=0.98,
+                    der_pf_direction="absorbing")
+        base.update(kw)
+        return Thresholds(**base)
+
+    def test_a_plant_holding_its_setpoint_passes_on_direction(self):
+        from pq_analysis import check_der_power_factor
+        df = self._df([0.98] * 20, [-500_000.0] * 20, [101_000.0] * 20)
+        r = check_der_power_factor(df, self._t())
+        assert r["assessed"] is True
+        assert r["pct_in_required_direction"] == 100.0
+        assert r["direction_pass"] is True
+        assert r["max_deviation"] < 0.001
+
+    def test_the_same_magnitude_the_wrong_way_round_fails(self):
+        from pq_analysis import check_der_power_factor
+        # 0.98 exactly, but injecting. The magnitude is perfect and the plant
+        # is still doing the opposite of what the agreement asked for.
+        df = self._df([0.98] * 20, [-500_000.0] * 20, [-101_000.0] * 20)
+        r = check_der_power_factor(df, self._t())
+        assert r["max_deviation"] < 0.001        # magnitude is spotless
+        assert r["direction_pass"] is False      # and it still fails
+        assert r["pct_in_required_direction"] == 0.0
+
+    def test_no_tolerance_reports_the_deviation_without_grading_it(self):
+        from pq_analysis import check_der_power_factor
+        df = self._df([0.93] * 20, [-500_000.0] * 20, [101_000.0] * 20)
+        r = check_der_power_factor(df, self._t())
+        assert r["mean_deviation"] == pytest.approx(0.05, abs=0.001)
+        assert r["magnitude_pass"] is None
+        assert r["pct_outside_tolerance"] is None
+        assert len(r["violation_timestamps"]) == 0
+        assert "tolerance" in r["tolerance_note"]
+
+    def test_a_tolerance_turns_the_deviation_into_a_verdict(self):
+        from pq_analysis import check_der_power_factor
+        df = self._df([0.93] * 20, [-500_000.0] * 20, [101_000.0] * 20)
+        r = check_der_power_factor(df, self._t(der_pf_tolerance=0.01))
+        assert r["magnitude_pass"] is False
+        assert r["pct_outside_tolerance"] == 100.0
+        assert len(r["violation_timestamps"]) == 20
+
+    def test_volt_var_is_declined_rather_than_graded(self):
+        from pq_analysis import check_der_power_factor
+        # The reactive output is *required* to move with voltage here, so a
+        # fixed-setpoint comparison would report correct operation as a fault.
+        df = self._df([0.90] * 20, [-500_000.0] * 20, [101_000.0] * 20)
+        r = check_der_power_factor(df, self._t(der_reactive_mode="volt_var"))
+        assert r["assessed"] is False
+        assert r["available"] is False
+        assert "vary" in r["error"]
+        assert "5.3.3" in r["error"]
+
+    def test_an_unentered_mode_is_not_assumed_to_be_fixed(self):
+        from pq_analysis import check_der_power_factor
+        df = self._df([0.98] * 20, [-500_000.0] * 20, [101_000.0] * 20)
+        r = check_der_power_factor(df, self._t(der_reactive_mode=None))
+        assert r["assessed"] is False
+        assert "not entered" in r["error"]
+
+    def test_a_load_service_has_no_agreement_to_check(self):
+        from pq_analysis import check_der_power_factor
+        df = self._df([0.95] * 20, [50_000.0] * 20, [10_000.0] * 20)
+        r = check_der_power_factor(df, self._t(service_role="load"))
+        assert r["assessed"] is False
+        assert "no generation" in r["error"]
+
+    def test_output_below_the_witness_test_floor_is_not_assessed(self):
+        from pq_analysis import check_der_power_factor
+        # TSM 8.1 will not verify power factor below 15% of capacity. A 500 kW
+        # plant trickling 20 kW is under it, and its displacement there says
+        # nothing about the setpoint.
+        df = self._df([0.50] * 20, [-20_000.0] * 20, [30_000.0] * 20)
+        r = check_der_power_factor(df, self._t())
+        assert r["assessed"] is False
+        assert "15%" in r["error"]
+
+    def test_the_floor_is_taken_against_the_nameplate_not_the_week(self):
+        from pq_analysis import check_der_power_factor
+        # Half the recording at 300 kW, half at 40 kW, on a 500 kW plant. The
+        # 40 kW half is 8% of the rating and excluded; against the recording's
+        # own peak it would have been 13% and still excluded, but the count of
+        # what was left out has to come from the rating.
+        df = self._df([0.98] * 20 + [0.60] * 20,
+                      [-300_000.0] * 20 + [-40_000.0] * 20,
+                      [101_000.0] * 40)
+        r = check_der_power_factor(df, self._t())
+        assert r["basis"] == "nameplate"
+        assert r["reference_kw"] == 500.0
+        assert r["intervals_used"] == 20
+        assert r["excluded_low_output"] == 20
+        assert r["mean_pf"] == pytest.approx(0.98, abs=0.001)
+
+    def test_a_mixed_service_is_assessed_on_its_exporting_half(self):
+        from pq_analysis import check_der_power_factor
+        # An agreement binds a net-metered site too, and only while it exports.
+        df = self._df([0.98] * 20 + [0.85] * 20,
+                      [-500_000.0] * 20 + [200_000.0] * 20,
+                      [101_000.0] * 40)
+        r = check_der_power_factor(df, self._t(service_role="mixed"))
+        assert r["intervals_used"] == 20
+        assert r["mean_pf"] == pytest.approx(0.98, abs=0.001)
 
 
 class TestSeverityGradesTheRightQuantity:
@@ -2329,6 +2534,27 @@ class TestBothDocumentsBuildForEveryFixture:
             # A document that assembled but says nothing is still a failure.
             assert sum(len(p.text) for p in doc.paragraphs) > 500, pqd
 
+    @pytest.mark.parametrize("pqd,cls,nominal,extra", _DOCUMENT_MATRIX,
+                             ids=[m[0] for m in _DOCUMENT_MATRIX])
+    def test_the_console_summary_prints(self, pqd, cls, nominal, extra, capsys):
+        # The third time the suite was green while the CLI raised, it was here
+        # rather than in Word: a plant carries no power factor limit, and the
+        # console formatted it as ".2f" before anything reached the document
+        # layer. The documents were covered above; the terminal output that
+        # every run prints first was covered on one fixture.
+        from pq_report import print_report
+        _ds, rep, th = _build_report(pqd, cls, nominal, **extra)
+        print_report(rep)
+        assert len(capsys.readouterr().out) > 500, pqd
+
+    @pytest.mark.parametrize("pqd,cls,nominal,extra", _DOCUMENT_MATRIX,
+                             ids=[m[0] for m in _DOCUMENT_MATRIX])
+    def test_the_csv_exports_write(self, pqd, cls, nominal, extra, tmp_path):
+        from pq_report import export_results
+        ds, rep, th = _build_report(pqd, cls, nominal, **extra)
+        export_results(ds, rep, tmp_path, pqd)
+        assert list(tmp_path.glob("*.csv")), pqd
+
 
 class TestAnalysisModeIsVisible:
     """Which mode produced these numbers, stated on the documents.
@@ -2458,14 +2684,65 @@ class TestPowerFactorSignConvention:
         # Poor displacement while exporting, healthy while importing. The
         # tariff clauses describe what a load presents at the point of
         # delivery, so the export must not create a violation.
+        # "mixed", not "generation": this is a load with an array behind it.
+        # A plant is scoped the other way round -- see the test below.
         df = self._df([-0.70] * 20 + [0.97] * 20,
                       [-50_000.0] * 20 + [50_000.0] * 20)
         r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
                                               customer_class="sg",
-                                              service_role="generation"))
+                                              service_role="mixed"))
         assert r["pct_below_limit"] == 0.0
         assert "importing intervals only" in r["scope_note"]
         assert r["export_mean_pf"] == pytest.approx(0.70, abs=0.01)
+
+    def test_a_plant_is_measured_on_what_it_held_while_producing(self):
+        from pq_analysis import check_power_factor
+        # A producer's array: 2 MW out all day at 0.995, and a 10 kW SCADA
+        # cabinet overnight at 0.30. Scoped to the importing intervals, the
+        # only population is the cabinet -- which the light-load gate then
+        # discards entirely, so the check reported nothing while the number
+        # that matters, the displacement while producing, went unread.
+        df = self._df([0.995] * 20 + [0.30] * 20,
+                      [-2_000_000.0] * 20 + [10_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="generation"))
+        assert r["basis"] == "plant_export"
+        assert r["mean_pf"] == pytest.approx(0.995, abs=0.005)
+        assert r["intervals_used"] == 20
+        # Reported, never graded: no tariff clause reaches a plant.
+        assert r["assessed"] is False
+        assert r["limit"] is None
+        assert r["pct_below_limit"] is None
+        assert len(r["violation_timestamps"]) == 0
+
+    def test_the_light_load_gate_uses_the_population_it_is_gating(self):
+        from pq_analysis import check_power_factor
+        # A net-metered service: 500 kW of midday export, 40 kW of import the
+        # rest of the time at a poor 0.80. The tariff clause applies to the
+        # import, and 40 kW is a real load -- but measured against the export
+        # peak it is 8%, so a gate keyed to the whole recording threw away
+        # every interval the clause speaks to and reported that nothing
+        # carried enough load. Each population is gated against its own peak.
+        df = self._df([0.98] * 20 + [0.80] * 20,
+                      [-500_000.0] * 20 + [40_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="mixed"))
+        assert r["pct_below_limit"] == 100.0
+        assert r["mean_pf"] == pytest.approx(0.80, abs=0.01)
+
+    def test_a_plants_overnight_auxiliary_load_is_not_its_power_factor(self):
+        from pq_analysis import check_power_factor
+        # The regression this fixes: the mean over the whole record, night
+        # included, was 0.53 against a plant that ran at 0.995 all day.
+        df = self._df([0.995] * 20 + [0.003] * 20,
+                      [-2_000_000.0] * 20 + [8_000.0] * 20)
+        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+                                              customer_class="sg",
+                                              service_role="generation"))
+        assert r["mean_pf"] > 0.9
+        assert r["min_pf"] > 0.9
 
     def test_a_service_that_only_exports_gets_no_compliance_finding(self):
         from pq_analysis import check_power_factor
@@ -3307,6 +3584,26 @@ class TestWhichCurrentStandardApplies:
             service_role="generation", rated_ac_kw=250.0, avg_peak_demand_kw=10.0))
         assert r["standard"] == "1547"
         assert "1547" in r["reason"]
+
+    def test_a_plant_needs_no_demand_figure_to_reach_1547(self):
+        # The demand field is greyed out at a plant, so nothing supplies it.
+        # Falling through to "undetermined" here graded a producer's array
+        # against 519 -- three times the aggregate limit that governs it.
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t(
+            service_role="generation", rated_ac_kw=2300.0))
+        assert r["standard"] == "1547"
+        assert r["branch"] == "generation_only"
+        assert r["determined"] is True
+        assert "5.2" in r["reason"]
+
+    def test_a_mixed_service_still_needs_both_figures(self):
+        # The short circuit above is scoped to plants: a load with generation
+        # behind it is exactly the case Figure 1 exists to decide.
+        from pq_analysis import applicable_current_standard
+        r = applicable_current_standard(self._t(
+            service_role="mixed", rated_ac_kw=2300.0))
+        assert r["branch"] == "undetermined"
 
     def test_missing_records_are_reported_undetermined_not_guessed(self):
         # Both quantities come from records. Guessing either picks the wrong
@@ -4264,6 +4561,63 @@ def gui_app():
     app.update_idletasks()
     yield app
     app.destroy()
+
+
+class TestTheWindowFitsOnAScreen:
+    """The form ran off the bottom of a 1080p work PC.
+
+    It was one vertical stack -- form, then log -- asking for 914 px before the
+    session row or the expanded sign-off were showing, which put the Run button
+    below the taskbar. The log is the tallest single element and the one least
+    needed while the form is being filled in, so it moved into a second column.
+    These assertions are a height budget: a row added later that pushes the
+    window past a laptop screen should fail here rather than in the field.
+    """
+
+    @staticmethod
+    def _generation(app):
+        import run
+        kids = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                kids.append(c)
+                walk(c)
+
+        walk(app)
+        combo = [w for w in kids if isinstance(w, run.ttk.Combobox)
+                 and str(w.cget("textvariable")) == str(app._role_var)][0]
+        app._role_var.set(run._ROLE_LABELS[2])
+        combo.event_generate("<<ComboboxSelected>>")
+        app.update_idletasks()
+
+    def test_the_form_and_the_log_are_side_by_side(self, gui_app):
+        # Not a cosmetic assertion: if the log ever lands back under the form,
+        # every height figure below moves by ~270 px at once.
+        assert gui_app._log.winfo_rootx() > gui_app._form.winfo_rootx()
+
+    def test_it_opens_short_enough_for_a_laptop(self, gui_app):
+        # 768 px is the shortest display these run on, less ~120 for the
+        # taskbar and title bar.
+        self._generation(gui_app)
+        assert gui_app.winfo_reqheight() < 648, gui_app.winfo_reqheight()
+
+    def test_even_everything_at_once_clears_a_1080p_screen(self, gui_app):
+        # Session picker showing and the sign-off expanded: the tallest the
+        # window ever gets.
+        self._generation(gui_app)
+        gui_app._session_frame.pack(fill="x", padx=12, pady=6,
+                                    after=gui_app._file_frame)
+        gui_app._det_toggle_btn.invoke()
+        gui_app.update_idletasks()
+        assert gui_app.winfo_reqheight() < 960, gui_app.winfo_reqheight()
+
+    def test_it_never_opens_taller_than_the_display(self, gui_app):
+        # Windows DPI scaling can inflate every row on a machine this was
+        # never measured on, so the clamp is belt and braces for the split.
+        gui_app._fit_to_screen()
+        height = int(gui_app.geometry().split("x")[1].split("+")[0])
+        assert height <= gui_app.winfo_screenheight() - 120
 
 
 class TestHelpWindowStructure:

@@ -31,9 +31,9 @@ from pq_constants import (
     _tdd_limit,
 )
 from pq_adapter import PQDataset
-from pq_constants import IL_CONVERSION_PF
+from pq_constants import IL_CONVERSION_PF, TSM_PF_TEST_MIN_OUTPUT
 from pq_analysis import (check_ride_through, check_frequency_ride_through,
-                         check_billing_demand_imbalance,
+                         check_billing_demand_imbalance, check_der_power_factor,
                          _IMPEDANCE_MIN_CONSISTENCY, _IMPEDANCE_STEP_MIN_A,
                          _MIN_LOADED_AMPS, _VOLTAGE_RESOLUTION_V,
                          applicable_current_standard, check_trd, exports_power,
@@ -431,6 +431,10 @@ def generate_report(
                                   else {"available": False,
                                         "note": "No generation at this service."}),
         "power_factor":          pf_result,
+        # What the interconnection agreement asks of a plant, as distinct from
+        # what the tariff asks of a load. Derived here for the same reason the
+        # two above are: it needs only the frame and the thresholds.
+        "der_power_factor":      check_der_power_factor(ds.df, thresh),
         "voltage_imbalance":     volt_imb_result,
         "current_imbalance":     curr_imb_result,
         "demand":                demand_result,
@@ -720,8 +724,19 @@ def print_report(report: dict) -> None:
         print(f"  {pfr['error']}")
     else:
         if pfr.get("pct_below_limit") is None:
-            print(f"  Min={pfr['min_pf']:.4f}  Mean={pfr['mean_pf']:.4f}  "
-                  f"Limit={pfr['limit']:.2f}  [NOT ASSESSED]")
+            # A plant carries no limit at all -- no tariff clause reaches it --
+            # so there is nothing to print after "Limit=", and the verdict is
+            # REPORTED rather than NOT ASSESSED: the figure was measured, on
+            # the exporting intervals, and simply is not graded.
+            if pfr.get("limit") is None:
+                tail = ("[REPORTED — while producing; no tariff limit applies]"
+                        if pfr.get("basis") == "plant_export" else
+                        "[REPORTED — no limit applies]")
+                print(f"  Min={pfr['min_pf']:.4f}  Mean={pfr['mean_pf']:.4f}  "
+                      f"{tail}")
+            else:
+                print(f"  Min={pfr['min_pf']:.4f}  Mean={pfr['mean_pf']:.4f}  "
+                      f"Limit={pfr['limit']:.2f}  [NOT ASSESSED]")
             print(f"  {pfr.get('scope_note', '')}")
         else:
             sym = "PASS" if pfr["pct_below_limit"] == 0 else "FAIL"
@@ -730,6 +745,36 @@ def print_report(report: dict) -> None:
         if pfr.get("convention") == "leading":
             print(f"  Power factor is signed leading/lagging; "
                   f"{pfr.get('pct_leading', 0):.1f}% of assessed intervals leading.")
+
+    # The interconnection agreement's own finding, printed here rather than
+    # only in Word. Every previous section that lived in the document alone
+    # went unnoticed until a run crashed or an engineer asked where it was.
+    der = report.get("der_power_factor") or {}
+    if der.get("mode") or der.get("error"):
+        print(f"\n  {'-' * 56}")
+        print("  AGAINST THE INTERCONNECTION AGREEMENT")
+        if not der.get("assessed"):
+            print(f"  {der.get('error') or 'Not assessed.'}")
+        else:
+            _dirn = der.get("direction") or ""
+            _pct  = der.get("pct_in_required_direction")
+            _dsym = ("PASS" if der.get("direction_pass") else "FAIL"
+                     if der.get("direction_pass") is not None else "n/a")
+            print(f"  Setpoint={der['setpoint']:.2f} {_dirn}  "
+                  f"Measured mean={der['mean_pf']:.4f}  "
+                  f"({der['intervals_used']:,} intervals while producing)")
+            if _pct is not None:
+                print(f"  Direction: {_pct:.1f}% {_dirn}  [{_dsym}]")
+            if der.get("magnitude_pass") is None:
+                print(f"  Deviation from setpoint: mean "
+                      f"{der['mean_deviation']:.4f}, worst "
+                      f"{der['max_deviation']:.4f}  [REPORTED — no tolerance stated]")
+            else:
+                _msym = "PASS" if der["magnitude_pass"] else "FAIL"
+                print(f"  Deviation from setpoint: worst "
+                      f"{der['max_deviation']:.4f} against "
+                      f"±{der['tolerance']:.3f}, outside for "
+                      f"{der['pct_outside_tolerance']:.2f}%  [{_msym}]")
 
     # ── Voltage imbalance ─────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -1481,8 +1526,29 @@ def analysis_mode_summary(report: dict, thresh) -> List[str]:
         bits.append(f"IEEE 1547 category: {cat}" if cat
                     else "IEEE 1547 category: not entered — ride-through not assessed")
 
+    # Which reactive control function is in play decides what the power factor
+    # numbers below mean, so it belongs with the other mode settings rather than
+    # only in the section it governs. A plant on volt-var and a plant on a fixed
+    # setpoint can produce the same recording.
+    der = report.get("der_power_factor") or {}
+    if role != "load":
+        if der.get("assessed"):
+            bits.append(
+                f"Reactive control: fixed power factor, setpoint "
+                f"{der['setpoint']:.2f} {der.get('direction') or ''}"
+                + (f" ±{der['tolerance']:.3f}" if der.get("tolerance")
+                   else " (no tolerance stated — deviation reported, not graded)"))
+        elif der.get("mode_label"):
+            bits.append(f"Reactive control: {der['mode_label'].lower()} "
+                        f"— not assessed")
+        else:
+            bits.append("Reactive control: mode not entered — power factor "
+                        "reported against no requirement")
+
     pfr = report.get("power_factor") or {}
-    if pfr.get("available") and pfr.get("pct_below_limit") is None:
+    if der.get("assessed"):
+        pass                      # said above, with the setpoint attached
+    elif pfr.get("available") and pfr.get("pct_below_limit") is None:
         bits.append("Power factor: not assessed (see note in that section)")
     elif pfr.get("convention") == "direction":
         bits.append("Power factor: meter signs it by direction of flow; "
@@ -1837,6 +1903,28 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
                     f"Mean {_m(pfr['mean_pf'], '.3f')}  "
                     f"(residential — tariff PF clause not applicable)")
             add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas, None, group="power")
+        elif (pfr.get("basis") == "plant_export"
+              and (report.get("der_power_factor") or {}).get("assessed")):
+            # Suppressed: the agreement's own row below carries this plant's
+            # power factor with an actual verdict. Printing both put "Not
+            # assessed" directly above "Exceeded" for the same quantity.
+            pass
+        elif pfr.get("limit") is None:
+            # A plant, or any case with no limit to name. Sheets R73 and R121
+            # bind the power factor a load presents; there is no load here, so
+            # the row reports the measurement and reaches no verdict rather
+            # than formatting a limit that does not exist.
+            meas = (f"Min {_m(pfr['min_pf'], '.3f')}  /  "
+                    f"Mean {_m(pfr['mean_pf'], '.3f')}  "
+                    + ("(while exporting — set by the interconnection "
+                       "agreement, not the tariff)"
+                       if pfr.get("basis") == "plant_export" else
+                       "(not assessed against the tariff)"))
+            add_row("Power factor (interconnection agreement)"
+                    if pfr.get("basis") == "plant_export" else
+                    "Power factor ≥ 0.90 lagging (Xcel tariff)",
+                    meas, None, group="power")
+
         else:
             meas = (f"Min {_m(pfr['min_pf'], '.3f')}  /  "
                     f"Mean {_m(pfr['mean_pf'], '.3f')}  "
@@ -1848,6 +1936,24 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
                     pf["power_factor"], sev.get("power_factor"), group="power")
     else:
         add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", "No data", None, group="power")
+
+    # The interconnection agreement's own row, where a setpoint was entered.
+    # It sits apart from the tariff row above because it is a different
+    # requirement on a different population, and collapsing them would put a
+    # plant's obligation under a heading citing a tariff that does not reach it.
+    der = report.get("der_power_factor") or {}
+    if der.get("assessed"):
+        _sp = der["setpoint"]
+        _dir = (der.get("direction") or "").capitalize()
+        add_row(f"Power factor {_sp:.2f} {_dir.lower()} (interconnection agreement)",
+                f"Mean {_m(der['mean_pf'], '.3f')}  /  "
+                f"{_mp(der.get('pct_in_required_direction'), '.0f')} in the "
+                f"required direction"
+                + (f"  (±{der['tolerance']:.3f})" if der.get("tolerance")
+                   else "  (no tolerance stated)"),
+                der.get("direction_pass") if der.get("magnitude_pass") is None
+                else (der["direction_pass"] and der["magnitude_pass"]),
+                group="power")
 
     # Voltage compliance
     if volt["available"]:
@@ -2976,6 +3082,114 @@ def _word_demand(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
     return None
 
 
+def _word_quadrant(doc, pfr, outdir, stem) -> None:
+    """Which way each power flowed, stated and then shown.
+
+    A power factor is a magnitude, and on a generating service the magnitude is
+    the least of what the interconnection agreement specifies: a setpoint
+    written "-0.98" names a quadrant as well as a number, and 0.98 while
+    injecting reactive power is the same figure describing the opposite
+    behaviour. The chart is here because it is what an engineer draws by hand
+    when asked to demonstrate this -- the watts below the line and the VAR
+    above it, on one time axis, with nothing to interpret.
+    """
+    quad = pfr.get("quadrants") or {}
+    if quad.get("dominant"):
+        _body(doc,
+            f"Over the intervals assessed, the service was "
+            f"{quad['dominant_label']} for {_mp(quad['dominant_pct'], '.0f')} "
+            f"of the time, averaging {_m(quad['mean_kw'], ',.0f', ' kW')} real "
+            f"and {_m(quad['mean_kvar'], ',.0f', ' kVAR')} (positive imported "
+            f"or absorbed, negative exported or injected). The direction is "
+            f"taken from the signs of the two power channels rather than from "
+            f"the sign of the power factor, so it does not depend on which "
+            f"convention the meter used.")
+    _embed_plot(doc, outdir, stem, "real_reactive.png",
+                "Real and reactive power over the recording. Exported watts "
+                "fall below the zero line and absorbed VAR sit above it, so "
+                "the quadrant an interconnection agreement specifies can be "
+                "read off directly.", width_cm=15.0)
+
+
+def _word_der_power_factor(doc, report, thresh) -> None:
+    """The interconnection agreement's power factor, where one governs.
+
+    Written inside the Power Factor section rather than as a section of its own:
+    a reader looking at what the plant held should meet what it owed in the same
+    place, and on a plant the tariff paragraphs above reach no verdict at all.
+    """
+    der = report.get("der_power_factor") or {}
+    if not der.get("mode") and not der.get("error"):
+        return
+    if not exports_power(thresh):
+        return
+
+    _bold(doc.add_paragraph(), "Against the interconnection agreement", size_pt=10)
+    if not der.get("assessed"):
+        _body(doc, der.get("error") or "Not assessed.")
+        return
+
+    sp, direction = der["setpoint"], der.get("direction_label") or ""
+    _body(doc,
+        f"The agreement specifies a fixed power factor of {sp:.2f}, "
+        f"{direction}, held at the reference point of applicability "
+        f"(IEEE 1547-2018 Clause 5.3.1; PSCo Technical Specifications Manual "
+        f"§6.3.2). Measured over {der['intervals_used']:,} intervals in which "
+        f"the plant produced at least "
+        f"{_mp(TSM_PF_TEST_MIN_OUTPUT * 100, '.0f')} of its "
+        + ("rating" if der.get("basis") == "nameplate"
+           else "largest output in this recording")
+        + f", the power factor averaged {_m(der['mean_pf'], '.3f')} "
+          f"(range {_m(der['min_pf'], '.3f')} to {_m(der['max_pf'], '.3f')}).")
+
+    # Direction first: it is the half of the requirement that is a fact rather
+    # than a matter of degree, and the half a magnitude cannot express.
+    pct = der.get("pct_in_required_direction")
+    if pct is not None:
+        if der.get("direction_pass"):
+            _body(doc,
+                f"The plant was {direction} for {_mp(pct, '.1f')} of those "
+                f"intervals, which is the direction the agreement calls for.")
+        else:
+            _body(doc,
+                f"The plant was {direction} for only {_mp(pct, '.1f')} of those "
+                f"intervals. The reactive flow was predominantly "
+                f"{(der.get('quadrants') or {}).get('dominant_label', 'the other way')}, "
+                f"which is the opposite of what the agreement specifies. A "
+                f"plant asked to absorb reactive power for voltage mitigation "
+                f"and injecting instead raises the voltage it was interconnected "
+                f"to hold down. This is a setting to check at the inverter, not "
+                f"a measurement artefact: the direction is taken from the sign "
+                f"of the reactive channel and does not depend on the meter's "
+                f"power factor convention.")
+
+    if der.get("magnitude_pass") is None:
+        _body(doc,
+            f"Displacement deviated from the {sp:.2f} setpoint by "
+            f"{_m(der['mean_deviation'], '.3f')} on average and "
+            f"{_m(der['max_deviation'], '.3f')} at worst. "
+            + (der.get("tolerance_note") or ""))
+    elif der["magnitude_pass"]:
+        _body(doc,
+            f"Displacement stayed within the ±{der['tolerance']:.3f} the "
+            f"agreement allows throughout, deviating by at most "
+            f"{_m(der['max_deviation'], '.3f')}.")
+    else:
+        _body(doc,
+            f"Displacement fell outside the ±{der['tolerance']:.3f} the "
+            f"agreement allows during {_mp(der['pct_outside_tolerance'], '.1f')} "
+            f"of the assessed intervals, deviating by up to "
+            f"{_m(der['max_deviation'], '.3f')}.")
+
+    if der.get("excluded_low_output"):
+        _body(doc,
+            f"{der['excluded_low_output']:,} further exporting intervals were "
+            f"excluded for being below that output threshold. PSCo's own "
+            f"witness testing does not verify power factor below it (TSM §8.1), "
+            f"and an inverter's displacement near the bottom of its range is "
+            f"not what the setpoint speaks to.")
+
+
 def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[str]:
     pfr = report["power_factor"]
 
@@ -2988,17 +3202,45 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
     # measurement is reported and the tariff comparison is not made. Falling
     # through to the class branches below would compare None against a limit.
     if pfr.get("pct_below_limit") is None:
-        _body(doc,
-            f"Measured mean displacement power factor was "
-            f"{_m(pfr['mean_pf'], '.3f')} (minimum {_m(pfr['min_pf'], '.3f')}), "
-            f"reported as measured. " + (pfr.get("scope_note") or ""))
+        if pfr.get("basis") == "plant_export":
+            n = pfr.get("intervals_used")
+            _body(doc,
+                f"The plant held a mean displacement power factor of "
+                f"{_m(pfr['mean_pf'], '.3f')} while producing (minimum "
+                f"{_m(pfr['min_pf'], '.3f')}"
+                + (f", over {n:,} intervals" if n else "") + "). "
+                + (pfr.get("scope_note") or ""))
+        else:
+            _body(doc,
+                f"Measured mean displacement power factor was "
+                f"{_m(pfr['mean_pf'], '.3f')} (minimum {_m(pfr['min_pf'], '.3f')}), "
+                f"reported as measured. " + (pfr.get("scope_note") or ""))
         if pfr.get("convention") == "direction":
             _body(doc,
                 "This meter signs power factor by the direction of real power, "
                 "so the negative values in the record are exporting intervals "
                 "rather than low power factor. The figures above are "
                 "magnitudes.")
-        return "Power Factor"
+        # The chart is the whole value of this section where no verdict is
+        # reached, so it is embedded here rather than only on the graded path
+        # below -- which is what left a plant's page with two sentences and
+        # nothing to look at.
+        _embed_plot(doc, outdir, stem, "pf_load.png",
+                    "Power factor against real power. Exporting intervals sit "
+                    "at negative real power; the near-zero cluster is the site "
+                    "drawing its auxiliary load, where displacement is "
+                    "arithmetic rather than a finding."
+                    if pfr.get("basis") == "plant_export" else
+                    "Power factor vs load. Low power factor at light load is "
+                    "common and usually benign; low power factor at high load "
+                    "is what the tariff addresses.", width_cm=12.5)
+        _word_quadrant(doc, pfr, outdir, stem)
+        _word_der_power_factor(doc, report, thresh)
+        doc.add_paragraph()
+        # None, not "Power Factor": the section was written. Returning the
+        # label here also listed power factor as data that was not available,
+        # in the same document that had just reported it.
+        return None
 
     if pfr["available"]:
         direction = "lagging" if pfr["mean_pf"] > 0 else "leading"
@@ -3052,6 +3294,8 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
                 "Power factor vs load. Low power factor at light load is common and "
                 "usually benign; low power factor at high load is what the tariff "
                 "addresses.", width_cm=12.5)
+    _word_quadrant(doc, pfr, outdir, stem)
+    _word_der_power_factor(doc, report, thresh)
     doc.add_paragraph()
     return None
 
@@ -5752,8 +5996,17 @@ def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
     rows: List[dict] = []
 
     def add(item, measured, against, ok):
+        """One row. ``ok`` is True, False, "reported" or None.
+
+        "reported" and None are different states and used to print the same
+        word: None means nothing was measured, while "reported" means it was
+        measured and no limit governs it -- a leg difference, or the power
+        factor of a plant. "Not measured" alongside a measurement reads as a
+        gap in the recording, which is not what happened.
+        """
         rows.append({"item": item, "measured": measured, "against": against,
-                     "result": {True: "Within limits", False: "Outside limits"}
+                     "result": {True: "Within limits", False: "Outside limits",
+                                "reported": "Reported"}
                                 .get(ok, "Not measured")})
 
     vc = report.get("voltage_compliance") or {}
@@ -5793,7 +6046,8 @@ def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
              f"{imb['limit_pct']:.0f}% maximum" if graded_imb else
              f"{imb.get('metric_label') or 'Leg difference'}: "
              "reported, no limit applies"),
-            (imb["max_imbalance_pct"] <= imb["limit_pct"]) if graded_imb else None)
+            (imb["max_imbalance_pct"] <= imb["limit_pct"]) if graded_imb
+            else "reported")
 
     itic = report.get("itic") or {}
     if itic.get("available"):
@@ -5822,7 +6076,31 @@ def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
 
     pfr = report.get("power_factor") or {}
     register = _letter_register(thresh)
-    if pfr.get("available") and register.get("pf_sheet"):
+    der = report.get("der_power_factor") or {}
+    if der.get("assessed"):
+        # The agreement was supplied, so the customer gets a verdict against
+        # their own agreement rather than a measurement with no yardstick.
+        _sp, _dir = der["setpoint"], (der.get("direction") or "")
+        graded = (der.get("direction_pass") if der.get("magnitude_pass") is None
+                  else (der["direction_pass"] and der["magnitude_pass"]))
+        add("Power factor while producing",
+            f"average {_m(der['mean_pf'], '.2f')}, "
+            f"{_mp(der.get('pct_in_required_direction'), '.0f')} of the time "
+            f"{_dir} reactive power",
+            f"Your interconnection agreement: {_sp:.2f} {_dir}"
+            + (f", ±{der['tolerance']:.2f}" if der.get("tolerance") else ""),
+            graded)
+    elif pfr.get("basis") == "plant_export":
+        # No tariff sheet reaches a plant's power factor, so the row carries
+        # the measurement and names what does govern it instead of citing a
+        # limit that does not apply here.
+        add("Power factor while producing",
+            f"lowest {_m(pfr['min_pf'], '.2f')}, "
+            f"average {_m(pfr['mean_pf'], '.2f')}",
+            "Set by your interconnection agreement, not by tariff",
+            "reported")
+    elif pfr.get("available") and register.get("pf_sheet") \
+            and pfr.get("limit") is not None:
         add("Power factor",
             f"lowest {_m(pfr['min_pf'], '.2f')}, "
             f"average {_m(pfr['mean_pf'], '.2f')}",
