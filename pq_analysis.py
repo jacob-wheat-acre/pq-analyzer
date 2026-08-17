@@ -5211,6 +5211,20 @@ def check_billing_demand_imbalance(df: pd.DataFrame, thresh: Thresholds) -> dict
         result["note"] = ("This schedule carries no demand charge, so there is "
                           "no billing demand for Sheet R123 to recompute.")
         return result
+    # A producer's array has no billing demand either. R123 recomputes what a
+    # *load* is billed for drawing, and a plant is settled on what it exports;
+    # its own draw is the auxiliary load. The clause was being raised in the
+    # letter to plant operators, telling them their phase spread was inflating
+    # a demand charge they do not pay. Phase balance still matters at a plant,
+    # but for TSM 2.5 -- balanced production -- which the imbalance section
+    # covers on its own terms.
+    if is_generation_only(thresh):
+        result["note"] = ("This is a generating facility, settled on what it "
+                          "exports rather than on a demand charge, so Sheet "
+                          "R123 has no billing demand to recompute. Phase "
+                          "balance at a plant is a TSM 2.5 question and is "
+                          "covered with the imbalance measurements.")
+        return result
 
     i_cols = [c for c in ("current_a", "current_b", "current_c") if c in df.columns]
     if len(i_cols) < 3:

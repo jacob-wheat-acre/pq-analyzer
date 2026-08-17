@@ -2354,6 +2354,68 @@ class TestFixedPowerFactorAgainstTheAgreement:
         assert r["mean_pf"] == pytest.approx(0.98, abs=0.001)
 
 
+class TestModeRoutingDoesNotCrossWires:
+    """Every setting combination produces two documents, and the wrong clause
+    in the wrong one is the failure this guards.
+
+    The tool has four customer classes and three power-flow roles, and the
+    documents are routed on both. A plant keeps whichever schedule it takes
+    service under, so class-keyed content reaches it unless something stops it
+    -- which is how Sheet R123's billing demand section, written for what a
+    load is billed for drawing, ended up in a producer's letter.
+    """
+
+    @staticmethod
+    def _r(role, cls="sg", **kw):
+        _ds, rep, th = _build_report("test_producer_array", cls, 277.0,
+                                     isc_amps=40000.0, service_role=role, **kw)
+        return rep, th
+
+    def test_a_plant_is_not_told_about_its_billing_demand(self):
+        rep, _th = self._r("generation", rated_ac_kw=250.0)
+        bd = rep["billing_demand_imbalance"]
+        assert bd["applies"] is False
+        assert "exports" in bd["note"]
+
+    def test_a_load_on_the_same_schedule_still_gets_it(self):
+        rep, _th = self._r("load")
+        assert rep["billing_demand_imbalance"]["available"] is True
+
+    def test_der_sections_stay_off_a_load_service(self):
+        rep, _th = self._r("load")
+        for key in ("volt_watt", "volt_var", "trip_settings", "der_power_factor"):
+            block = rep[key]
+            assert not block.get("assessed"), key
+            assert not block.get("available"), key
+
+    def test_der_sections_come_on_for_a_mixed_service_too(self):
+        # An array behind a load has an interconnection agreement as well.
+        rep, _th = self._r("mixed", rated_ac_kw=250.0, avg_peak_demand_kw=1200.0)
+        for key in ("volt_watt", "volt_var", "trip_settings"):
+            assert rep[key].get("available"), key
+
+    def test_the_letter_register_follows_the_role_not_the_schedule(self):
+        from pq_report import _letter_register
+        _rep, th = self._r("generation", rated_ac_kw=250.0)
+        assert _letter_register(th)["generating"] is True
+        # Same schedule, no generation: the ordinary SG register.
+        _rep2, th2 = self._r("load")
+        assert _letter_register(th2).get("generating") is not True
+
+    @pytest.mark.parametrize("cls", ["r", "c", "sg", "pg"])
+    def test_every_class_routes_to_a_register(self, cls):
+        from pq_report import _letter_register, _LETTER_REGISTER
+        from pq_constants import Thresholds
+        th = Thresholds(nominal_voltage=277.0, customer_class=cls)
+        reg = _letter_register(th)
+        assert reg is _LETTER_REGISTER[cls]
+        # Every register has to answer the questions the letter asks of it, or
+        # the letter falls back silently to a homeowner's reading level.
+        for field in ("site", "reader", "explains_basics", "fix_agent",
+                      "detail", "itic_curve", "owns_transformer"):
+            assert field in reg, (cls, field)
+
+
 class TestVoltWattCurtailment:
     """TSM 6.3.4 Table 3 — the function that reads in both directions.
 
