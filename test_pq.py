@@ -14,7 +14,9 @@ Coverage:
   7. Pipeline smoke test: MockAdapter → extract_dataset → check_voltage_compliance
 """
 
+import datetime
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -1711,6 +1713,72 @@ class TestSpecChannelTable:
 _FIXTURES = sorted((Path(__file__).parent / "test_data").glob("*.pqd"))
 
 
+class TestTimestampEpoch:
+    """The PQDIF day count is an Excel serial: day zero is 1899-12-30.
+
+    Annex A's prose calls the field "days since January 1, 1900", but the same
+    annex defines EXCEL_DAYCOUNT_ADJUST as 25569 for the span 1/1/1900 to
+    1/1/1970, and the true calendar span is 25567.  Reading the prose
+    literally dated every report two days late.  These anchors come from the
+    spec and from real instrument output, not from our own writer, so a
+    matching writer bug cannot hide a reader bug here.
+    """
+
+    def _decode(self, day, sec=0.0):
+        el = pqdif.Element(
+            tag=pqdif.TAG_TIME_START, element_type=1, physical_type=50,
+            embedded=False, link=0, size=12,
+            body=struct.pack("<Id", day, sec),
+        )
+        return el.scalar()
+
+    def test_excel_daycount_adjust_lands_on_the_unix_epoch(self):
+        # Annex A: EXCEL_DAYCOUNT_ADJUST converts this day count to C time.
+        assert self._decode(25569) == datetime.datetime(1970, 1, 1)
+
+    def test_seconds_are_added_to_the_day(self):
+        assert self._decode(25569, 3661.5) == datetime.datetime(
+            1970, 1, 1, 1, 1, 1, 500000)
+
+    def test_epoch_constant_is_the_excel_serial_zero(self):
+        assert pqdif.PQDIF_EPOCH == datetime.datetime(1899, 12, 30)
+
+    def test_adapter_shares_the_reader_epoch(self):
+        # Two epochs in two files is how they drift apart.
+        assert ProntoAdapter._PQDIF_EPOCH == pqdif.PQDIF_EPOCH
+
+
+@pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
+def test_observation_dates_match_their_labels():
+    """Pronto writes its own date into each waveform label.
+
+    That label is an independent witness to tagTimeStart inside the same
+    file, and a constant disagreement between the two is how the two-day
+    epoch error showed itself.  The synthetic fixtures carry no dated labels,
+    so this skips today; it exists to bite if a real Pronto file is ever
+    dropped into test_data.  On such a file the check means something
+    precisely because Pronto wrote the label -- against our own writer it
+    would only prove the reader and writer share an epoch, not that the epoch
+    is right.  That guarantee comes from TestTimestampEpoch instead.
+    """
+    label = re.compile(r"(\d{2})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})")
+    checked = 0
+    for path in _FIXTURES:
+        for obs in pqdif.PQDIFFile(path).observations:
+            m = label.search(obs.name or "")
+            if not (m and obs.start_time):
+                continue
+            mo, dy, yr, hh, mi, ss = (int(g) for g in m.groups())
+            labelled = datetime.datetime(2000 + yr, mo, dy, hh, mi, ss)
+            assert obs.start_time.replace(microsecond=0) == labelled, (
+                f"{path.name}: {obs.name!r} is labelled {labelled} but "
+                f"tagTimeStart decodes to {obs.start_time}"
+            )
+            checked += 1
+    if not checked:
+        pytest.skip("no dated waveform labels in the fixtures")
+
+
 @pytest.mark.skipif(not _FIXTURES, reason="test_data/*.pqd not generated")
 class TestFixturesAreCompliant:
     """The fixtures exist to exercise the same path real Pronto files take.
@@ -1736,11 +1804,15 @@ class TestFixturesAreCompliant:
 
     def test_every_guid_is_a_standard_identifier(self, path):
         # A vendor-private GUID would be legal but these fixtures should model
-        # what real Pronto files contain, which is standard IDs throughout.
+        # what real files contain, which is standard IDs throughout. The test
+        # is against the standard's own name tables rather than the handful of
+        # values Pronto happens to use: ProView tags power factor and phase
+        # angle with quantity_measured 'none' (ID 0), which is as standard as
+        # 'power' is.
         f = pqdif.PQDIFFile(path)
         for defn in f.definitions:
             assert defn.quantity_type in ("VALUELOG", "PHASOR", "WAVEFORM")
-            assert defn.quantity_measured in ("voltage", "current", "power")
+            assert defn.quantity_measured in pqdif.QUANTITY_MEASURED_NAMES.values()
             for series in defn.series:
                 assert series.characteristic in pqdif.CHARACTERISTIC_NAMES.values()
                 assert series.value_type in pqdif.VALUE_TYPE_NAMES.values()
@@ -1810,6 +1882,8 @@ class TestFixturesAreCompliant:
         by_name = {c.name: c
                    for obs in self._analysed_observations(path)
                    for c in obs.channels}
+        if "Harm 1 of Van" not in by_name:
+            pytest.skip("meter reports no per-order harmonics (ProView)")
         rms_channel = by_name["RMS Van (V1)"]
         fundamental_channel = by_name["Harm 1 of Van"]
         assert rms_channel.characteristic == "RMS"
@@ -1846,6 +1920,111 @@ class TestFixturesAreCompliant:
             assert (low <= avg + 1e-9).all(), f"{col}: min > avg"
             checked += 1
         assert checked >= 2, "expected max-min columns on the fixtures"
+
+
+class TestPerPhasePowerIsSummedToATotal:
+    """PMI's ProView reports power per phase and writes no three-phase total.
+
+    Pronto writes the total and no per-phase values, so _SPEC_CHANNELS -- a
+    strict 1:1 map -- had nothing to resolve on a ProView file, and tariff
+    power factor, demand, transformer loading and import/export direction all
+    went unavailable with only an INFO line to say so.
+    """
+
+    PROVIEW = "test_proview_per_phase"
+
+    def _resolved(self, stem):
+        path = Path(__file__).parent / "test_data" / f"{stem}.pqd"
+        adapter = ProntoAdapter(str(path))
+        return adapter, ChannelMapper().resolve(adapter.list_channels())
+
+    def _df(self, stem):
+        path = Path(__file__).parent / "test_data" / f"{stem}.pqd"
+        return extract_dataset(ProntoAdapter(str(path)), ChannelMapper()).df
+
+    def test_the_totals_exist_at_all(self):
+        df = self._df(self.PROVIEW)
+        for col in ("power_real", "power_reactive", "power_apparent",
+                    "power_factor", "frequency"):
+            assert col in df.columns, f"{col} missing on a per-phase meter"
+            assert df[col].notna().any(), f"{col} is entirely empty"
+
+    def test_real_power_is_the_exact_sum_of_the_phase_elements(self):
+        # Blondel: three elements on a four-wire service measure total real
+        # power exactly, so this is an identity and not an approximation.
+        path = Path(__file__).parent / "test_data" / f"{self.PROVIEW}.pqd"
+        phases = {}
+        for obs in pqdif.PQDIFFile(path).observations:
+            for ch in obs.channels:
+                if (ch.quantity_measured == "power"
+                        and ch.characteristic == "P"
+                        and ch.phase in ("an", "bn", "cn")):
+                    phases[ch.phase] = np.asarray(
+                        ch.series["AVG"], dtype=float)[0::2]
+        assert set(phases) == {"an", "bn", "cn"}, "fixture lost a phase"
+        expected = phases["an"] + phases["bn"] + phases["cn"]
+        got = self._df(self.PROVIEW)["power_real"].to_numpy()
+        assert np.allclose(got, expected[:len(got)], rtol=1e-9)
+
+    def test_power_factor_is_p_over_arithmetic_s(self):
+        df = self._df(self.PROVIEW)
+        got = df["power_factor"].to_numpy()
+        expected = df["power_real"].to_numpy() / df["power_apparent"].to_numpy()
+        assert np.allclose(got, expected, rtol=1e-9)
+
+    def test_arithmetic_apparent_differs_from_the_vector_sum(self):
+        # If these agreed the choice between them would not matter, and this
+        # fixture would not be exercising the decision it was built for.
+        df = self._df(self.PROVIEW)
+        arithmetic = df["power_apparent"].to_numpy()
+        vector = np.hypot(df["power_real"].to_numpy(),
+                          df["power_reactive"].to_numpy())
+        assert (arithmetic > vector).all(), "arithmetic S must be the larger"
+        assert (arithmetic / vector).mean() > 1.001
+
+    def test_power_factor_never_leaves_the_unit_interval(self):
+        pf = self._df(self.PROVIEW)["power_factor"].dropna().to_numpy()
+        assert ((pf >= -1.0) & (pf <= 1.0)).all()
+
+    def test_frequency_on_phase_a_resolves_like_a_total(self):
+        _adapter, resolved = self._resolved(self.PROVIEW)
+        assert "frequency" in resolved
+        hz = self._df(self.PROVIEW)["frequency"].dropna()
+        assert 59.5 < hz.mean() < 60.5
+
+    def test_a_meter_that_reports_its_own_total_is_not_overridden(self):
+        # Pronto writes a measured three-phase total. Ours is inferred, so the
+        # measured one must win wherever both could exist.
+        _adapter, resolved = self._resolved("test_commercial_small")
+        from pq_adapter import DERIVED_MARK
+        assert DERIVED_MARK not in resolved["power_real"].label
+
+    def test_the_derived_total_says_that_it_was_derived(self):
+        # The label reaches the report's data-source table, which is where a
+        # reader comparing against a revenue meter finds out these came from
+        # summed elements rather than a total register.
+        _adapter, resolved = self._resolved(self.PROVIEW)
+        from pq_adapter import DERIVED_MARK
+        assert DERIVED_MARK in resolved["power_real"].label
+
+    def test_consumed_per_phase_channels_are_not_reported_unmapped(self, caplog):
+        path = Path(__file__).parent / "test_data" / f"{self.PROVIEW}.pqd"
+        with caplog.at_level("INFO"):
+            extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        unmapped = " ".join(r.getMessage() for r in caplog.records
+                            if "no canonical column" in r.getMessage())
+        for consumed in ("power/P/phase=an", "power/Q/phase=bn",
+                         "power/S/phase=cn", "none/PF/phase=an"):
+            assert consumed not in unmapped, (
+                f"{consumed} fed a derived total but still reads as unmapped")
+
+    def test_the_checks_that_rest_on_power_now_run(self):
+        import pq_analysis as An
+        df = self._df(self.PROVIEW)
+        th = Thresholds(nominal_voltage=277.0, customer_class="sg",
+                        isc_amps=40000.0)
+        assert An.check_power_factor(df, th)["available"] is True
+        assert An.check_demand(df, th)["available"] is True
 
 
 class TestOverloadedCharacteristics:
@@ -2140,6 +2319,11 @@ _DOCUMENT_MATRIX = [
     ("test_commercial_large",    "sg", 277.0,   {"isc_amps": 40000.0}),
     ("test_commercial_imbalanced", "sg", 277.0, {"isc_amps": 40000.0}),
     ("test_commercial_primary",  "pg", 13200.0, {"isc_amps": 5000.0}),
+    # A meter that reports power per phase with no three-phase total, and Pst
+    # with no Plt. Both documents are built for it because the flicker crash
+    # and the missing power channels both reached the CLI without any test
+    # constructing the shape that produced them.
+    ("test_proview_per_phase",   "sg", 277.0,   {"isc_amps": 40000.0}),
     ("test_solar_net_metered",   "sg", 277.0,
      {"isc_amps": 40000.0, "service_role": "mixed", "rated_ac_kw": 150.0,
       "avg_peak_demand_kw": 1200.0}),
@@ -2919,6 +3103,261 @@ class TestAnalysisModeIsVisible:
         assert "assessed as" not in load
 
 
+class TestStateSpecificFindingsAreVisiblyFlagged:
+    """A tariff verdict and an IEEE 519 verdict must not look alike.
+
+    One travels and one does not, and a reader forwarding a report to another
+    region has to be able to see which is which without knowing the sheet
+    numbers by heart.
+    """
+
+    @staticmethod
+    def _doc(tmp_path, state):
+        import pq_analysis as An
+        from pq_report import generate_report, generate_word_report
+        from docx import Document
+        path = Path(__file__).parent / "test_data" / "test_commercial_small.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        th = Thresholds(state=state, nominal_voltage=120.0, customer_class="c")
+        df, ev = ds.df, An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            itic_result=An.check_itic(ev, th),
+            flicker_result=An.check_flicker(df, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        out = generate_word_report(
+            report=rep, thresh=th, site_name="S", site_address="A",
+            engineer_name="E", outdir=tmp_path, stem=str(state), ds=ds,
+            engineer_title="T", engineer_email="e@example.com")
+        return Document(out)
+
+    @staticmethod
+    def _standard_rows(doc):
+        tbl = next(tb for tb in doc.tables
+                   if tb.rows[0].cells[0].text.strip() == "Standard")
+        return [r.cells[0].text for r in tbl.rows[1:]
+                if len({id(c._tc) for c in r.cells}) > 1]
+
+    def test_the_tariff_row_is_marked(self, tmp_path):
+        from pq_constants import JURISDICTION_MARK
+        rows = self._standard_rows(self._doc(tmp_path, "CO"))
+        tariff = [r for r in rows if "tariff" in r.lower()]
+        assert tariff, "no tariff row in the table"
+        for row in tariff:
+            assert JURISDICTION_MARK in row, f"unmarked tariff row: {row!r}"
+            assert "CO TARIFF" in row
+
+    def test_national_standards_are_not_marked(self, tmp_path):
+        # Marking everything would mark nothing.
+        from pq_constants import JURISDICTION_MARK
+        rows = self._standard_rows(self._doc(tmp_path, "CO"))
+        national = [r for r in rows
+                    if any(k in r for k in ("IEEE 519", "ANSI C84.1",
+                                            "NEMA MG1", "ITIC",
+                                            "IEC 61000-3-3"))]
+        assert national, "fixture produced no national rows to compare against"
+        for row in national:
+            assert JURISDICTION_MARK not in row, f"marked a national standard: {row!r}"
+
+    def test_the_mark_is_explained_where_it_is_used(self, tmp_path):
+        doc = self._doc(tmp_path, "CO")
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "come from the filed tariff" in text
+        assert "applies identically in every state" in text
+
+    def test_the_section_heading_carries_it_into_the_navigation_pane(
+            self, tmp_path):
+        from pq_constants import JURISDICTION_MARK
+        doc = self._doc(tmp_path, "CO")
+        heads = [p.text for p in doc.paragraphs
+                 if p.style.name.startswith("Heading")]
+        pf = [h for h in heads if h.strip().startswith("Power Factor")]
+        assert pf, "no Power Factor heading"
+        assert JURISDICTION_MARK in pf[0], (
+            "the heading does not say the section is jurisdictional")
+
+    def test_the_summary_says_what_would_change_elsewhere(self, tmp_path):
+        doc = self._doc(tmp_path, "CO")
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "would be judged differently in another state" in text
+
+    def test_an_unencoded_state_is_marked_as_not_applied(self, tmp_path):
+        from pq_constants import JURISDICTION_MARK
+        doc = self._doc(tmp_path, "MN")
+        rows = self._standard_rows(doc)
+        marked = [r for r in rows if JURISDICTION_MARK in r]
+        assert marked, "nothing marked on an unencoded jurisdiction"
+        assert any("NOT APPLIED" in r for r in marked), (
+            "a clause that was never applied must say so on its row")
+
+    def test_an_unset_state_is_marked_rather_than_silently_national(
+            self, tmp_path):
+        from pq_constants import JURISDICTION_MARK
+        rows = self._standard_rows(self._doc(tmp_path, None))
+        marked = [r for r in rows if JURISDICTION_MARK in r]
+        assert marked and any("NO STATE SET" in r for r in marked), (
+            "with no state the tariff row must still declare itself")
+
+    def test_no_colorado_citation_reaches_another_state_letter(self, tmp_path):
+        # The engineering report is marked; the letter must simply not carry
+        # the clause at all, since a customer cannot act on a mark.
+        import re
+        import pq_analysis as An
+        from pq_report import generate_report, generate_customer_letter
+        from docx import Document
+        path = Path(__file__).parent / "test_data" / "test_commercial_small.pqd"
+        ds = extract_dataset(ProntoAdapter(str(path)), ChannelMapper())
+        th = Thresholds(state="MN", nominal_voltage=120.0, customer_class="c")
+        df, ev = ds.df, An.detect_events(ds, th)
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th,
+            itic_result=An.check_itic(ev, th))
+        rep["root_causes"] = An.analyze_root_causes(rep, ds, th)
+        out = generate_customer_letter(
+            report=rep, thresh=th, site_address="A", engineer_name="E",
+            outdir=tmp_path, stem="mn", engineer_title="T",
+            engineer_email="e@example.com")
+        text = "\n".join(p.text for p in Document(out).paragraphs)
+        assert not re.search(r"\bR7\d\b|\bR12\d\b|PSCo", text), (
+            "a Colorado sheet reached a Minnesota customer")
+
+
+class TestJurisdictionFailsClosed:
+    """A tariff clause is a state's document and does not travel.
+
+    A real ProView recording at 10 River Park Plaza, Saint Paul was analysed
+    against PSCo Sheets R73 and R121 -- Colorado clauses quoted at a Minnesota
+    customer -- because the jurisdiction was never a field. It is entered now,
+    and where it is unstated or its clauses are not encoded the power factor is
+    measured and reported but graded against nothing. Defaulting to Colorado
+    is the bug, not the fallback.
+    """
+
+    @staticmethod
+    def _df():
+        import pandas as pd
+        n = 40
+        idx = pd.date_range("2025-05-16", periods=n, freq="5min")
+        # Comfortably below any 0.90 clause, so a graded run must find a fault
+        # and an ungraded one must still decline.
+        return pd.DataFrame({
+            "power_factor":   [0.72] * n,
+            "power_real":     [50_000.0] * n,
+            "power_reactive": [48_000.0] * n,
+        }, index=idx)
+
+    def _check(self, state):
+        from pq_analysis import check_power_factor
+        return check_power_factor(self._df(), Thresholds(
+            state=state, nominal_voltage=277.0, customer_class="sg"))
+
+    def test_colorado_still_grades_against_its_sheet(self):
+        r = self._check("CO")
+        assert r["assessed"] is True
+        assert r["clause"] == "Sheet R73"
+        assert r["limit"] == 0.90
+        assert r["pct_below_limit"] == 100.0
+
+    @pytest.mark.parametrize("state", ["MN", "ND", "SD", "WI", "MI", "TX", "NM"])
+    def test_every_other_xcel_state_declines_rather_than_borrowing_colorado(
+            self, state):
+        r = self._check(state)
+        assert r["available"] is True, "the measurement is still reported"
+        assert r["assessed"] is False
+        assert r["limit"] is None
+        assert r["pct_below_limit"] is None
+        assert r["clause"] is None if "clause" in r else True
+        # The measurement itself is jurisdiction-free and must survive.
+        assert r["mean_pf"] == pytest.approx(0.72)
+
+    def test_an_unstated_state_declines(self):
+        r = self._check(None)
+        assert r["assessed"] is False
+        assert r["pct_below_limit"] is None
+        assert "No state was given" in r["scope_note"]
+
+    def test_a_state_xcel_does_not_serve_declines(self):
+        r = self._check("FL")
+        assert r["assessed"] is False
+        assert "not a state Xcel Energy serves" in r["scope_note"]
+
+    def test_the_reason_is_stated_rather_than_left_blank(self):
+        for state in ("MN", "TX", "WI"):
+            note = self._check(state)["scope_note"]
+            assert note and len(note) > 80, f"{state} declined without saying why"
+
+    def test_no_violation_timestamps_are_produced_without_a_clause(self):
+        # A violation is a claim against a clause. With no clause there can be
+        # no violations, however low the power factor went.
+        assert len(self._check("MN")["violation_timestamps"]) == 0
+        assert len(self._check("CO")["violation_timestamps"]) == 40
+
+    def test_pass_fail_reads_not_assessed_and_never_false(self):
+        # False would put "power factor" in the failed-standards list and into
+        # the customer letter, citing a clause that was never applied.
+        import pq_analysis as An
+        from pq_report import generate_report
+        ds = extract_dataset(
+            ProntoAdapter(str(Path(__file__).parent / "test_data"
+                          / "test_commercial_small.pqd")), ChannelMapper())
+        th = Thresholds(state="MN", nominal_voltage=120.0, customer_class="c")
+        df, ev = ds.df, An.detect_events(ds, Thresholds(nominal_voltage=120.0))
+        rep = generate_report(
+            ds, An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), ev, th)
+        assert rep["pass_fail"]["power_factor"] is None
+
+    def test_every_served_state_maps_to_an_operating_company(self):
+        from pq_constants import SERVED_STATES, STATE_TO_OPCO, TARIFF_RULESETS
+        for code, _name in SERVED_STATES:
+            assert code in STATE_TO_OPCO, f"{code} has no operating company"
+            assert STATE_TO_OPCO[code] in TARIFF_RULESETS
+
+    def test_an_unencoded_ruleset_says_what_is_missing(self):
+        from pq_constants import TARIFF_RULESETS
+        for opco, rules in TARIFF_RULESETS.items():
+            if not rules.encoded:
+                assert rules.gap, f"{opco} is unencoded but names no gap"
+                assert not rules.power_factor, (
+                    f"{opco} carries clauses but is marked unencoded")
+
+    def test_a_billing_adjustment_is_never_returned_as_a_requirement(self):
+        # R123 and Minnesota's demand adjustment are rate mechanisms. Grading
+        # against one would report a billing charge as a compliance breach.
+        from pq_constants import TARIFF_RULESETS, power_factor_requirement
+        for cls in ("r", "c", "sg", "pg"):
+            clause = power_factor_requirement("CO", cls)
+            if clause is not None:
+                assert clause.rule_type == "requirement"
+        billing = [c for c in TARIFF_RULESETS["PSCo"].power_factor
+                   if c.rule_type == "billing_adjustment"]
+        assert billing, "R123 should be recorded as a billing adjustment"
+
+    def test_the_report_header_names_the_jurisdiction(self):
+        from pq_report import _jurisdiction_label
+        assert "Not stated" in _jurisdiction_label(Thresholds())
+        assert "Colorado" in _jurisdiction_label(Thresholds(state="CO"))
+        mn = _jurisdiction_label(Thresholds(state="MN"))
+        assert "Minnesota" in mn and "not yet encoded" in mn
+
+
 class TestPowerFactorSignConvention:
     """A signed power factor channel read as a violation on every export.
 
@@ -2944,7 +3383,7 @@ class TestPowerFactorSignConvention:
         # Exporting at a healthy 0.95 displacement, reported as -0.95.
         df = self._df([-0.95] * 20 + [0.95] * 20,
                       [-50_000.0] * 20 + [50_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg",
                                               service_role="mixed"))
         assert r["convention"] == "direction"
@@ -2957,7 +3396,7 @@ class TestPowerFactorSignConvention:
         from pq_analysis import check_power_factor
         df = self._df([-0.95] * 20 + [0.95] * 20,
                       [-50_000.0] * 20 + [50_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg"))
         assert r["pct_below_limit"] == 0.0
 
@@ -2966,7 +3405,7 @@ class TestPowerFactorSignConvention:
         # export; it is a leading power factor, and R73 asks for lagging.
         from pq_analysis import check_power_factor
         df = self._df([-0.95] * 20 + [0.95] * 20, [50_000.0] * 40)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg"))
         assert r["convention"] == "leading"
         assert r["pct_leading"] == pytest.approx(50.0, abs=1.0)
@@ -2980,7 +3419,7 @@ class TestPowerFactorSignConvention:
         # A plant is scoped the other way round -- see the test below.
         df = self._df([-0.70] * 20 + [0.97] * 20,
                       [-50_000.0] * 20 + [50_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg",
                                               service_role="mixed"))
         assert r["pct_below_limit"] == 0.0
@@ -2996,7 +3435,7 @@ class TestPowerFactorSignConvention:
         # that matters, the displacement while producing, went unread.
         df = self._df([0.995] * 20 + [0.30] * 20,
                       [-2_000_000.0] * 20 + [10_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg",
                                               service_role="generation"))
         assert r["basis"] == "plant_export"
@@ -3018,7 +3457,7 @@ class TestPowerFactorSignConvention:
         # carried enough load. Each population is gated against its own peak.
         df = self._df([0.98] * 20 + [0.80] * 20,
                       [-500_000.0] * 20 + [40_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg",
                                               service_role="mixed"))
         assert r["pct_below_limit"] == 100.0
@@ -3030,7 +3469,7 @@ class TestPowerFactorSignConvention:
         # included, was 0.53 against a plant that ran at 0.995 all day.
         df = self._df([0.995] * 20 + [0.003] * 20,
                       [-2_000_000.0] * 20 + [8_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg",
                                               service_role="generation"))
         assert r["mean_pf"] > 0.9
@@ -3039,7 +3478,7 @@ class TestPowerFactorSignConvention:
     def test_a_service_that_only_exports_gets_no_compliance_finding(self):
         from pq_analysis import check_power_factor
         df = self._df([-0.85] * 20, [-50_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg",
                                               service_role="generation"))
         assert r["assessed"] is False
@@ -3050,7 +3489,7 @@ class TestPowerFactorSignConvention:
         # A plant's overnight auxiliary load: 600 W against 2 kVAR is a real
         # 0.29 displacement and a meaningless finding.
         df = self._df([0.29] * 20 + [0.97] * 20, [600.0] * 20 + [90_000.0] * 20)
-        r = check_power_factor(df, Thresholds(nominal_voltage=277.0,
+        r = check_power_factor(df, Thresholds(state="CO", nominal_voltage=277.0,
                                               customer_class="sg"))
         assert r["pct_below_limit"] == 0.0    # the idle intervals are excluded
 
@@ -4109,6 +4548,60 @@ class TestFlickerAllPhases:
     def test_unavailable_without_channels(self):
         from pq_analysis import check_flicker
         assert check_flicker(_frame(voltage_a=[120.0] * 5), Thresholds())["available"] is False
+
+
+class TestMeterRecordingOnlyOneFlickerMeasure:
+    """ProView exports Pst with no Plt; Pronto exports both.
+
+    check_flicker already handled the partial case -- plt_max is None and
+    overall_pass is decided on the measures present -- but the report layer
+    assumed both existed and formatted None, crashing every ProView file that
+    failed on Pst.  The document must name only what the meter recorded, and
+    must not claim a clean result for a window it never measured.
+    """
+
+    def _pst_only(self, pst):
+        from pq_analysis import check_flicker
+        return check_flicker(_frame(flicker_pst=[pst] * 10,
+                                    flicker_pst_b=[pst * 0.5] * 10),
+                             Thresholds())
+
+    def test_analysis_reports_pst_and_leaves_plt_unmeasured(self):
+        r = self._pst_only(1.9)
+        assert r["available"] is True
+        assert r["pst_max"] == 1.9
+        assert r["plt_max"] is None
+        assert r["overall_pass"] is False
+
+    def test_key_finding_does_not_format_the_missing_plt(self):
+        from pq_report import _collect_key_findings
+        ds, rep, th = _build_report("test_commercial_small", "c", 120.0)
+        rep["flicker"] = self._pst_only(1.9)
+        rep["pass_fail"]["flicker"] = False
+        found = [t for t in _collect_key_findings(rep, th, ds.df)
+                 if "flicker" in t.lower()]
+        assert found, "the failure produced no key finding"
+        assert "Pst maximum 1.90" in found[0]
+        assert "Plt" not in found[0], f"named an unmeasured Plt: {found[0]}"
+
+    def test_a_passing_pst_only_file_does_not_claim_both_measures_passed(
+            self, tmp_path):
+        from docx import Document
+        from pq_report import generate_word_report
+        ds, rep, th = _build_report("test_commercial_small", "c", 120.0)
+        rep["flicker"] = self._pst_only(0.4)
+        rep["pass_fail"]["flicker"] = True
+        path = generate_word_report(
+            report=rep, thresh=th, site_name="S", site_address="A",
+            engineer_name="E", outdir=tmp_path, stem="pstonly", ds=ds,
+            engineer_title="T", engineer_email="e@example.com")
+        text = "\n".join(p.text for p in Document(path).paragraphs)
+        assert "Both measures stayed within" not in text, (
+            "claimed a Plt result on a file with no Plt")
+        assert "Pst stayed within its limit" in text
+        # And it should not leave a degenerate range behind: the IEC and IEEE
+        # Pst figures are both 1.0, so there is no band to describe.
+        assert "between 1.00 and 1.0 " not in text
 
 
 class TestShortAndLongTermFlickerAreReportedSeparately:
@@ -6745,6 +7238,11 @@ class TestOneSeverityScale:
         allowed |= {"DA1020",                       # brand: headings, titles
                     "FFFFFF",                       # text on the header band
                     "333333", "555555", "666666", "6B6B6B", "808080"}  # neutrals
+        # The jurisdiction mark is a second axis, not a fourth severity: it
+        # says a finding comes from a state's tariff rather than a national
+        # standard, which is orthogonal to how bad the finding is. It gets one
+        # declared colour, read from the module so it cannot drift into two.
+        allowed |= {str(__import__("pq_report")._JURIS_CLR)}
         for path in _sample_documents(tmp_path):
             d = docx.Document(str(path))
             paras = list(d.paragraphs) + [
@@ -7637,7 +8135,10 @@ class TestCustomerLetter:
         import pq_analysis as An
         from pq_report import generate_report
         ds = extract_dataset(ProntoAdapter(path), ChannelMapper())
-        th = Thresholds(nominal_voltage=nominal, customer_class=customer_class)
+        # These assert PSCo sheet attribution, so the letter must be for a
+        # Colorado service; with no state stated there is no tariff to cite.
+        th = Thresholds(state="CO", nominal_voltage=nominal,
+                        customer_class=customer_class)
         df = ds.df
         ev = An.detect_events(ds, th)
         rep = generate_report(
@@ -8284,11 +8785,15 @@ class TestEngineeringReportReview:
         assert m, "standards tally sentence missing"
         claimed = int(m.group(1))
         # The table is grouped by measured quantity, so it carries merged
-        # heading rows that are not standards and must not be counted.
+        # heading rows that are not standards and must not be counted. Rows
+        # marked N/A in the Compliance column reached no verdict -- a plant's
+        # power factor, or a service whose jurisdiction has no encoded tariff
+        # -- and "standards evaluated" does not mean them either.
         tbl = next(tb for tb in doc.tables
                    if tb.rows[0].cells[0].text.strip() == "Standard")
         rows = sum(1 for r in tbl.rows[1:]
-                   if len({id(c._tc) for c in r.cells}) > 1)
+                   if len({id(c._tc) for c in r.cells}) > 1
+                   and r.cells[2].text.strip() != "N/A")
         assert claimed == rows, f"summary claims {claimed}, table shows {rows}"
 
     def test_the_new_checks_have_table_rows(self, doc):

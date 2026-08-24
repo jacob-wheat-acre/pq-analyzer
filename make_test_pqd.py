@@ -120,7 +120,10 @@ def _scalar_bytes(physical_type: int, value) -> bytes:
     if physical_type == 60:                       # GUID
         return value.bytes_le
     if physical_type == 50:                       # TIMESTAMPPQDIF
-        delta = value - datetime(1900, 1, 1)
+        # Day zero is 1899-12-30, not 1900-01-01 -- the count is an Excel
+        # serial date.  See pqdif.PQDIF_EPOCH; writing the other epoch here
+        # would hide a reader bug behind a matching writer bug.
+        delta = value - datetime(1899, 12, 30)
         return struct.pack('<Id', delta.days,
                            delta.seconds + delta.microseconds / 1e6)
     if physical_type == 32:
@@ -1526,6 +1529,111 @@ ADAPTIVE = {
 SECOND_SESSION_START = datetime(2025, 6, 28, 0, 0, 0)
 
 
+def _write_proview_file(out_dir: Path) -> None:
+    """A file shaped the way PMI's ProView exports, not the way Pronto does.
+
+    ProView reports power per phase and never writes a three-phase total, puts
+    system frequency on phase A rather than as a total, and tags power factor
+    with quantity_measured 'none'.  Every check that rests on power therefore
+    went unavailable on a real ProView file while the run still succeeded --
+    the failure mode the fixture matrix exists to catch.
+
+    The numbers are a modest three-phase commercial load: ~48 kW at 0.93
+    lagging, unbalanced enough that the arithmetic apparent power is
+    meaningfully above the vector one, which is the case the two definitions
+    disagree on.
+    """
+    rng = np.random.default_rng(20260824)
+    n = N_SAMPLES
+    times = _step_times(T_SEC, INTERVAL_SEC)
+    time_series = Series('TIME', 'INSTANTANEOUS', 's', times)
+
+    channels: list[Channel] = []
+
+    def add(name, phase, measured, characteristic, units, values):
+        channels.append(Channel(name, phase, measured, 'VALUELOG', [
+            time_series,
+            Series('AVG', characteristic, units, _step_pairs(values)),
+        ]))
+
+    def add_mm(name, phase, measured, characteristic, units, values):
+        # ProView reports the interval extremes alongside the average for the
+        # quantities it trends -- the real file carried 15 peak and 15 min
+        # series -- so min <= avg <= max has to hold here as it does on a
+        # Pronto fixture.
+        values = np.asarray(values, dtype=float)
+        spread = np.maximum(np.abs(values) * 0.004, 1e-3)
+        channels.append(Channel(name, phase, measured, 'VALUELOG', [
+            time_series,
+            Series('MAX', characteristic, units, _step_pairs(values + spread)),
+            Series('MIN', characteristic, units, _step_pairs(values - spread)),
+            Series('AVG', characteristic, units, _step_pairs(values)),
+        ]))
+
+    daily = np.sin(2 * np.pi * np.arange(n) / max(n, 1))
+    # Per-phase real power, deliberately unbalanced across the three.
+    p_ph = {}
+    q_ph = {}
+    for phase, (scale, pf_ph) in {'a': (1.00, 0.94),
+                                  'b': (0.86, 0.91),
+                                  'c': (1.09, 0.95)}.items():
+        p = (16_000.0 * scale) * (0.82 + 0.18 * daily) \
+            + rng.normal(0, 90.0, n)
+        # Q from the per-phase displacement, so the phases differ in angle as
+        # well as in magnitude.
+        q = p * np.tan(np.arccos(pf_ph))
+        p_ph[phase], q_ph[phase] = p, q
+
+    for phase in ('a', 'b', 'c'):
+        p, q = p_ph[phase], q_ph[phase]
+        # The meter's S carries distortion power, so it sits slightly above
+        # sqrt(P^2 + Q^2) -- the reason the arithmetic sum is preferred.
+        s = np.sqrt(p ** 2 + q ** 2) * 1.006
+        up = phase.upper()
+        add(f'Stripchart RMS RealPower{up}', f'{phase}n', 'power', 'P', 'W', p)
+        add(f'Stripchart RMS ReactivePower{up}', f'{phase}n', 'power', 'Q',
+            'VAR', q)
+        add(f'Stripchart RMS ApparentPower{up}', f'{phase}n', 'power', 'S',
+            'VA', s)
+        # Per-phase power factor and displacement factor, tagged the way
+        # ProView tags them: quantity_measured 'none'.
+        add(f'Stripchart RMS PowerFactor{up}', f'{phase}n', 'none', 'PF',
+            '', p / s)
+        add(f'Stripchart RMS DisplacementPowerFactor{up}', f'{phase}n',
+            'none', 'DF', '', p / np.sqrt(p ** 2 + q ** 2))
+        add(f'Stripchart RMS PhaseAngle{up}', f'{phase}n', 'none',
+            'ANGLE_FUND', 'deg', np.degrees(np.arctan2(q, p)))
+
+        v = 277.0 * (1.0 - 0.004 * daily) + rng.normal(0, 0.35, n)
+        i = s / v
+        add_mm(f'Stripchart RMS V{phase}n', f'{phase}n', 'voltage', 'RMS', 'V', v)
+        add_mm(f'Stripchart RMS I{phase}', f'{phase}n', 'current', 'RMS', 'A', i)
+        add_mm(f'Stripchart RMS THDV{up}', f'{phase}n', 'voltage', 'TOTAL_THD',
+            '%', np.clip(2.6 + rng.normal(0, 0.5, n), 0.2, 20))
+        add_mm(f'Stripchart RMS THDI{up}', f'{phase}n', 'current', 'TOTAL_THD',
+            '%', np.clip(5.1 + rng.normal(0, 0.9, n), 0.2, 30))
+        # Pst but no Plt, which is what ProView exports.
+        add_mm(f'Stripchart RMS Pst{up}', f'{phase}n', 'voltage', 'FLKR_PST',
+            '', np.clip(0.35 + rng.normal(0, 0.06, n), 0.01, 5))
+        add(f'Stripchart RMS IFL{up}', f'{phase}n', 'voltage', 'NONE', '',
+            np.clip(0.4 + rng.normal(0, 0.1, n), 0.0, 5))
+
+    # System frequency, on phase A rather than as a total.
+    add('Stripchart RMS FrequencyA', 'an', 'voltage', 'FREQUENCY', 'Hz',
+        60.0 + rng.normal(0, 0.008, n))
+
+    site = "test_proview_per_phase"
+    pqd_bytes = build_file(site, [
+        (f"{site} - Interval (avg)", channels),
+    ])
+    path = out_dir / f"{site}.pqd"
+    path.write_bytes(pqd_bytes)
+    parsed = pqdif.PQDIFFile(path)
+    print(f"  wrote {path}  ({len(pqd_bytes):,} bytes, "
+          f"{len(parsed.definitions)} channel definitions, "
+          f"{len(channels)} per-phase channels, no three-phase totals)")
+
+
 def _write_two_session_file(out_dir: Path) -> None:
     """A file holding two recording sessions, as "download all data" gives.
 
@@ -1594,6 +1702,7 @@ def main():
                  if len(observations) > 2 else "") + ")")
 
     _write_two_session_file(out_dir)
+    _write_proview_file(out_dir)
 
     print(f"\nSample CLI commands (run from repo root):\n")
     print("  python pq_analyzer.py test_data/test_residential.pqd \\")

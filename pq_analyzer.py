@@ -20,6 +20,7 @@ from pathlib import Path
 
 # ── Re-export symbols that run.py imports from this module ───────────────────
 from pq_constants import (
+    SERVED_STATES,
     __version__,
     Thresholds,
     _BLUE_BOOK_ISC,
@@ -320,6 +321,13 @@ EXAMPLES
     p.add_argument("--engineer",       default=None, help="Engineer name for the report sign-off")
     p.add_argument("--engineer-title", default=None, help="Engineer title (default: Electric Area Engineer)")
     p.add_argument("--engineer-email", default=None, help="Engineer email address for sign-off")
+    p.add_argument("--state", default=None,
+                   choices=[c for c, _n in SERVED_STATES],
+                   help="Two-letter state code for the service, which decides "
+                        "whose tariff applies. Without it the power factor is "
+                        "measured and reported but not judged against any "
+                        "clause; it is never assumed. Xcel serves "
+                        + ", ".join(c for c, _n in SERVED_STATES) + ".")
     p.add_argument("--customer-class", default="sg",
                    choices=["r", "c", "sg", "pg"],
                    help="PSCo tariff schedule: r=Residential, c=Small Comm., sg=C&I Secondary, pg=C&I Primary")
@@ -437,6 +445,7 @@ def main():
         isc_source=isc_source,
         transformer_kva=args.transformer_kva,
         customer_class=args.customer_class,
+        state=args.state,
         service_role=args.service_role,
         rated_ac_kw=args.rated_ac_kw,
         avg_peak_demand_kw=args.avg_peak_demand_kw,

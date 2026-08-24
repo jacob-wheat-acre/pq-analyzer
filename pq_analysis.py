@@ -10,6 +10,8 @@ import pandas as pd
 
 from pq_constants import (
     measured as _m,
+    power_factor_requirement,
+    jurisdiction_gap,
     measured_pct as _mp,
     ansi_bands,
     ansi_band_basis,
@@ -1761,12 +1763,41 @@ def check_power_factor(df: pd.DataFrame, thresh: Thresholds) -> dict:
             "violation_timestamps": pd.DatetimeIndex([]),
         }
 
-    low = graded < thresh.power_factor_limit
+    # ── Which tariff, if any, this service answers to ─────────────────────
+    # The measurement above is jurisdiction-free; the finding below is not.
+    # Without a verified clause for this state the power factor is reported as
+    # measured and graded against nothing. Falling back to Colorado here is
+    # the failure this branch exists to prevent, not a convenience.
+    clause = power_factor_requirement(thresh.state, thresh.customer_class)
+    if clause is None:
+        return {
+            "available":            True,
+            "error":                None,
+            "assessed":             False,
+            "basis":                "no_jurisdiction",
+            "limit":                None,
+            "convention":           convention,
+            "min_pf":               float(graded.min()),
+            "mean_pf":              float(graded.mean()),
+            "pct_below_limit":      None,
+            "intervals_used":       int(len(graded)),
+            "scope_note":           jurisdiction_gap(thresh.state),
+            "quadrants":            quadrants,
+            "violation_timestamps": pd.DatetimeIndex([]),
+        }
+
+    # A clause may name a limit the engineer has overridden on the command
+    # line; the entered value wins, and the clause still says who is asking.
+    limit = (thresh.power_factor_limit
+             if thresh.power_factor_limit is not None else clause.limit)
+    low = graded < limit
     result = {
         "available":            True,
         "error":                None,
         "assessed":             True,
-        "limit":                thresh.power_factor_limit,
+        "clause":               clause.clause,
+        "clause_source":        clause.source,
+        "limit":                limit,
         "convention":           convention,
         "min_pf":               float(graded.min()),
         "mean_pf":              float(graded.mean()),

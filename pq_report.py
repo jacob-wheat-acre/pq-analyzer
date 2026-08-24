@@ -30,8 +30,12 @@ from pq_constants import (
     _tdd_class,
     _tdd_limit,
 )
-from pq_adapter import PQDataset
-from pq_constants import IL_CONVERSION_PF, TSM_PF_TEST_MIN_OUTPUT
+from pq_adapter import PQDataset, DERIVED_MARK
+from pq_constants import (IL_CONVERSION_PF, TSM_PF_TEST_MIN_OUTPUT,
+                          tariff_ruleset, jurisdiction_badge,
+                          jurisdiction_legend, JURISDICTION_MARK,
+                          BASIS_NATIONAL, BASIS_TARIFF,
+                          BASIS_INTERCONNECTION)
 from pq_analysis import (check_ride_through, check_frequency_ride_through,
                          check_billing_demand_imbalance, check_der_power_factor,
                          check_volt_watt, check_volt_var, check_trip_settings,
@@ -181,6 +185,10 @@ _GRAY_CLR  = RGBColor(0xF2, 0xF2, 0xF2) if _DOCX_AVAILABLE else None
 #: means a severity band and never decoration.
 _CHROME_HDR   = "DA1020"    # header band, white text on brand red
 _CHROME_BAND  = "E4E4E4"    # group divider inside a table
+#: Behind anything jurisdictional, so a state-specific row is visible
+#: from across the page rather than only on a careful read.
+_JURIS_BAND   = "FBEBCB"    # light amber, jurisdictional row
+_JURIS_CLR    = RGBColor(0x8A, 0x54, 0x00) if _DOCX_AVAILABLE else None
 _CHROME_LABEL = "EFEFEF"    # label column of a two-column table
 
 #: Body font. Arial at 10 pt is what this group writes in, so a report that
@@ -1138,13 +1146,29 @@ def _apply_base_style(doc) -> None:
         style.font.color.rgb = _XE_RED
 
 
-def _section_heading(doc, title: str, level: int = 1):
+def _section_heading(doc, title: str, level: int = 1, *,
+                     basis: str = BASIS_NATIONAL, state=None):
     """Real Word heading (level 1 or 2) so Word's navigation pane and an
-    auto-generated table of contents both work — not just a bolded paragraph."""
+    auto-generated table of contents both work — not just a bolded paragraph.
+
+    ``basis`` marks a whole section as jurisdictional, which the power factor
+    and DER interconnection sections are: everything under them comes from one
+    state's documents. The mark rides in the heading text so it survives into
+    the navigation pane and the table of contents, where a reader scanning the
+    structure can see which sections would change in another state.
+    """
+    badge = jurisdiction_badge(basis, state)
     heading = doc.add_heading(title, level=level)
     for run in heading.runs:
         run.font.color.rgb = _XE_RED
         _set_font(run)
+    if badge:
+        mark = heading.add_run("   " + badge)
+        mark.bold = True
+        mark.font.size = Pt(8)
+        _set_font(mark)
+        if _JURIS_CLR:
+            mark.font.color.rgb = _JURIS_CLR
     return heading
 
 
@@ -1591,7 +1615,7 @@ def _set_document_footer(doc, report: dict, thresh) -> None:
 
 def _word_site_info_table(doc, site_name, stem, site_address,
                           fs, nominal_v, nominal_ll, prepared_by="",
-                          analysis_mode=None) -> None:
+                          analysis_mode=None, thresh=None) -> None:
     rows_data = [
         ("Customer / Site", site_name or stem),
     ]
@@ -1608,6 +1632,10 @@ def _word_site_info_table(doc, site_name, stem, site_address,
         ("Duration",         f"{fs['duration_hours']:.2f} hours  |  {fs['sample_count']:,} intervals"),
         ("Service voltage",  f"{nominal_v:.0f} V L-N  /  {nominal_ll} V L-L"),
         ("Topology",         fs.get("topology", "unknown")),
+        # Which tariff this service was judged against, on the front page. A
+        # reader must not have to infer the jurisdiction from which sheet
+        # numbers appear further down.
+        ("Tariff jurisdiction", _jurisdiction_label(thresh)),
         ("Data sources",     (
             "Interval avg"
             + (", interval max/min" if fs.get("has_maxmin") else "")
@@ -1820,7 +1848,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
     buffered: List[tuple] = []
 
     def add_row(standard, measured, passes, severity=None, group="other",
-                verdict=None):
+                verdict=None, basis=BASIS_NATIONAL):
         """One finding: the compliance fact, then how much it matters.
 
         Callers that pass no severity fall back to grading on pass/fail alone,
@@ -1831,12 +1859,25 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
         standard is not binary — C84.1 has two named ranges, and collapsing
         Range B into "Exceeded" would lose the distinction the standard draws.
         """
-        buffered.append((group, standard, measured, passes, severity, verdict))
+        buffered.append((group, standard, measured, passes, severity, verdict,
+                         basis))
 
-    def _emit(standard, measured, passes, severity, verdict=None):
+    def _emit(standard, measured, passes, severity, verdict=None,
+              basis=BASIS_NATIONAL):
         row   = tbl.add_row()
         cells = row.cells
         cells[0].paragraphs[0].add_run(standard).font.size = Pt(10)
+        # A jurisdictional row is shaded and badged in the Standard column.
+        # Severity already owns the colour in the last column, and the first
+        # column is otherwise plain, so the two markings cannot be confused.
+        badge = jurisdiction_badge(basis, getattr(thresh, "state", None))
+        if badge:
+            _cell_shade(cells[0], _JURIS_BAND)
+            mark = cells[0].paragraphs[0].add_run("\n" + badge)
+            mark.bold = True
+            mark.font.size = Pt(7.5)
+            if _JURIS_CLR:
+                mark.font.color.rgb = _JURIS_CLR
         # The Measured column is the case the marking exists for: one cell puts
         # a reading and the limit it is judged against in the same breath --
         # "P95 6.80% (limit 8.00%)" -- and only the first came off the meter.
@@ -1908,7 +1949,8 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             meas = (f"Min {_m(pfr['min_pf'], '.3f')}  /  "
                     f"Mean {_m(pfr['mean_pf'], '.3f')}  "
                     f"(residential — tariff PF clause not applicable)")
-            add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas, None, group="power")
+            add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas, None,
+                    group="power", basis=BASIS_TARIFF)
         elif (pfr.get("basis") == "plant_export"
               and (report.get("der_power_factor") or {}).get("assessed")):
             # Suppressed: the agreement's own row below carries this plant's
@@ -1920,16 +1962,27 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             # bind the power factor a load presents; there is no load here, so
             # the row reports the measurement and reaches no verdict rather
             # than formatting a limit that does not exist.
+            if pfr.get("basis") == "plant_export":
+                pf_why = ("(while exporting — set by the interconnection "
+                          "agreement, not the tariff)")
+            elif pfr.get("basis") == "no_jurisdiction":
+                pf_why = "(measured only — no tariff for this jurisdiction)"
+            else:
+                pf_why = "(not assessed against the tariff)"
             meas = (f"Min {_m(pfr['min_pf'], '.3f')}  /  "
-                    f"Mean {_m(pfr['mean_pf'], '.3f')}  "
-                    + ("(while exporting — set by the interconnection "
-                       "agreement, not the tariff)"
-                       if pfr.get("basis") == "plant_export" else
-                       "(not assessed against the tariff)"))
-            add_row("Power factor (interconnection agreement)"
-                    if pfr.get("basis") == "plant_export" else
-                    "Power factor ≥ 0.90 lagging (Xcel tariff)",
-                    meas, None, group="power")
+                    f"Mean {_m(pfr['mean_pf'], '.3f')}  " + pf_why)
+            # Naming a 0.90 Xcel limit on a row that reached no verdict
+            # asserts the very clause the jurisdiction gate declined to apply.
+            if pfr.get("basis") == "plant_export":
+                pf_title = "Power factor (interconnection agreement)"
+            elif pfr.get("basis") == "no_jurisdiction":
+                pf_title = "Power factor (no tariff applied)"
+            else:
+                pf_title = "Power factor ≥ 0.90 lagging (Xcel tariff)"
+            add_row(pf_title, meas, None, group="power",
+                    basis=(BASIS_INTERCONNECTION
+                           if pfr.get("basis") == "plant_export"
+                           else BASIS_TARIFF))
 
         else:
             meas = (f"Min {_m(pfr['min_pf'], '.3f')}  /  "
@@ -1939,9 +1992,11 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             # sustained operation, and a single low interval is not a billing
             # condition.  The minimum still shows in the Measured column.
             add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", meas,
-                    pf["power_factor"], sev.get("power_factor"), group="power")
+                    pf["power_factor"], sev.get("power_factor"), group="power",
+                    basis=BASIS_TARIFF)
     else:
-        add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", "No data", None, group="power")
+        add_row("Power factor ≥ 0.90 lagging (Xcel tariff)", "No data", None,
+                group="power", basis=BASIS_TARIFF)
 
     # The interconnection agreement's own row, where a setpoint was entered.
     # It sits apart from the tariff row above because it is a different
@@ -1959,7 +2014,7 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
                    else "  (no tolerance stated)"),
                 der.get("direction_pass") if der.get("magnitude_pass") is None
                 else (der["direction_pass"] and der["magnitude_pass"]),
-                group="power")
+                group="power", basis=BASIS_INTERCONNECTION)
 
     # Voltage compliance
     if volt["available"]:
@@ -2277,8 +2332,18 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             continue
         rows.sort(key=lambda r: _rank(key, r[1]))
         _emit_group_heading(heading)
-        for _, standard, measured, passes, severity, verdict in rows:
-            _emit(standard, measured, passes, severity, verdict)
+        for _, standard, measured, passes, severity, verdict, basis in rows:
+            _emit(standard, measured, passes, severity, verdict, basis)
+
+    # The legend goes under the table, where a reader who has just met the mark
+    # is looking for what it means.
+    if any(r[6] != BASIS_NATIONAL for r in buffered):
+        legend = doc.add_paragraph()
+        lr = legend.add_run(jurisdiction_legend(getattr(thresh, "state", None)))
+        lr.font.size = Pt(8)
+        lr.italic = True
+        if _JURIS_CLR:
+            lr.font.color.rgb = _JURIS_CLR
 
     doc.add_paragraph()
 
@@ -2294,7 +2359,7 @@ _PF_FRIENDLY = {
     "thd_current":                  "current TDD (IEEE 519)",
     "individual_harmonics":         "individual harmonic currents (IEEE 519)",
     "individual_voltage_harmonics": "individual harmonic voltages (IEEE 519)",
-    "power_factor":                 "power factor (PSCo tariff)",
+    "power_factor":                 "power factor (utility tariff)",
     "voltage_imbalance":            "voltage imbalance",
     "current_imbalance":            "current imbalance",
     "harmonic_statistics":          "current harmonic statistical limits (IEEE 519 Clause 5)",
@@ -2313,6 +2378,24 @@ _PRIORITY_FROM_SEV = {"critical": "High", "warning": "Medium", "info": "Low"}
 def _phase_label(ph: str) -> str:
     """Customer-facing phase label from an internal phase/channel key."""
     return ph.replace("voltage_", "").replace("current_", "").strip("_").upper() or ph.upper()
+
+
+def _jurisdiction_label(thresh) -> str:
+    """Whose tariff this service answers to, for the report's header table.
+
+    Says plainly when there is none, because "not stated" and "Colorado" must
+    never look alike to a reader checking which clauses were applied.
+    """
+    state = (getattr(thresh, "state", None) or "").strip().upper()
+    if not state:
+        return "Not stated — no tariff clauses applied"
+    ruleset = tariff_ruleset(state)
+    if ruleset is None:
+        return f"{state} — not an Xcel Energy service area; no tariff applied"
+    if not ruleset.encoded:
+        return (f"{state} — {ruleset.company_name}; "
+                "clauses not yet encoded, no tariff finding made")
+    return f"{state} — {ruleset.company_name}"
 
 
 def _flicker_status(report: dict) -> Optional[dict]:
@@ -2435,12 +2518,20 @@ def _collect_key_findings(report: dict, thresh: Thresholds, df) -> List[str]:
 
     fl = _flicker_status(report)
     if fl and fl["passes"] is False:
-        items.append((0,
-            "Voltage flicker exceeded IEC 61000-3-3 limits "
-            f"(Pst maximum {fl['pst_max']:.2f} on phase {fl['pst_phase']} "
-            f"against a {fl['pst_limit']:.2f} limit; Plt maximum "
-            f"{fl['plt_max']:.2f} on phase {fl['plt_phase']} against a "
-            f"{fl['plt_limit']:.2f} limit)."))
+        # Only quote the measures the meter actually recorded. Pronto writes
+        # both Pst and Plt; ProView writes Pst alone, and naming a Plt it
+        # never measured formatted None and crashed the report.
+        parts = [
+            f"{label} maximum {fl[f'{k}_max']:.2f} on phase "
+            f"{_phase_label(fl[f'{k}_phase'])} against a "
+            f"{fl[f'{k}_limit']:.2f} limit"
+            for k, label in (("pst", "Pst"), ("plt", "Plt"))
+            if fl.get(f"{k}_max") is not None
+        ]
+        if parts:
+            items.append((0,
+                "Voltage flicker exceeded IEC 61000-3-3 limits "
+                f"({'; '.join(parts)})."))
 
     itic = report.get("itic", {})
     if pf.get("itic_transients") is False and itic.get("worst"):
@@ -2871,6 +2962,44 @@ def _severity_rollup(sev: dict) -> str:
                      for b in order if b in counts)
 
 
+def _jurisdiction_summary(report: dict, thresh: Thresholds) -> Optional[str]:
+    """One bullet naming what in this report is state-specific, if anything."""
+    pfr = report.get("power_factor") or {}
+    der = report.get("der_power_factor") or {}
+    marked = []
+    if pfr.get("available"):
+        marked.append("power factor")
+    if der.get("assessed"):
+        marked.append("the interconnection power factor setpoint")
+    if not marked:
+        return None
+
+    state = (getattr(thresh, "state", None) or "").strip().upper()
+    ruleset = tariff_ruleset(state)
+    subject = " and ".join(marked)
+    if ruleset is not None and ruleset.encoded:
+        return (f"{JURISDICTION_MARK} Marked findings — {subject} — come from "
+                f"{ruleset.company_name}'s own documents rather than a "
+                "national standard, and would be judged differently in "
+                "another state. Every other standard in this report applies "
+                "identically across Xcel Energy's service area.")
+    if ruleset is not None:
+        return (f"{JURISDICTION_MARK} This is a {ruleset.company_name} "
+                f"service in {state}. Its tariff clauses are not encoded in "
+                f"this tool, so {subject} is reported as measured and reaches "
+                "no compliance verdict. Every other standard in this report "
+                "is national and was applied in full.")
+    if state:
+        return (f"{JURISDICTION_MARK} {state} is not an Xcel Energy service "
+                f"area, so no utility tariff was applied and {subject} "
+                "reaches no compliance verdict. Every other standard in this "
+                "report is national and was applied in full.")
+    return (f"{JURISDICTION_MARK} No state was recorded for this service, so "
+            f"no utility tariff was applied and {subject} reaches no "
+            "compliance verdict. Every other standard in this report is "
+            "national and was applied in full.")
+
+
 def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
                           key_findings: List[str], actions: List[dict]) -> List[str]:
     """3–5 bullets: overall compliance, most significant finding, principal
@@ -2908,6 +3037,14 @@ def _exec_summary_bullets(report: dict, thresh: Thresholds, df,
         bullets.append(
             f"All {n_eval} power quality standards evaluated for this service "
             f"were met.{watch_txt}")
+
+    # Which of those standards would change at a state line, said before the
+    # reader reaches a table. A verdict drawn from one state's tariff and one
+    # drawn from IEEE 519 do not travel the same way, and the summary is where
+    # someone forwarding this report will look.
+    juris = _jurisdiction_summary(report, thresh)
+    if juris:
+        bullets.append(juris)
 
     if key_findings and (fails or len(key_findings) > 0):
         bullets.append(key_findings[0])
@@ -3201,7 +3338,8 @@ def _word_power_factor(doc, report, thresh, outdir=None, stem="") -> Optional[st
 
     if not pfr["available"]:
         return "Power Factor"
-    _section_heading(doc, "Power Factor", level=2)
+    _section_heading(doc, "Power Factor", level=2,
+                     basis=BASIS_TARIFF, state=getattr(thresh, "state", None))
 
     # Where the displacement could not be graded -- every interval exporting,
     # or none of them loaded enough for a ratio to mean anything -- the
@@ -4511,20 +4649,43 @@ def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
     if not fl.get("available"):
         return "Voltage Flicker"
 
+    # Not every meter records both measures: Pronto writes Pst and Plt,
+    # ProView writes Pst alone. The section describes what was measured, so
+    # it never explains a number the table does not contain or claim a clean
+    # result for a window the meter never reported.
+    has_pst = bool(fl.get("pst"))
+    has_plt = bool(fl.get("plt"))
+
     _section_heading(doc, "Voltage Flicker (IEC 61000-3-3)", level=2)
-    _body(doc,
-        "Flicker severity is reported as two numbers because it is measured "
-        "over two windows. Pst, short-term severity, is computed over 10 "
-        "minutes and scaled so that 1.0 is the level at which half of "
-        "observers watching an incandescent lamp find the flicker "
-        "objectionable — it catches motor starts, welders and other short "
-        "bursts. Plt, long-term severity, aggregates twelve consecutive Pst "
-        "values into one figure covering two hours (the cube root of their "
-        "mean cube, so one bad ten minutes still shows), and it catches loads "
-        "that cycle for hours: heat pumps, compressors, arc furnaces. A high "
-        "Pst with a low Plt is a brief disturbance; a Plt near its limit with "
-        "modest Pst values is something running repeatedly."
-    )
+    _pst_prose = (
+        "Pst, short-term severity, is computed over 10 minutes and scaled so "
+        "that 1.0 is the level at which half of observers watching an "
+        "incandescent lamp find the flicker objectionable — it catches motor "
+        "starts, welders and other short bursts.")
+    _plt_prose = (
+        "Plt, long-term severity, aggregates twelve consecutive Pst values "
+        "into one figure covering two hours (the cube root of their mean "
+        "cube, so one bad ten minutes still shows), and it catches loads that "
+        "cycle for hours: heat pumps, compressors, arc furnaces.")
+    if has_pst and has_plt:
+        _body(doc,
+            "Flicker severity is reported as two numbers because it is "
+            f"measured over two windows. {_pst_prose} {_plt_prose} A high Pst "
+            "with a low Plt is a brief disturbance; a Plt near its limit with "
+            "modest Pst values is something running repeatedly."
+        )
+    elif has_pst:
+        _body(doc,
+            f"{_pst_prose} This meter reported short-term severity only. Plt, "
+            "the two-hour measure that reveals a load cycling repeatedly "
+            "rather than starting once, was not recorded in this file, so "
+            "nothing below speaks to it."
+        )
+    else:
+        _body(doc,
+            f"{_plt_prose} This meter reported long-term severity only; the "
+            "10-minute Pst measure was not recorded in this file."
+        )
 
     tbl = doc.add_table(rows=1, cols=7)
     tbl.style = 'Table Grid'
@@ -4573,10 +4734,17 @@ def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
                 for phase, stats in sorted(fl.get(kind, {}).items())
                 if not stats["pass"]]
     if not failures:
+        measured = ("Both measures" if has_pst and has_plt
+                    else "Pst" if has_pst else "Plt")
+        caveat = ("" if has_pst and has_plt else
+                  " Only the one measure was recorded, so this is not a "
+                  "statement about the other.")
         _body(doc,
-            f"Both measures stayed within their limits on every phase "
+            f"{measured} stayed within "
+            f"{'their' if has_pst and has_plt else 'its'} limit"
+            f"{'s' if has_pst and has_plt else ''} on every phase "
             f"measured ({', '.join(fl.get('phases_read', []))}). No "
-            "objectionable lamp flicker from this service is expected."
+            f"objectionable lamp flicker from this service is expected.{caveat}"
         )
     else:
         worst = ", ".join(
@@ -4603,16 +4771,34 @@ def _word_flicker(doc, report, df, outdir=None, stem="") -> Optional[str]:
     # The limits above are equipment emission limits; the numbers a supply
     # system is held to are different, and a reader comparing against the
     # wrong one draws the wrong conclusion.
+    # The headroom sentence is drawn against whichever measure is in hand;
+    # quoting the Plt band on a file that carries no Plt invites the reader to
+    # look for a number that is not in the table.
+    if has_plt:
+        _applied = (f"Pst {fl['pst_limit']:.2f} and Plt {fl['plt_limit']:.2f}"
+                    if has_pst else f"Plt {fl['plt_limit']:.2f}")
+        _headroom = (
+            f"are higher — so a Plt between {fl['plt_limit']:.2f} and "
+            f"{_IEEE1453_LV_PLT:.1f} is over the equipment limit without "
+            "exceeding what the supply system is expected to hold")
+    else:
+        # The two Pst figures coincide at 1.0, so there is no band between
+        # them to describe -- the headroom the Plt pair leaves does not exist
+        # here, and inventing one would read as "between 1.00 and 1.0".
+        _applied = f"Pst {fl['pst_limit']:.2f}"
+        _headroom = (
+            f"coincide with the equipment limit on Pst at "
+            f"{_IEEE1453_LV_PST:.1f}, so for the measure recorded here the "
+            "emission limit is also the level the supply system is expected "
+            "to hold. The margin the two standards leave on Plt has no "
+            "equivalent on Pst, and no Plt was recorded in this file")
     _body(doc,
         f"Limits applied are IEC 61000-3-3, which governs what a piece of "
-        f"equipment may emit: Pst {fl['pst_limit']:.2f} and Plt "
-        f"{fl['plt_limit']:.2f}. The compatibility levels IEEE 1453-2015 sets "
-        f"for a low-voltage supply system are higher — Pst {_IEEE1453_LV_PST:.1f} "
-        f"and Plt {_IEEE1453_LV_PLT:.1f} — so a Plt between "
-        f"{fl['plt_limit']:.2f} and {_IEEE1453_LV_PLT:.1f} is over the "
-        "equipment limit without exceeding what the supply system is expected "
-        "to hold. Both standards assess against the 95th percentile over a "
-        "week; this recording covers "
+        f"equipment may emit: {_applied}. The compatibility levels IEEE "
+        f"1453-2015 sets for a low-voltage supply system, Pst "
+        f"{_IEEE1453_LV_PST:.1f} and Plt {_IEEE1453_LV_PLT:.1f}, "
+        f"{_headroom}. Both standards assess against the 95th percentile over "
+        "a week; this recording covers "
         f"{_m(report['file_summary']['duration_hours'] / 24, '.1f')} day(s), so the "
         "percentiles above describe the period recorded and not a week."
     )
@@ -4885,7 +5071,9 @@ def _word_der_verification(doc, report, thresh) -> None:
     if not any(x.get("available") or x.get("error") for x in (vw, vv, ts)):
         return
 
-    _section_heading(doc, "DER Interconnection Verification", level=1)
+    _section_heading(doc, "DER Interconnection Verification", level=1,
+                     basis=BASIS_INTERCONNECTION,
+                     state=getattr(thresh, "state", None))
     _body(doc,
         "PSCo's Technical Specifications Manual (01/01/2025) sets which "
         "autonomous inverter functions are enabled by default and what "
@@ -5411,6 +5599,24 @@ def _word_channel_appendix(doc, report, df) -> None:
           f"{intervals:,} recording intervals carried a value — a channel that "
           "matched but arrived empty shows here as 0.")
 
+    # Rows the adapter computed have no channel in the file to check against,
+    # and a reader comparing these figures with a revenue meter needs to know
+    # which ones those are before drawing a conclusion from a difference.
+    derived = sorted(name for name, info in cmap.items()
+                     if DERIVED_MARK in (info.get("device") or ""))
+    if derived:
+        _body(doc,
+            f"{len(derived)} of the rows below "
+            f"({', '.join(derived)}) were not read from the file. This meter "
+            "reports power separately for each phase and writes no "
+            "three-phase total, so the totals were summed from the per-phase "
+            "elements. Real power sums exactly. Apparent power is the "
+            "arithmetic sum of the per-phase values, which keeps the "
+            "distortion power the meter measured but runs above the vector "
+            "sum when the phases are unbalanced, and power factor is real "
+            "over apparent on those totals. Their device names below say so "
+            "rather than naming a channel that does not exist in the file.")
+
     # Within-interval max/min ride with the channel they qualify, so the table
     # stays one row per measured quantity rather than three.
     extras: Dict[str, List[str]] = {}
@@ -5563,7 +5769,12 @@ def _word_appendix(doc, report, thresh, df) -> None:
             "averaging it away. Pst therefore answers whether a disturbance is "
             "perceptible now, and Plt whether a repeatedly cycling load adds up "
             "to a nuisance over a working period; they fail independently and "
-            "both are reported per phase. The meter carries each value forward "
+            + ("both are reported per phase. "
+               if fl.get("pst") and fl.get("plt") else
+               "are reported per phase. This meter recorded "
+               + ("Pst only" if fl.get("pst") else "Plt only")
+               + ", so only that measure appears above. ")
+            + "The meter carries each value forward "
             "across several recording intervals, so the interval count is not "
             "the number of measurement windows and the percentiles are "
             "time-weighted. The limits applied, Pst 1.0 and Plt 0.65, are IEC "
@@ -5773,7 +5984,7 @@ def generate_word_report(
     doc.add_paragraph()
 
     _word_site_info_table(doc, site_name, stem, site_address,
-                          fs, nominal_v, nominal_ll,
+                          fs, nominal_v, nominal_ll, thresh=thresh,
                           prepared_by=", ".join(
                               b for b in (engineer_name,
                                           engineer_title or "Electric Area Engineer")
@@ -6272,10 +6483,13 @@ def _customer_checks(report: dict, thresh: Thresholds) -> List[dict]:
 
     fl = report.get("flicker") or {}
     if fl.get("available") and fl.get("pst_max") is not None:
+        # Name the Plt limit only when a Plt was measured against it.
+        _basis = f"IEC 61000-3-3: Pst {fl['pst_limit']:.2f}"
+        if fl.get("plt_max") is not None:
+            _basis += f", Plt {fl['plt_limit']:.2f}"
         add("Flicker (visible lamp flutter)",
             f"worst short-term reading {_m(fl['pst_max'], '.2f')}",
-            f"IEC 61000-3-3: Pst {fl['pst_limit']:.2f}, "
-            f"Plt {fl['plt_limit']:.2f}",
+            _basis,
             fl.get("overall_pass"))
 
     v_thd = (report.get("thd_compliance") or {}).get("voltage") or {}

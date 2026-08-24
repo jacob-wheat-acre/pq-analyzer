@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.59.0"
+__version__ = "0.64.0"
 
 
 @dataclass
@@ -35,6 +35,15 @@ class Thresholds:
     isc_source: Optional[str] = None     # human-readable note on how ISC was determined
     transformer_kva: Optional[float] = None  # service transformer nameplate (kVA)
     customer_class: str = "sg"            # "r" | "c" | "sg" | "pg"  (PSCo tariff schedules)
+    # Which state the service is in, and therefore whose tariff it answers to.
+    # Entered, never inferred: nothing in a .pqd names the jurisdiction, and an
+    # address is not in the file either. Left unset it stays unset -- it does
+    # NOT fall back to Colorado. A default here would be the whole bug: a
+    # Minnesota service silently judged against PSCo Sheets R73 and R121, which
+    # is what a real Saint Paul recording did. See tariff_ruleset() and
+    # power_factor_requirement(); with no jurisdiction the power factor is
+    # measured and reported but graded against nothing.
+    state: Optional[str] = None           # two-letter code, e.g. "CO", "MN"
     # On-site generation is not a rate class.  PSCo Schedule NM is "applicable
     # as a service element under all rate schedules, including Schedule PV",
     # and Schedule PV bills delivered energy "under the applicable Residential,
@@ -438,6 +447,271 @@ _H519_LIMITS: List[Tuple[int, int, List[float]]] = [
     (23, 35, [0.6,  1.0,  1.5,  2.0,  2.5]),   # 23 ≤ h < 35
     (35, 51, [0.3,  0.5,  0.7,  1.0,  1.4]),   # 35 ≤ h ≤ 50
 ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JURISDICTION — which utility's tariff a service is judged against
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Everything below this line is jurisdictional.  ANSI C84.1, IEEE 519, IEEE
+# 1547, IEC 61000-3-3 and the ITIC curve are national and are not: they apply
+# the same way in every state, which is why the bulk of the analysis needs no
+# jurisdiction at all.
+#
+# The tariff clauses do not travel.  A recording at 10 River Park Plaza in
+# Saint Paul is an NSP-Minnesota service, and quoting PSCo Sheet R73 at it is
+# quoting a Colorado document at a Minnesota customer.  That is the failure
+# this section exists to make impossible.
+
+
+@dataclass(frozen=True)
+class PowerFactorClause:
+    """One tariff clause about power factor.
+
+    ``rule_type`` is the distinction that decides whether a finding may be
+    written at all.  A *requirement* is something a customer can be out of
+    compliance with.  A *billing_adjustment* is a rate mechanism: the utility
+    prices low power factor into the demand charge and nobody is in breach of
+    anything.  PSCo's R123 and NSP-Minnesota's demand adjustment are both the
+    second kind, and reporting either as a violation is wrong in the same way.
+    """
+    clause: str                       # e.g. "Sheet R73"
+    rule_type: str                    # "requirement" | "billing_adjustment"
+    limit: Optional[float]            # lagging power factor, where one is set
+    classes: Tuple[str, ...]          # customer classes it reaches
+    note: str
+    source: str                       # document and revision it was read from
+
+
+@dataclass(frozen=True)
+class TariffRuleset:
+    """What is known about one operating company's tariff.
+
+    ``encoded`` is deliberately separate from "we have read something".  It is
+    True only where the clauses have been verified against the filed tariff
+    *and* the tool has the inputs needed to know which of them apply.  Where it
+    is False the analysis still measures and reports power factor -- that is a
+    measurement, and measurements are not jurisdictional -- but makes no
+    compliance finding.  Failing closed is the whole point: a silent fallback
+    to Colorado is the bug, not the safety net.
+    """
+    opco: str
+    company_name: str
+    states: Tuple[str, ...]
+    encoded: bool
+    power_factor: Tuple[PowerFactorClause, ...] = ()
+    gap: str = ""                     # what is missing, when not encoded
+
+
+#: Xcel Energy's four regulated operating companies.  PSCo is the only one
+#: whose clauses are encoded; the rest are researched to the point of knowing
+#: what still has to be settled before they can be.
+TARIFF_RULESETS: Dict[str, TariffRuleset] = {
+    "PSCo": TariffRuleset(
+        opco="PSCo",
+        company_name="Public Service Company of Colorado",
+        states=("CO",),
+        encoded=True,
+        power_factor=(
+            PowerFactorClause(
+                clause="Sheet R73",
+                rule_type="requirement",
+                limit=0.90,
+                classes=("r", "c", "sg", "pg"),
+                note="General rules: 0.90 lagging, applying to every class.",
+                source="PSCo Colorado Electric Tariff, Sheet R73",
+            ),
+            PowerFactorClause(
+                clause="Sheet R121",
+                rule_type="requirement",
+                limit=None,
+                classes=("c", "sg", "pg"),
+                note="C&I rules: power factor near unity. No number is given, "
+                     "so R73's 0.90 is what can be measured against.",
+                source="PSCo Colorado Electric Tariff, Sheet R121",
+            ),
+            PowerFactorClause(
+                clause="Sheet R123",
+                rule_type="billing_adjustment",
+                limit=None,
+                classes=("c", "sg", "pg"),
+                note="A billing charge on demand, not a limit. Never reported "
+                     "as a violation.",
+                source="PSCo Colorado Electric Tariff, Sheet R123",
+            ),
+        ),
+    ),
+    "NSP-MN": TariffRuleset(
+        opco="NSP-MN",
+        company_name="Northern States Power Company, a Minnesota corporation",
+        states=("MN", "ND", "SD"),
+        encoded=False,
+        gap="The Minnesota Electric Rate Book (MPUC No. 2) Section 5 carries a "
+            "demand adjustment -- actual demand divided by power factor "
+            "'but not more than a 90% power factor' -- which is a billing "
+            "mechanism and not a limit, and a separate clause under which the "
+            "Company 'may require' equipment to hold not less than 90%. "
+            "Neither can be applied yet: power factor is metered only for "
+            "three-phase services above 200 A or above 480 V, and at or below "
+            "that 'a power factor of 90% will be assumed' rather than "
+            "measured, so the clause's reach depends on a service size this "
+            "tool does not collect. The General Rules and Regulations "
+            "(Section 3) are also unread, and North Dakota and South Dakota "
+            "file their own rate books.",
+    ),
+    "NSP-WI": TariffRuleset(
+        opco="NSP-WI",
+        company_name="Northern States Power Company, a Wisconsin corporation",
+        states=("WI", "MI"),
+        encoded=False,
+        gap="Not yet researched. Wisconsin and Michigan are separate "
+            "jurisdictions filing with the PSCW and the MPSC respectively.",
+    ),
+    "SPS": TariffRuleset(
+        opco="SPS",
+        company_name="Southwestern Public Service Company",
+        states=("TX", "NM"),
+        encoded=False,
+        gap="Sheet IV-173 Rev 12 (Primary General Service, eff. 2024-02-01) "
+            "applies a power factor adjustment charge where the power factor "
+            "at the highest metered 30-minute demand is 'less than 90 percent "
+            "lagging', and only where power factor metering is installed -- "
+            "customers whose demand is expected to exceed 200 kW. That is a "
+            "charge rather than a limit, it turns on a single demand interval "
+            "rather than the recording, and whether Texas (PUCT) and New "
+            "Mexico (NMPRC) file the same sheet is unconfirmed. The 0.95 in "
+            "the charge formula is a coefficient, not a threshold.",
+    ),
+}
+
+#: Every state Xcel Energy serves, to the operating company that serves it.
+STATE_TO_OPCO: Dict[str, str] = {
+    state: ruleset.opco
+    for ruleset in TARIFF_RULESETS.values()
+    for state in ruleset.states
+}
+
+#: Shown in the entry form and the CLI help, in the order a list should read.
+SERVED_STATES: List[Tuple[str, str]] = [
+    ("CO", "Colorado"), ("MI", "Michigan"), ("MN", "Minnesota"),
+    ("ND", "North Dakota"), ("NM", "New Mexico"), ("SD", "South Dakota"),
+    ("TX", "Texas"), ("WI", "Wisconsin"),
+]
+
+
+#: What kind of document a finding rests on.  Only NATIONAL travels: the other
+#: two change at a state line, and a reader has to be able to see which is
+#: which without knowing the tariff numbers by heart.
+BASIS_NATIONAL = "national"              # ANSI, IEEE, IEC, ITIC — same everywhere
+BASIS_TARIFF = "tariff"                  # the operating company's filed tariff
+BASIS_INTERCONNECTION = "interconnection"  # e.g. PSCo's Technical Specifications Manual
+
+#: The mark put beside anything jurisdictional, in both documents.
+JURISDICTION_MARK = "\u25c6"            # ◆
+
+
+def jurisdiction_badge(basis: str, state: Optional[str]) -> Optional[str]:
+    """The short label flagging a finding as jurisdictional, or None.
+
+    Returns None for a national standard, which is the common case and needs
+    no mark: marking everything would mark nothing.
+    """
+    if basis == BASIS_NATIONAL:
+        return None
+    kind = "TARIFF" if basis == BASIS_TARIFF else "INTERCONNECTION"
+    code = (state or "").strip().upper()
+    if not code:
+        return f"{JURISDICTION_MARK} STATE {kind} — NO STATE SET"
+    ruleset = tariff_ruleset(code)
+    if ruleset is None:
+        return f"{JURISDICTION_MARK} {code} — NOT AN XCEL AREA"
+    if not ruleset.encoded:
+        return f"{JURISDICTION_MARK} {code} {kind} — NOT APPLIED"
+    return f"{JURISDICTION_MARK} {code} {kind}"
+
+
+def jurisdiction_legend(state: Optional[str]) -> str:
+    """One paragraph explaining the mark, naming this service's jurisdiction.
+
+    Each branch is written as a whole sentence rather than a stem with a
+    clause bolted on, because the no-state case reads as an afterthought
+    otherwise -- and that is the case most in need of being read.
+    """
+    national = (
+        "Everything unmarked is a national standard — ANSI C84.1, IEEE 519, "
+        "IEEE 1547, IEC 61000-3-3, NEMA MG1, the ITIC curve — and applies "
+        "identically in every state Xcel Energy serves.")
+    code = (state or "").strip().upper()
+    ruleset = tariff_ruleset(code)
+    if ruleset is not None and ruleset.encoded:
+        first = (f"Rows marked {JURISDICTION_MARK} come from the filed tariff "
+                 f"or interconnection manual of {ruleset.company_name}, and "
+                 "would be judged differently in another state.")
+    elif ruleset is not None:
+        first = (f"Rows marked {JURISDICTION_MARK} would be governed by the "
+                 f"filed tariff of {ruleset.company_name}. Those clauses are "
+                 "not yet encoded in this tool, so each such row reports a "
+                 "measurement and reaches no compliance verdict.")
+    elif code:
+        first = (f"Rows marked {JURISDICTION_MARK} would be governed by a "
+                 f"utility tariff. {code} is not an Xcel Energy service area, "
+                 "so no tariff was applied and each such row reports a "
+                 "measurement and reaches no compliance verdict.")
+    else:
+        first = (f"Rows marked {JURISDICTION_MARK} would be governed by a "
+                 "utility tariff. No state was recorded for this service, so "
+                 "no tariff was applied and each such row reports a "
+                 "measurement and reaches no compliance verdict.")
+    return first + " " + national
+
+
+def tariff_ruleset(state: Optional[str]) -> Optional[TariffRuleset]:
+    """The ruleset for a state, or None when the jurisdiction is unstated.
+
+    None is returned for an unstated state and for one Xcel does not serve.
+    Both mean the same thing to a caller: there is no tariff to judge this
+    service against, so no compliance finding may be made.
+    """
+    if not state:
+        return None
+    opco = STATE_TO_OPCO.get(state.strip().upper())
+    return TARIFF_RULESETS.get(opco) if opco else None
+
+
+def power_factor_requirement(
+    state: Optional[str], customer_class: str,
+) -> Optional[PowerFactorClause]:
+    """The clause a measured power factor may be graded against, if any.
+
+    Only a *requirement* that names a number is returned; a billing adjustment
+    never is, however low the power factor goes.
+    """
+    ruleset = tariff_ruleset(state)
+    if ruleset is None or not ruleset.encoded:
+        return None
+    for clause in ruleset.power_factor:
+        if (clause.rule_type == "requirement" and clause.limit is not None
+                and customer_class in clause.classes):
+            return clause
+    return None
+
+
+def jurisdiction_gap(state: Optional[str]) -> str:
+    """Why no tariff finding can be made, in a sentence fit for a report."""
+    if not state:
+        return ("No state was given for this service, so no tariff applies to "
+                "it. Power factor is reported as measured and is not judged "
+                "against any clause.")
+    code = state.strip().upper()
+    ruleset = tariff_ruleset(code)
+    if ruleset is None:
+        return (f"{code} is not a state Xcel Energy serves, so no Xcel tariff "
+                "applies to this service. Power factor is reported as "
+                "measured and is not judged against any clause.")
+    return (f"This is a {ruleset.company_name} service in {code}. Its power "
+            "factor clauses are not yet encoded in this tool, so power factor "
+            "is reported as measured and is not judged against any clause. "
+            + ruleset.gap)
+
 
 # Odd harmonic orders to check per IEEE 519-2022 (even harmonics limited to 25% of odd limits)
 _H519_ORDERS = [3, 5, 7, 9, 11, 13, 17, 19, 23, 25, 35, 37, 47, 49]

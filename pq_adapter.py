@@ -282,6 +282,13 @@ class RawChannelInfo:
         )
 
 
+#: Marks a channel the adapter computed from other channels rather than read
+#: from the file.  It appears in the device-label column of the report's
+#: channel appendix, where a reader checking a number against the meter's own
+#: channel list needs to know there is no such channel to check against.
+DERIVED_MARK = "derived from per-phase elements"
+
+
 class ChannelMapper:
     """Map raw device channels to canonical engineering names.
 
@@ -902,6 +909,11 @@ class ProntoAdapter:
                                  'power', 'apparent', 'total'),
         ('voltage', 'FREQUENCY', 'none'): ('Frequency', 'frequency',
                                            'frequency', 'frequency', 'total'),
+        # ProView writes system frequency against phase A rather than as a
+        # total. It is one measurement either way -- a service has one
+        # frequency -- so it resolves to the same canonical column.
+        ('voltage', 'FREQUENCY', 'an'): ('Frequency', 'frequency',
+                                         'frequency', 'frequency', 'total'),
         # ── Aggregate harmonic RMS ────────────────────────────────────────
         # Computed inside the meter at full precision; summing the reported
         # per-order magnitudes understates it, badly at light load where the
@@ -936,6 +948,51 @@ class ProntoAdapter:
                                       'unbalance_voltage_nps',
                                       'voltage', 's2s1', 'total'),
     }
+
+    #: Totals summed from per-phase elements, for meters that report power per
+    #: phase and never write a three-phase total.
+    #:
+    #: Pronto writes the total ('W 3 4 wire') and no per-phase values; PMI's
+    #: ProView writes RealPowerA/B/C and no total, so on a ProView file every
+    #: check that rests on power -- tariff power factor, demand, transformer
+    #: loading, import/export direction -- went unavailable with nothing but an
+    #: INFO line to say so.
+    #:
+    #: Summing is exact for real power: by Blondel's theorem three measuring
+    #: elements on a four-wire service measure total P exactly, whatever the
+    #: waveform or the unbalance.  Reactive power is the conventional
+    #: arithmetic sum.  Apparent power is the *arithmetic* sum Sa+Sb+Sc, which
+    #: under unbalance is not the vector sum sqrt(P^2+Q^2) and not IEEE
+    #: 1459-2010's effective Se; it is used because it keeps the distortion
+    #: power the meter measured, the same reason the meter's own S is
+    #: preferred over sqrt(P^2+Q^2) in _SPEC_CHANNELS above.
+    #:
+    #: Each entry: canonical -> (label, contributing keys, (qt, qm, phase),
+    #: expected unit symbol).
+    _SPEC_DERIVED: Dict[str, Tuple[str, Tuple[Tuple[str, str, str], ...],
+                                   Tuple[str, str, str], str]] = {
+        'power_real': (
+            f'Real Power ({DERIVED_MARK})',
+            (('power', 'P', 'an'), ('power', 'P', 'bn'), ('power', 'P', 'cn')),
+            ('watts', 'watts', 'total'), 'W'),
+        'power_reactive': (
+            f'Reactive Power ({DERIVED_MARK})',
+            (('power', 'Q', 'an'), ('power', 'Q', 'bn'), ('power', 'Q', 'cn')),
+            ('power', 'reactive', 'total'), 'VAR'),
+        'power_apparent': (
+            f'Apparent Power (arithmetic sum, {DERIVED_MARK})',
+            (('power', 'S', 'an'), ('power', 'S', 'bn'), ('power', 'S', 'cn')),
+            ('power', 'apparent', 'total'), 'VA'),
+    }
+
+    #: Per-phase power factor is not summable and its average is not the
+    #: service power factor, so it is never mapped; the total is P/S over the
+    #: derived totals instead.  These keys are consumed so they do not read as
+    #: unmapped channels once the totals they inform have been built.
+    _SPEC_DERIVED_PF_KEYS = (
+        ('none', 'PF', 'an'), ('none', 'PF', 'bn'), ('none', 'PF', 'cn'),
+        ('power', 'PF', 'an'), ('power', 'PF', 'bn'), ('power', 'PF', 'cn'),
+    )
 
     #: Characteristics that are instrument housekeeping rather than power
     #: quality, so their absence from _SPEC_CHANNELS is deliberate and does not
@@ -1117,16 +1174,17 @@ class ProntoAdapter:
         return 1
 
     #: PQDIF epoch (Annex A): timestamps count days from here.
-    _PQDIF_EPOCH = datetime(1900, 1, 1)
+    _PQDIF_EPOCH = pqdif.PQDIF_EPOCH
 
     def _spec_times(self, obs, t: np.ndarray, units: int) -> np.ndarray:
         """Convert a channel TIME series to absolute datetime64[ns].
 
         The observation's tagTimeStart is the authoritative start of the
-        record.  Note that Pronto's *label* dates disagree with tagTimeStart by
-        a fixed two days on the files checked, which is why the old reader --
-        which scraped the date out of a waveform label -- dated every report
-        two days early.
+        record.  Pronto's waveform *labels* carry the instrument's own date,
+        and they agree with tagTimeStart to the second once the timestamp is
+        decoded from the correct epoch (see pqdif.PQDIF_EPOCH).  They appeared
+        to disagree by a fixed two days only because the epoch was off by
+        two, which dated every report two days late.
 
         ``units`` is the TIME series' ID_QU_* value: seconds relative to
         tagTimeStart (the normal case), cycles relative to it, or absolute.
@@ -1139,7 +1197,7 @@ class ProntoAdapter:
         if start is None:
             log.warning(
                 "ProntoAdapter (spec): observation %r has no tagTimeStart; "
-                "timestamps will be relative to 1900-01-01.", obs.name,
+                "timestamps will be relative to the PQDIF epoch.", obs.name,
             )
             start = self._PQDIF_EPOCH
 
@@ -1361,6 +1419,85 @@ class ProntoAdapter:
             # of quietly going missing from the analysis.
             if channel.characteristic not in self._SPEC_IGNORED:
                 unmapped.setdefault(key, []).append(channel.name)
+
+        # ── Totals summed from per-phase elements ─────────────────────────
+        # Only when the meter wrote no total of its own: a meter that reports
+        # both must be believed over our arithmetic, since its total is
+        # measured and ours is inferred.
+        by_key: Dict[Tuple[str, str, str], object] = {}
+        for channel in pooled:
+            by_key.setdefault((channel.quantity_measured,
+                               channel.characteristic, channel.phase), channel)
+
+        consumed: Set[Tuple[str, str, str]] = set()
+        for canonical, (label, keys, tags, want_unit) in \
+                self._SPEC_DERIVED.items():
+            if canonical in canonical_index:
+                continue
+            parts, units = [], []
+            for key in keys:
+                channel = by_key.get(key)
+                if channel is None:
+                    continue
+                values = measured(channel)
+                if values is None:
+                    continue
+                parts.append(values)
+                units.append(channel.units)
+                consumed.add(key)
+            if not parts:
+                continue
+            # The PQDIF unit IDs for power are W, VAR and VA -- the standard
+            # offers no kW or kVA -- so a channel declaring anything else is
+            # not something to silently scale by a guessed factor. Say so and
+            # keep going: the arithmetic is still the meter's own numbers.
+            odd = sorted({u for u in units if u and u != want_unit})
+            if odd:
+                log.warning(
+                    "ProntoAdapter (spec): %s summed from channels declaring "
+                    "%s where %s was expected; values are used unscaled and "
+                    "may be wrong by a unit factor.",
+                    canonical, ", ".join(odd), want_unit,
+                )
+            stack = np.vstack(parts)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                total = np.nansum(stack, axis=0)
+            # An interval every phase left blank is unmeasured, not zero.
+            total[np.all(np.isnan(stack), axis=0)] = np.nan
+            qt, qm, phase = tags
+            add(label, canonical, qt, qm, phase,
+                want_unit, total)
+            log.info(
+                "ProntoAdapter (spec): %s summed from %d per-phase element(s); "
+                "this meter reports no three-phase total.",
+                canonical, len(parts),
+            )
+
+        # Power factor over the derived totals. The per-phase power factors are
+        # not summable and their mean is not the service power factor, so it is
+        # P/S that is taken -- signed by the direction of real power, which is
+        # the convention check_power_factor detects and reports.
+        if ('power_factor' not in canonical_index
+                and 'power_real' in canonical_index
+                and 'power_apparent' in canonical_index):
+            p_tot = arrays[canonical_index['power_real']]
+            s_tot = arrays[canonical_index['power_apparent']]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                pf = np.where(np.abs(s_tot) > 0, p_tot / s_tot, np.nan)
+            # |P| <= arithmetic S always holds, so anything outside the unit
+            # interval is numerical noise rather than a reading.
+            pf = np.clip(pf, -1.0, 1.0)
+            add(f'Power Factor (P/S, {DERIVED_MARK})', 'power_factor',
+                'powerfactor', 'powerfactor', 'total', '', pf)
+            consumed.update(self._SPEC_DERIVED_PF_KEYS)
+            log.info(
+                "ProntoAdapter (spec): power_factor derived as P/S over the "
+                "summed per-phase totals (arithmetic apparent power).",
+            )
+
+        for key in consumed:
+            unmapped.pop(key, None)
 
         if unmapped:
             log.info(

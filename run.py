@@ -44,6 +44,11 @@ _FIELD_TRIM         = "#c9c9c9"   # field borders, separators, tab edges
 _ISC_FG    = "#1a6fbf"   # blue for auto-populated ISC
 _ISC_NONE  = "#888888"   # grey when no ISC resolved
 
+#: Shown beside the state box while nothing is chosen. The consequence of
+#: leaving it blank belongs next to the blank, not in a manual.
+_STATE_HINT_BLANK = "(no state — power factor is measured but not judged)"
+
+
 # ── PSCo tariff schedule → CLI key mapping ───────────────────────────────────
 _SCHEDULE_KEY = {
     "Schedule R — Residential":               "r",
@@ -101,6 +106,7 @@ try:
     sys.path.insert(0, str(Path(__file__).parent))
     from pq_constants import __version__ as _ENGINE_VERSION
     from pq_constants import ansi_bands, ll_factor, REACTIVE_MODES
+    from pq_constants import SERVED_STATES, tariff_ruleset
 except Exception:
     _ENGINE_VERSION = "unknown"
     REACTIVE_MODES = {"fixed_pf": {"label": "Fixed power factor",
@@ -612,9 +618,26 @@ class PQApp(tk.Tk):
             width=34, font=_FONT_UI, state="readonly",
         )
         cclass_combo.pack(side="left")
-        tk.Label(cclass_frame,
-                 text="(PF: Sheet R73 ≥ 0.90 lagging, all classes  |  Sheet R121 near unity, C&I only)",
-                 bg=_BG, fg="#888888", font=_FONT_UI_S).pack(side="left", padx=(8, 0))
+
+        # The state sits on this row because it is the same question: which
+        # tariff, and then which schedule under it. Blank on purpose -- an
+        # unset state must not read as Colorado, which is how a Saint Paul
+        # recording came to be judged against PSCo sheets.
+        tk.Label(cclass_frame, text="State", bg=_BG, fg=_LABEL_FG,
+                 font=_FONT_UI).pack(side="left", padx=(12, 4))
+        self._state_var = tk.StringVar(value="")
+        state_combo = ttk.Combobox(
+            cclass_frame, textvariable=self._state_var,
+            values=[""] + [c for c, _n in SERVED_STATES],
+            width=5, font=_FONT_UI, state="readonly",
+        )
+        state_combo.pack(side="left")
+        self._state_hint = tk.Label(
+            cclass_frame, text=_STATE_HINT_BLANK,
+            bg=_BG, fg="#888888", font=_FONT_UI_S, anchor="w", justify="left")
+        self._state_hint.pack(side="left", padx=(8, 0))
+        state_combo.bind("<<ComboboxSelected>>",
+                         lambda _e: self._refresh_state_hint())
 
         # Generation rides on top of the class above rather than replacing it
         # -- Schedule NM applies "as a service element under all rate
@@ -1689,6 +1712,7 @@ class PQApp(tk.Tk):
             "session":        self._selected_session(),
             "nominal":        nominal,
             "cclass_key":     _SCHEDULE_KEY.get(self._cclass_var.get(), "sg"),
+            "state":          (self._state_var.get() or "").strip() or None,
             "service_role":   _ROLE_KEY.get(self._role_var.get(), "load"),
             "rated_ac_kw":    _float_or_none(self._rated_kw_var.get()),
             "avg_peak_demand_kw": _float_or_none(self._avg_peak_var.get()),
@@ -1733,6 +1757,30 @@ class PQApp(tk.Tk):
         self._running = True
 
         threading.Thread(target=self._run_direct, args=(params,), daemon=True).start()
+
+    def _refresh_state_hint(self) -> None:
+        """Say what the chosen state means before the run, not after.
+
+        A state Xcel serves but whose clauses are not yet encoded looks
+        identical to a working one until the report comes out with no power
+        factor verdict in it, so the box says so here.
+        """
+        code = (self._state_var.get() or "").strip()
+        if not code:
+            self._state_hint.config(text=_STATE_HINT_BLANK, fg="#888888")
+            return
+        ruleset = tariff_ruleset(code)
+        if ruleset is None:
+            self._state_hint.config(
+                text="(not an Xcel service area — no tariff finding)",
+                fg="#888888")
+        elif not ruleset.encoded:
+            self._state_hint.config(
+                text=f"({ruleset.opco} — clauses not encoded; no PF verdict)",
+                fg="#B8860B")
+        else:
+            self._state_hint.config(
+                text=f"({ruleset.opco} — tariff clauses applied)", fg="#888888")
 
     def _run_direct(self, params):
         handler = _GUILogHandler(self._log, self.after)
@@ -1807,6 +1855,7 @@ class PQApp(tk.Tk):
         thresh = Thresholds(
             nominal_voltage=nominal,
             customer_class=params["cclass_key"],
+            state=params["state"],
             service_role=params["service_role"],
             rated_ac_kw=params["rated_ac_kw"],
             avg_peak_demand_kw=params["avg_peak_demand_kw"],

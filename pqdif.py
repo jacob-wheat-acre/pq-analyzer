@@ -112,7 +112,20 @@ PHYS_TYPE_NAMES = {
 }
 
 #: PQDIF timestamps count days from this epoch (Annex A, struct ts).
-_EPOCH = datetime(1900, 1, 1)
+#:
+#: Annex A calls the field "days since January 1, 1900", but the same annex
+#: defines EXCEL_DAYCOUNT_ADJUST as 25569 -- "the number of days between
+#: 1/1/1900 and 1/1/1970" -- and the true calendar distance is 25567.  The
+#: struct is documented as a split-out Excel serial date, and 25569 is the
+#: Excel serial for 1970-01-01, so the count is an Excel serial whose day
+#: zero is 1899-12-30.  Decoding from 1900-01-01 dates every record two days
+#: late.  Pronto files settle it: each waveform observation carries the
+#: instrument's own date in its label, and the label matches this epoch to
+#: the second on every observation checked.
+_EPOCH = datetime(1899, 12, 30)
+
+#: Public alias -- pq_adapter converts absolute-time series against this too.
+PQDIF_EPOCH = _EPOCH
 
 
 def _u(s: str) -> uuid.UUID:
