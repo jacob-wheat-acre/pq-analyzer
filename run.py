@@ -107,6 +107,8 @@ try:
     from pq_constants import __version__ as _ENGINE_VERSION
     from pq_constants import ansi_bands, ll_factor, REACTIVE_MODES
     from pq_constants import SERVED_STATES, tariff_ruleset
+    from pq_constants import (tariff_status_report, tariff_gap_report,
+                              tariff_document_report)
 except Exception:
     _ENGINE_VERSION = "unknown"
     REACTIVE_MODES = {"fixed_pf": {"label": "Fixed power factor",
@@ -2157,6 +2159,14 @@ class PQApp(tk.Tk):
                          underline=True)
             t.tag_config("note", font=(_f0, _fs-1), foreground="#999999",
                          lmargin1=24, lmargin2=24)
+            # Every table, arrow diagram and label column in this guide was
+            # written to line up in a fixed-width font and was being rendered
+            # in Segoe UI, where nothing lines up with anything. Indented
+            # lines get the monospace tag; flush-left lines are prose and stay
+            # proportional. The wrap is turned off for these so a long table
+            # row scrolls rather than folding in half.
+            t.tag_config("mono", font=_FONT_MONO, foreground="#444444",
+                         lmargin1=24, lmargin2=24, spacing3=0, wrap="none")
             return t
 
         def use(t):
@@ -2203,7 +2213,8 @@ class PQApp(tk.Tk):
         pg_start     = page("Start here")
         pg_standard  = page("Which standard")
         pg_ridethru  = page("Ride-through")
-        pg_tariff    = page("PSCo tariff")
+        pg_tariff    = page("Colorado tariff")
+        pg_states    = page("State differences")
         pg_refs      = page("Standards")
         pg_workflow  = page("Investigating a job")
         pg_concepts  = page("Concepts")
@@ -2287,8 +2298,10 @@ class PQApp(tk.Tk):
             "                        generation is actually on site\n"
             "  Ride-through          what the plant must survive, and whose\n"
             "                        problem a trip is (Clause 6.4.2)\n"
-            "  PSCo tariff           the PF and phase clauses, and what they\n"
+            "  Colorado tariff       the PF and phase clauses, and what they\n"
             "                        actually say (this catches people out)\n"
+            "  State differences     the other seven states, and why a power\n"
+            "                        factor clause does not travel\n"
             "  Standards             the reference shelf, with links\n"
             "  Investigating a job   what to check first, by customer class\n"
             "  Concepts              the ideas the checks are built on\n"
@@ -2445,13 +2458,17 @@ class PQApp(tk.Tk):
             "\n"
             "                TRD = √(I_rms² − I₁²) ÷ I_rated × 100%   (1547 Eq. 2)\n"
             "\n"
-            "IEEE 1547-2018 Clause 7.3, Table 26 — odd orders, % of I_rated:\n"
+            "IEEE 1547-2018 Clause 7.3 — limits as % of I_rated:\n"
             "\n"
-            "    h < 11    11 ≤ h < 17   17 ≤ h < 23   23 ≤ h < 35   35 ≤ h < 50   TRD\n"
-            "     4.0%        2.0%          1.5%          0.6%          0.3%       5.0%\n"
-            "\n"
-            "Table 27 — even orders:  h=2 → 1.0%   h=4 → 2.0%   h=6 → 3.0%\n"
-            "                         8 ≤ h < 50 → the odd range above\n"
+            "    Table 26, odd orders        Table 27, even orders\n"
+            "    ────────────────────        ─────────────────────\n"
+            "         h < 11    4.0%             h = 2     1.0%\n"
+            "    11 ≤ h < 17    2.0%             h = 4     2.0%\n"
+            "    17 ≤ h < 23    1.5%             h = 6     3.0%\n"
+            "    23 ≤ h < 35    0.6%        8 ≤ h < 50     the odd\n"
+            "    35 ≤ h < 50    0.3%                       band above\n"
+            "    ────────────────────\n"
+            "    TRD, aggregate 5.0%\n"
             "\n"
             "Note the even limits are *looser* than 519's blanket 25%-of-odd rule.\n"
             "1547's rationale is that the 25% figure was researched and not found to\n"
@@ -2979,11 +2996,14 @@ class PQApp(tk.Tk):
             "absorb more harmonic current without voltage distortion.  IEEE 519-2022\n"
             "Table 2 current TDD limits by ISC/IL:\n"
             "\n"
-            "   < 20    →  TDD ≤  5%  (most residential / small commercial)\n"
-            "   20–50   →  TDD ≤  8%\n"
-            "   50–100  →  TDD ≤ 12%\n"
-            "   100–1000 → TDD ≤ 15%\n"
-            "   > 1000  →  TDD ≤ 20%\n"
+            "        ISC / IL      TDD limit\n"
+            "    ──────────────      ─────────\n"
+            "            < 20            5%     most residential,\n"
+            "                                   small commercial\n"
+            "         20 – 50            8%\n"
+            "        50 – 100           12%\n"
+            "       100 – 1000          15%\n"
+            "          > 1000           20%\n"
             "\n"
             "If ISC is unknown, this tool falls back to a flat 5% THD limit.",
         )
@@ -3293,11 +3313,13 @@ class PQApp(tk.Tk):
             "against the applicable IEEE 519-2022 limits.\n"
             "\n"
             "Current TDD limit is determined by the ISC/IL ratio entered in the tool:\n"
-            "  ISC/IL < 20     →  TDD ≤  5%\n"
-            "  ISC/IL 20–50    →  TDD ≤  8%\n"
-            "  ISC/IL 50–100   →  TDD ≤ 12%\n"
-            "  ISC/IL 100–1000 →  TDD ≤ 15%\n"
-            "  ISC/IL > 1000   →  TDD ≤ 20%\n"
+            "        ISC / IL      TDD limit\n"
+            "    ──────────────      ─────────\n"
+            "            < 20            5%\n"
+            "         20 – 50            8%\n"
+            "        50 – 100           12%\n"
+            "       100 – 1000          15%\n"
+            "          > 1000           20%\n"
             "\n"
             "If ISC is not entered, the tool falls back to a flat 5% limit (most\n"
             "conservative).  Enter ISC in amps to get the correct limit for the service.",
@@ -3494,8 +3516,156 @@ class PQApp(tk.Tk):
             "references that specific load type and its recommended mitigation.",
         )
 
-        for _pg in (pg_start, pg_standard, pg_ridethru, pg_tariff, pg_refs,
-                    pg_workflow, pg_concepts, pg_neutral, pg_methods):
+        # ── State differences ──────────────────────────────────────────────
+        use(pg_states)
+        section("State Differences — Whose Tariff Applies")
+        lead(
+            "Xcel Energy is four regulated companies across eight states, and a\n"
+            "tariff clause does not travel between them. Everything on this page\n"
+            "was read from the filed tariffs, which are archived locally under\n"
+            "Documents/xcel-tariffs alongside a written spec."
+        )
+
+        concept(
+            "The states define a different quantity, not a different number",
+            "This is the thing to take away, and it is easy to miss because every\n"
+            "state says \"90%\".  They are not measuring the same thing.\n"
+            "\n"
+            "  Colorado    \"the ratio of real power in kW to apparent power in\n"
+            "              kVA AT ANY GIVEN TIME\" -- instantaneous, at the meter,\n"
+            "              and required continuously.  A recording measures\n"
+            "              exactly this.\n"
+            "\n"
+            "  Minnesota   the month's kWh divided by the square root of\n"
+            "  Dakotas     (kWh squared + lagging kVARh squared), with leading\n"
+            "  Wisconsin   kVARh discarded entirely.  A billing-month energy\n"
+            "              ratio taken off the revenue meter.\n"
+            "\n"
+            "  Texas       the power factor at the single 30-minute interval in\n"
+            "  New Mexico  which the month's highest demand occurred.\n"
+            "\n"
+            "A power quality recording can produce the Colorado quantity.  It\n"
+            "cannot produce the Minnesota one -- not approximately, and not by\n"
+            "recording for longer.  They are different measurements that happen\n"
+            "to share a name.  This is why the tool declines to grade power\n"
+            "factor outside Colorado rather than applying 0.90 everywhere: that\n"
+            "would be the right number against the wrong quantity.",
+        )
+
+        concept(
+            "Most of the report is not state-specific at all",
+            "The national standards apply identically in all eight states, and\n"
+            "they are the bulk of the analysis:\n"
+            "\n"
+            "  ANSI C84.1        steady-state voltage ranges\n"
+            "  IEEE 519-2022     harmonic voltage and current limits\n"
+            "  IEEE 1547-2018    DER performance and ride-through\n"
+            "  IEC 61000-3-3     flicker, Pst and Plt\n"
+            "  NEMA MG1          voltage and current unbalance\n"
+            "  ITIC (CBEMA)      equipment sag and swell tolerance\n"
+            "\n"
+            "What is jurisdictional is the power factor tariff clause and the\n"
+            "interconnection requirements.  Nothing else in the report changes\n"
+            "when the service moves across a state line.",
+        )
+
+        # Generated from TARIFF_RULESETS rather than written out here. Two
+        # copies of the same facts drift, and a guide that describes last
+        # month's behaviour is worse than no guide: encoding a state has to
+        # change the verdict, the report badge and this page together.
+        concept(
+            "Where each company stands",
+            tariff_status_report(),
+        )
+
+        concept(
+            "What still has to be found",
+            "This is the hunt list, generated from the same table the tool\n"
+            "behaves by. An item here is a reason a state is not encoded yet.\n"
+            "\n"
+            + tariff_gap_report(),
+        )
+
+        concept(
+            "Documents these readings came from",
+            "Every quotation in this guide was read from a filed document, not\n"
+            "from a search result. The archive is in Documents/xcel-tariffs and\n"
+            "TARIFF-SPEC.md there carries the verbatim wording.\n"
+            "\n"
+            + tariff_document_report(),
+        )
+
+        concept(
+            "A requirement and a billing charge are not the same finding",
+            "Several of these clauses adjust what a customer is billed rather than\n"
+            "setting a limit they can breach.  PSCo Sheet R123 and the Minnesota\n"
+            "demand adjustment are both of that kind: the utility prices low power\n"
+            "factor into the demand charge, and nobody is out of compliance with\n"
+            "anything.\n"
+            "\n"
+            "The tool records which kind each clause is and will only ever grade\n"
+            "against a requirement.  Reporting a billing mechanism as a violation\n"
+            "would be wrong in a way a customer could reasonably object to.",
+        )
+
+        concept(
+            "How this shows up in the report",
+            "Anything jurisdictional is marked with a diamond and shaded, so a\n"
+            "tariff verdict never looks like an IEEE 519 verdict:\n"
+            "\n"
+            "  ◆ CO TARIFF                graded against Colorado's clause\n"
+            "  ◆ MN TARIFF -- NOT APPLIED measured and reported, not graded\n"
+            "  ◆ STATE TARIFF -- NO STATE no state was entered on the form\n"
+            "\n"
+            "The mark appears on the compliance table row, in the section heading\n"
+            "so it carries into Word's navigation pane and table of contents, in\n"
+            "the executive summary, and in a legend under the table.  The report\n"
+            "header names the jurisdiction outright.\n"
+            "\n"
+            "The customer letter is not marked.  A customer cannot act on a badge,\n"
+            "so instead the letter simply never cites a clause that does not reach\n"
+            "them -- a Minnesota letter carries no Colorado sheet number at all.",
+        )
+
+        concept(
+            "Why the State box must be filled in",
+            "It is blank by default and never defaults to Colorado.  A default\n"
+            "there is exactly how a real recording at 10 River Park Plaza in Saint\n"
+            "Paul came to be judged against PSCo Sheets R73 and R121 -- Colorado\n"
+            "clauses quoted at a Minnesota customer.\n"
+            "\n"
+            "Left blank, the analysis still runs in full and every national\n"
+            "standard is applied.  Only the power factor verdict is withheld, and\n"
+            "the report says so on its face rather than quietly assuming.",
+        )
+
+        def _monospace_diagrams(pane):
+            """Set the guide's tables and diagrams in a fixed-width font.
+
+            Every table here was written to line up in monospace and was being
+            drawn in the proportional UI font, where an 'I' is a third the
+            width of a 'W' -- so no column could line up with the one above it.
+
+            Done as one pass over the finished page rather than at each insert:
+            the guide is written by several emitters and some blocks go
+            straight into the widget, so choosing the tag at insert time missed
+            them. The rule is the page's own convention -- a line indented past
+            the prose margin is a diagram, a line at the margin is a sentence.
+            """
+            last = int(pane.index("end-1c").split(".")[0])
+            for i in range(1, last + 1):
+                line = pane.get(f"{i}.0", f"{i}.end")
+                if not line.strip() or line[:4] != "    ":
+                    continue
+                # Headings, links and notes carry their own font on purpose.
+                if "body" not in pane.tag_names(f"{i}.4"):
+                    continue
+                pane.tag_remove("body", f"{i}.0", f"{i}.end")
+                pane.tag_add("mono", f"{i}.0", f"{i}.end")
+
+        for _pg in (pg_start, pg_standard, pg_ridethru, pg_tariff, pg_states,
+                    pg_refs, pg_workflow, pg_concepts, pg_neutral, pg_methods):
+            _monospace_diagrams(_pg)
             _pg.config(state="disabled")
 
         ttk.Button(win, text="Close", command=win.destroy,

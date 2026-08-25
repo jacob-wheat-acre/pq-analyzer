@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as _np
 
-__version__ = "0.64.0"
+__version__ = "0.67.0"
 
 
 @dataclass
@@ -500,6 +500,24 @@ class TariffRuleset:
     encoded: bool
     power_factor: Tuple[PowerFactorClause, ...] = ()
     gap: str = ""                     # what is missing, when not encoded
+    #: Which body the company files with, which is where a current document
+    #: has to be confirmed against.
+    commission: str = ""
+    #: What the tariff's power factor *is*, physically.  The states do not
+    #: merely set different numbers -- Colorado defines an instantaneous ratio
+    #: and Minnesota a billing-month energy ratio -- and the difference decides
+    #: whether a recording can produce the quantity at all.
+    pf_quantity: str = ""
+    #: Whether a power quality recording can produce that quantity. None where
+    #: it has not been established.
+    pf_measurable: Optional[bool] = None
+    #: Documents actually read, for the reader who wants to check a reading.
+    documents: Tuple[str, ...] = ()
+    #: The hunt list: what still has to be found or decided before this
+    #: company can be encoded.  Rendered into the Help guide verbatim, so it
+    #: is written for someone going to look for it rather than as a note to
+    #: self.
+    needed: Tuple[str, ...] = ()
 
 
 #: Xcel Energy's four regulated operating companies.  PSCo is the only one
@@ -539,6 +557,18 @@ TARIFF_RULESETS: Dict[str, TariffRuleset] = {
                 source="PSCo Colorado Electric Tariff, Sheet R123",
             ),
         ),
+        commission="Colorado PUC",
+        pf_quantity="The ratio of real power in kW to apparent power in kVA "
+                    "\"at any given time\", required at the metered point and, "
+                    "for C&I, \"at all times\". Instantaneous.",
+        pf_measurable=True,
+        documents=("PSCo_Electric_Entire_Tariff.pdf (definitions; R73, R121, "
+                   "R123)",
+                   "PSCo Technical Specifications Manual, 01/01/2025 (DER)"),
+        needed=(
+            "Confirm the archived tariff PDF is the currently filed version; "
+            "it was pulled from the public site with no effective-date check.",
+        ),
     ),
     "NSP-MN": TariffRuleset(
         opco="NSP-MN",
@@ -557,14 +587,65 @@ TARIFF_RULESETS: Dict[str, TariffRuleset] = {
             "tool does not collect. The General Rules and Regulations "
             "(Section 3) are also unread, and North Dakota and South Dakota "
             "file their own rate books.",
+        commission="MPUC (MN), NDPSC (ND), SDPUC (SD)",
+        pf_quantity="The billing month's kWh divided by the square root of "
+                    "(kWh squared + lagging kVARh squared), with leading "
+                    "kVARh discarded. A revenue-meter energy ratio over the "
+                    "month, not an interval measurement.",
+        pf_measurable=False,
+        documents=("MN_Section_5.pdf (rate schedules)",
+                   "MN_Section_6.pdf §3.2 (General Rules — the definition)",
+                   "SD_Section_6.pdf (identical text; same corporation)",
+                   "MN_Section_10.pdf (Distributed Resources — not yet read)"),
+        needed=(
+            "A decision, not a document: either these states stay declining "
+            "with a note that the tariff figure comes from billing, or the "
+            "tool accepts entered monthly kWh and lagging kVARh and computes "
+            "the tariff quantity -- the precedent already set for IL.",
+            "Service ampacity at analysis time. The clause reaches only "
+            "three-phase services above 200 A or above 480 V; at or below "
+            "that the tariff assumes 90% rather than measuring it.",
+            "The North Dakota rate book (NDPSC No. 2). Not on xcelenergy.com "
+            "under the pattern the other states use.",
+            "The NSP-MN internal engineering standards -- whatever plays the "
+            "part PSCo's Technical Specifications Manual, Electric "
+            "Installation Standards and Blue Book play in Colorado. Every DER "
+            "check and the Isc lookup rest on those, and none of it is public.",
+            "The schedule codes an NSP-MN customer actually takes service "
+            "under. The tool's r/c/sg/pg are PSCo schedule names.",
+        ),
     ),
     "NSP-WI": TariffRuleset(
         opco="NSP-WI",
         company_name="Northern States Power Company, a Wisconsin corporation",
         states=("WI", "MI"),
         encoded=False,
-        gap="Not yet researched. Wisconsin and Michigan are separate "
-            "jurisdictions filing with the PSCW and the MPSC respectively.",
+        gap="Wisconsin defines the same billing-month energy ratio as "
+            "NSP-Minnesota, restricted to on-peak hours, with the adjustment "
+            "'90% divided by the Average On-Peak Power Factor'. Michigan's "
+            "power factor provisions were not located: they sit in the "
+            "distribution service schedules MCI-1 and MI-1, which are not in "
+            "the rate book sections archived here.",
+        commission="PSCW (WI), MPSC (MI)",
+        pf_quantity="Wisconsin: the on-peak kWh divided by the square root of "
+                    "(on-peak kWh squared + on-peak lagging kVARh squared). A "
+                    "billing-period energy ratio, as in Minnesota, but "
+                    "on-peak only. Michigan: not established.",
+        pf_measurable=False,
+        documents=("WI_Section_2.pdf (the energy ratio and the adjustment)",
+                   "WI_Section_3.pdf, WI_Section_4.pdf",
+                   "MI_Section_3.pdf, MI_Section_5.pdf (reference MCI-1 and "
+                   "MI-1 without carrying their text)"),
+        needed=(
+            "Michigan distribution service schedules MCI-1 and MI-1, which "
+            "hold the power factor charge provisions.",
+            "Michigan rate book sections 1 and 4 -- both returned 404 -- and "
+            "a text-searchable Section 6; the archived copy is scanned.",
+            "The same decision Minnesota needs, since Wisconsin's quantity is "
+            "also a billing-period energy ratio.",
+            "The NSP-WI internal engineering standards, for the same reason "
+            "as NSP-MN.",
+        ),
     ),
     "SPS": TariffRuleset(
         opco="SPS",
@@ -580,6 +661,29 @@ TARIFF_RULESETS: Dict[str, TariffRuleset] = {
             "rather than the recording, and whether Texas (PUCT) and New "
             "Mexico (NMPRC) file the same sheet is unconfirmed. The 0.95 in "
             "the charge formula is a coefficient, not a threshold.",
+        commission="PUCT (TX), NMPRC (NM)",
+        pf_quantity="The power factor at the single 30-minute interval in "
+                    "which the month's highest demand occurred -- a coincident "
+                    "peak reading, not a statistic over the recording. Applies "
+                    "only where power factor metering is fitted, which is "
+                    "customers expected to exceed 200 kW.",
+        pf_measurable=None,
+        documents=("Sheet IV-173 Rev 12, Primary General Service, eff. "
+                   "2024-02-01 (the charge and its trigger)",
+                   "SPS-NM/ Rule No. 1-28 (New Mexico rules; 17 of them are "
+                   "scanned with no text layer and could not be read)"),
+        needed=(
+            "The SPS Texas tariff, from the PUCT interchange. Only the New "
+            "Mexico rules were retrievable from xcelenergy.com, and whether "
+            "Texas files the same sheet is unconfirmed.",
+            "OCR for the scanned New Mexico rules. No OCR tool is installed "
+            "on this machine.",
+            "A decision on whether a coincident peak-demand power factor is "
+            "worth reporting at all, given the tool measures a whole "
+            "recording rather than the billing peak.",
+            "The SPS internal engineering standards, for the same reason as "
+            "the NSP companies.",
+        ),
     ),
 }
 
@@ -607,6 +711,109 @@ BASIS_INTERCONNECTION = "interconnection"  # e.g. PSCo's Technical Specification
 
 #: The mark put beside anything jurisdictional, in both documents.
 JURISDICTION_MARK = "\u25c6"            # ◆
+
+
+def _wrap(text: str, width: int, indent: str = "") -> List[str]:
+    """Greedy wrap, so generated help text sits in the same column as prose."""
+    out, line = [], indent
+    for word in text.split():
+        candidate = (line + " " + word) if line.strip() else indent + word
+        if len(candidate) > width and line.strip():
+            out.append(line)
+            line = indent + word
+        else:
+            line = candidate
+    if line.strip():
+        out.append(line)
+    return out
+
+
+def tariff_status_report(width: int = 68) -> str:
+    """Every operating company's status, rendered from the registry.
+
+    The Help guide's state pages are generated from this rather than written
+    out beside it. A page that describes last month's behaviour is worse than
+    no page, and the only way to be sure it does not is to give it no separate
+    copy of the facts: encoding a state changes the badge, the verdict and this
+    text together, because all three read the same table.
+    """
+    lines: List[str] = []
+    names = dict(SERVED_STATES)
+    for ruleset in TARIFF_RULESETS.values():
+        # Spelled out, not just the two-letter code: this is the one place a
+        # reader finds out that "SD" is a jurisdiction this tool has an
+        # opinion about, and a code they have to decode is a code they skip.
+        states = ", ".join(f"{names.get(c, c)} ({c})" for c in ruleset.states)
+        lines.append(f"  {ruleset.opco} — {ruleset.company_name}")
+        lines.append(f"  {states}")
+        lines.append(f"  Files with: {ruleset.commission}")
+        lines.append("")
+        verdict = ("GRADED — the tool applies these clauses"
+                   if ruleset.encoded else
+                   "DECLINED — measured and reported, never graded")
+        lines.append(f"    Status: {verdict}")
+        if ruleset.pf_measurable is True:
+            can = "Yes — a recording produces this quantity"
+        elif ruleset.pf_measurable is False:
+            can = "No — a recording cannot produce this quantity"
+        else:
+            can = "Not established"
+        lines.append(f"    Measurable from a recording: {can}")
+        if ruleset.pf_quantity:
+            lines.append("")
+            lines.extend(_wrap("What the tariff defines: " + ruleset.pf_quantity,
+                               width, "    "))
+        if ruleset.power_factor:
+            lines.append("")
+            lines.append("    Clauses applied:")
+            for clause in ruleset.power_factor:
+                kind = ("requirement" if clause.rule_type == "requirement"
+                        else "billing charge, never a violation")
+                limit = (f"{clause.limit:.2f}" if clause.limit is not None
+                         else "no number given")
+                lines.append(f"      {clause.clause} — {kind}; {limit}")
+                lines.extend(_wrap(clause.note, width, "        "))
+        lines.append("")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n")
+
+
+def tariff_gap_report(width: int = 68) -> str:
+    """What still has to be found, per company — the hunt list.
+
+    Generated so that the list someone works from and the list the tool
+    behaves by cannot disagree.
+    """
+    lines: List[str] = []
+    names = dict(SERVED_STATES)
+    for ruleset in TARIFF_RULESETS.values():
+        if not ruleset.needed:
+            continue
+        states = ", ".join(f"{names.get(c, c)}" for c in ruleset.states)
+        lines.append(f"  {ruleset.opco}  —  {states}")
+        for item in ruleset.needed:
+            body = _wrap(item, width, "        ")
+            body[0] = "      - " + body[0].lstrip()
+            lines.extend(body)
+        lines.append("")
+    lines.append("  Documents already read are listed per company below.")
+    lines.append("  The archive itself is in Documents/xcel-tariffs.")
+    return "\n".join(lines)
+
+
+def tariff_document_report(width: int = 68) -> str:
+    """Which filed documents each reading came from."""
+    lines: List[str] = []
+    for ruleset in TARIFF_RULESETS.values():
+        if not ruleset.documents:
+            continue
+        lines.append(f"  {ruleset.opco}")
+        for doc in ruleset.documents:
+            body = _wrap(doc, width, "        ")
+            body[0] = "      " + body[0].lstrip()
+            lines.extend(body)
+        lines.append("")
+    return "\n".join(lines).rstrip("\n")
 
 
 def jurisdiction_badge(basis: str, state: Optional[str]) -> Optional[str]:

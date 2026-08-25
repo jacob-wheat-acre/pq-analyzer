@@ -18,6 +18,7 @@ import datetime
 import math
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,7 @@ import struct
 import zlib
 
 import pqdif
+import run
 from pq_constants import (
     SEVERITY_LABEL,
     strip_marks,
@@ -5457,6 +5459,168 @@ class TestHelpWindowStructure:
         assert "Figure 1" in start
         assert "twelve previous months" in start
         win.destroy()
+
+    def test_the_state_differences_page_exists_and_is_indexed(self, gui_app):
+        win, tabs, txts = self._panes(gui_app)
+        assert "State differences" in tabs
+        # The Colorado tab was called "PSCo tariff" while Colorado was the only
+        # jurisdiction; naming it after the state is the point of the page.
+        assert "Colorado tariff" in tabs
+        assert "PSCo tariff" not in tabs
+        start = txts[tabs.index("Start here")].get("1.0", "end-1c")
+        assert "State differences" in start, (
+            "the page is unreachable from the index on Start here")
+        win.destroy()
+
+    def test_the_state_page_says_the_quantity_differs_not_just_the_number(
+            self, gui_app):
+        # The finding the page exists to carry. Someone who reads only one
+        # paragraph must not come away thinking every state is 0.90.
+        win, tabs, txts = self._panes(gui_app)
+        page = txts[tabs.index("State differences")].get("1.0", "end-1c")
+        assert "AT ANY GIVEN TIME" in page          # Colorado, instantaneous
+        assert "kVARh" in page                       # MN/WI, monthly energy
+        assert "cannot produce the Minnesota one" in page
+        win.destroy()
+
+    def test_the_state_page_covers_every_served_state(self, gui_app):
+        from pq_constants import SERVED_STATES
+        win, tabs, txts = self._panes(gui_app)
+        page = txts[tabs.index("State differences")].get("1.0", "end-1c")
+        for _code, name in SERVED_STATES:
+            assert name in page, f"{name} is not described on the page"
+        for opco in ("PSCo", "NSP-MN", "NSP-WI", "SPS"):
+            assert opco in page, f"{opco} is not named on the page"
+        win.destroy()
+
+    def test_the_state_page_explains_the_mark_used_in_the_report(self, gui_app):
+        from pq_constants import JURISDICTION_MARK
+        win, tabs, txts = self._panes(gui_app)
+        page = txts[tabs.index("State differences")].get("1.0", "end-1c")
+        assert JURISDICTION_MARK in page, (
+            "the page describes the reports but never shows the mark itself")
+        assert "billing" in page.lower(), (
+            "a billing charge and a requirement must be distinguished here")
+        win.destroy()
+
+    def test_the_state_page_is_generated_from_the_registry(self, gui_app):
+        """Changing the table must change the page.
+
+        The point of generating it: a guide that carries its own copy of the
+        facts drifts from the behaviour it describes, and the drift is
+        invisible until someone acts on a stale page.
+        """
+        import pq_constants as C
+        win, tabs, txts = self._panes(gui_app)
+        before = txts[tabs.index("State differences")].get("1.0", "end-1c")
+        win.destroy()
+        assert "MPUC" in before, "the registry's commission never reached the page"
+
+        marker = "PQ-ANALYZER-REGISTRY-PROBE"
+        original = C.TARIFF_RULESETS["NSP-WI"]
+        C.TARIFF_RULESETS["NSP-WI"] = replace(
+            original, needed=original.needed + (marker,))
+        try:
+            win, tabs, txts = self._panes(gui_app)
+            after = txts[tabs.index("State differences")].get("1.0", "end-1c")
+            win.destroy()
+        finally:
+            C.TARIFF_RULESETS["NSP-WI"] = original
+        assert marker in after, (
+            "the page did not pick up a registry change, so it is holding a "
+            "second copy of the facts")
+
+    def test_every_unencoded_company_tells_the_reader_what_to_go_find(
+            self, gui_app):
+        # The page exists to be worked from. A company that is declined but
+        # names nothing to hunt for is a dead end for whoever reads it.
+        import pq_constants as C
+        win, tabs, txts = self._panes(gui_app)
+        page = txts[tabs.index("State differences")].get("1.0", "end-1c")
+        win.destroy()
+        for opco, rules in C.TARIFF_RULESETS.items():
+            if rules.encoded:
+                continue
+            assert rules.needed, f"{opco} is declined but lists nothing needed"
+            assert opco in page, f"{opco} is missing from the page"
+
+    def test_the_page_says_which_documents_were_read(self, gui_app):
+        win, tabs, txts = self._panes(gui_app)
+        page = txts[tabs.index("State differences")].get("1.0", "end-1c")
+        win.destroy()
+        # Someone checking a quotation needs the document it came from.
+        assert "MN_Section_6.pdf" in page
+        assert "PSCo_Electric_Entire_Tariff.pdf" in page
+        assert "Documents/xcel-tariffs" in page
+
+    def test_diagrams_are_set_in_a_fixed_width_font(self, gui_app):
+        """Tables and arrow diagrams need monospace or they do not line up.
+
+        Every table in this guide was written to align in a fixed-width font
+        and was being rendered in the proportional UI font, where an 'I' is a
+        third the width of a 'W'. The columns could not line up, and the guide
+        read as jumbled.
+        """
+        import tkinter.font as tkfont
+        win, tabs, txts = self._panes(gui_app)
+        try:
+            mono = tkfont.Font(font=run._FONT_MONO)
+            assert mono.measure("IIIIII") == mono.measure("WWWWWW"), (
+                "the configured diagram font is not fixed-width")
+
+            checked = 0
+            for pane in txts:
+                body = pane.get("1.0", "end-1c").splitlines()
+                for i, line in enumerate(body, 1):
+                    # Indented, and carrying box rule or column padding: the
+                    # shapes that only survive in a fixed-width font.
+                    if line[:4] == "    " and ("─" in line or "  " in line.strip()):
+                        tags = pane.tag_names(f"{i}.4")
+                        assert "mono" in tags, (
+                            f"diagram line rendered proportionally: {line[:60]!r}")
+                        checked += 1
+            assert checked > 20, f"only found {checked} diagram lines to check"
+        finally:
+            win.destroy()
+
+    def test_prose_is_not_set_in_the_diagram_font(self, gui_app):
+        # The rule cuts both ways: turning whole paragraphs monospace would
+        # make the guide look like a terminal dump.
+        win, tabs, txts = self._panes(gui_app)
+        try:
+            for pane in txts:
+                body = pane.get("1.0", "end-1c").splitlines()
+                for i, line in enumerate(body, 1):
+                    stripped = line.strip()
+                    # A flush-left sentence: two leading spaces from the
+                    # emitter and then immediately text.
+                    if (line[:2] == "  " and line[2:3] not in (" ", "")
+                            and stripped.endswith(".") and len(stripped) > 40):
+                        tags = pane.tag_names(f"{i}.2")
+                        assert "mono" not in tags, (
+                            f"prose rendered as a diagram: {line[:60]!r}")
+        finally:
+            win.destroy()
+
+    def test_the_tdd_table_columns_line_up(self, gui_app):
+        # The 100-1000 row is the one people look up, and it was the row whose
+        # arrow broke the column.
+        win, tabs, txts = self._panes(gui_app)
+        try:
+            for pane in txts:
+                body = pane.get("1.0", "end-1c").splitlines()
+                rows = [l for l in body
+                        if "%" in l and any(k in l for k in
+                                            ("< 20", "20 – 50", "50 – 100",
+                                             "100 – 1000", "> 1000"))]
+                if len(rows) < 5:
+                    continue
+                cols = {l.rstrip().rindex("%") for l in rows}
+                assert len(cols) == 1, (
+                    f"TDD limit column is ragged at {sorted(cols)}:\n"
+                    + "\n".join(rows))
+        finally:
+            win.destroy()
 
     def test_every_pane_is_read_only(self, gui_app):
         win, tabs, txts = self._panes(gui_app)
