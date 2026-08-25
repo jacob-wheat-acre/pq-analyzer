@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -415,6 +416,7 @@ def generate_report(
             "data_quality":     ds.meta.get("data_quality", {}),
             "channel_map":      ds.meta.get("channel_map", {}),
             "device_channels":  ds.meta.get("device_channels", 0),
+            "unmapped_channels": ds.meta.get("unmapped_channels", []),
             "sessions":         ds.meta.get("sessions", []),
             "session_index":    ds.meta.get("session_index", 0),
             "has_maxmin":       ds.has_maxmin,
@@ -1109,6 +1111,62 @@ def export_results(
         ev_path = outdir / f"{stem}_events.csv"
         ev_df.to_csv(ev_path, index=False)
         log.info("Saved events → %s  (%d rows)", ev_path, len(ev_df))
+
+    # 5. Channel inventory
+    _export_channel_inventory(report, outdir, stem)
+
+
+def _export_channel_inventory(report: dict, outdir: Path, stem: str) -> None:
+    """Write what this run read, what it skipped, and what it has no column for.
+
+    One machine-readable file per run, so the question "what do these meters
+    record that we never look at?" can be answered across every file processed
+    rather than one report at a time. The customer's .pqd cannot leave site, so
+    this is the only form in which that evidence survives the run.
+
+    Deliberately three lists, not one count. ``read`` is what the numbers came
+    from; ``skipped`` is a channel the tool knows and wanted but the file did
+    not carry, which is the case that can quietly narrow a verdict; ``unmapped``
+    is a channel the file carries and the tool has no column for, which narrows
+    nothing but is the backlog worth mining.
+    """
+    fs = report.get("file_summary") or {}
+    cmap = fs.get("channel_map") or {}
+
+    volt = report.get("voltage_compliance") or {}
+    llv  = report.get("voltage_ll_compliance") or {}
+    skipped = (
+        [{"check": "voltage_compliance", "expected": c,
+          "reason": "channel present but no usable samples"}
+         for c in (volt.get("phases_missing_data") or [])]
+        + [{"check": "voltage_ll_compliance", "expected": p,
+            "reason": "channel present but no usable samples"}
+           for p in (llv.get("pairs_missing_data") or [])]
+    )
+
+    inventory = {
+        "stem":              stem,
+        "recorded_from":     fs.get("start_time"),
+        "recorded_to":       fs.get("end_time"),
+        "topology":          fs.get("topology"),
+        "interval_minutes":  fs.get("interval_minutes"),
+        "device_channels":   fs.get("device_channels", 0),
+        "read": sorted(
+            ({"column": name,
+              "device": (info or {}).get("device"),
+              "unit":   (info or {}).get("unit")}
+             for name, info in cmap.items()),
+            key=lambda d: d["column"]),
+        "skipped":           skipped,
+        "unmapped":          fs.get("unmapped_channels") or [],
+    }
+
+    path = outdir / f"{stem}_channel_inventory.json"
+    path.write_text(json.dumps(inventory, indent=2, default=str), encoding="utf-8")
+    log.info(
+        "Saved channel inventory → %s  (%d read, %d skipped, %d unmapped)",
+        path, len(inventory["read"]), len(skipped), len(inventory["unmapped"]),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2271,6 +2329,11 @@ def _word_compliance_table(doc, report, thresh, df) -> None:
             key=lambda kv: (VOLTAGE_BAND_ORDER.index(kv[1]["band"]),
                             kv[1]["pct_out_of_bounds"]))
         meas = _voltage_band_cell(worst, llv, f"Worst pair {worst_pair}: ")
+        # Which pairs the verdict rests on, where it is not all of them. A pass
+        # covering two of three pairs has to say which one nobody measured.
+        ll_missing = llv.get("pairs_missing_data") or []
+        if ll_missing:
+            meas += f"  |  No usable data: {', '.join(ll_missing)}"
         if llv.get("range_b_note"):
             meas += f"  |  {llv['range_b_note']}"
         # Where the engineer stated the nominal, say so: on a primary service
@@ -2939,7 +3002,8 @@ def compute_severities(report: dict, thresh: Thresholds) -> dict:
         sev.update(_flicker_severities(fl, report))
 
     if llv.get("available"):
-        sev["voltage_line_to_line"] = _grade_voltage_band(llv)
+        sev["voltage_line_to_line"] = _grade_voltage_band(
+            llv, llv.get("pairs_missing_data") or [])
 
     if frq.get("available"):
         sev["frequency"] = grade_finding(
@@ -5545,10 +5609,16 @@ def _channel_description(name: str, is_split: bool) -> str:
     if m:
         return f"Transformer K-factor from the {_phase_word(m.group(1), is_split)} current"
 
-    m = re.fullmatch(r"flicker_(pst|plt)(?:_(a|b|c))?", name)
+    m = re.fullmatch(r"flicker_(pst|plt|ifl)(?:_(a|b|c))?", name)
     if m:
-        kind = ("Short-term flicker severity (Pst, 10-minute)" if m.group(1) == "pst"
-                else "Long-term flicker severity (Plt, 2-hour)")
+        kind = {
+            "pst": "Short-term flicker severity (Pst, 10-minute)",
+            "plt": "Long-term flicker severity (Plt, 2-hour)",
+            # Not a severity statistic and not graded against IEEE 1453 --
+            # it is the signal those two are computed from, recorded only by
+            # part of the fleet.
+            "ifl": "Instantaneous flicker level (IFL, IEC 61000-4-15 signal)",
+        }[m.group(1)]
         return f"{kind}, {_phase_word(m.group(2) or 'a', is_split)}"
 
     m = re.fullmatch(r"voltage_(ab|bc|ca)", name)
@@ -5564,6 +5634,60 @@ def _channel_description(name: str, is_split: bool) -> str:
         return f"{what}, {_phase_word(ph, is_split)}"
 
     return name.replace("_", " ").capitalize()
+
+
+def _unmapped_channel_table(doc, fs: dict) -> None:
+    """Name the channel groups the tool has no column for.
+
+    Appendix C already counts them. A count says a gap exists; it does not say
+    what is in it, and the count alone cannot be acted on months later when the
+    meter file is no longer to hand. The PQDIF triple below is exactly the key a
+    new registry entry is written against, and the device name is what the same
+    channel is called in the meter's own software, so a reader can find it on
+    the instrument and decide whether it is worth reading.
+
+    This is inventory, not a finding. A meter records a great deal that no
+    compliance check needs, and nothing here says the analysis is wrong -- only
+    what it did not look at.
+    """
+    groups = fs.get("unmapped_channels") or []
+    if not groups:
+        return
+
+    _body(doc,
+        f"{len(groups)} channel group(s) in this file have no column in this "
+        "tool and were not read. They are listed here rather than only counted "
+        "because the identifiers below are what an entry covering them would be "
+        "written against. None of this affects the results above; it is a record "
+        "of what the meter captured that the analysis did not use.")
+
+    table = doc.add_table(rows=1, cols=5)
+    table.style = "Table Grid"
+    _set_col_widths(table, [3.4, 3.4, 1.6, 5.4, 2.8])
+    for i, head in enumerate(("Quantity measured", "Characteristic", "Phase",
+                              "Device name in file", "Record")):
+        cell = table.rows[0].cells[i]
+        _cell_shade(cell, _CHROME_BAND)
+        r = cell.paragraphs[0].add_run(head)
+        r.bold = True
+        r.font.size = Pt(9)
+
+    for g in groups:
+        names = g.get("names") or []
+        shown = names[0] if names else "—"
+        if len(names) > 1:
+            shown += f"  (+{len(names) - 1} more)"
+        cells = table.add_row().cells
+        for cell, text in zip(cells, (
+            g.get("quantity") or "—",
+            g.get("characteristic") or "—",
+            g.get("phase") or "—",
+            shown,
+            g.get("source") or "—",
+        )):
+            r = cell.paragraphs[0].add_run(text)
+            r.font.size = Pt(8)
+    doc.add_paragraph()
 
 
 def _word_channel_appendix(doc, report, df) -> None:
@@ -5624,6 +5748,8 @@ def _word_channel_appendix(doc, report, df) -> None:
         base, _, stat = col.rpartition("_")
         if stat in ("peak", "min") and base in cmap:
             extras.setdefault(base, []).append("max" if stat == "peak" else "min")
+
+    _unmapped_channel_table(doc, fs)
 
     rows = sorted(cmap.items(), key=lambda kv: _channel_sort_key(kv[0]))
 

@@ -74,6 +74,10 @@ CANONICAL = [
     "flicker_pst_b", "flicker_plt_b", "flicker_pst_c", "flicker_plt_c",
     "flicker_pst",
     "flicker_plt",
+    # Instantaneous flicker level -- the IEC 61000-4-15 signal Pst and Plt are
+    # computed from. Only some of the fleet records it, so every consumer must
+    # treat it as absent by default.
+    "flicker_ifl", "flicker_ifl_b", "flicker_ifl_c",
 ]
 
 # ── PQDIF tag dictionaries ────────────────────────────────────────────────────
@@ -174,6 +178,15 @@ _TAG_MAP: Dict[str, Dict[str, Set[str]]] = {
     "flicker_plt_b": {"qt": {"flicker", "voltage"}, "qm": {"plt", "flkrplt"}, "ph": {"bn", "b", "phase_b"}},
     "flicker_pst_c": {"qt": {"flicker", "voltage"}, "qm": {"pst", "flkrpst"}, "ph": {"cn", "c", "phase_c"}},
     "flicker_plt_c": {"qt": {"flicker", "voltage"}, "qm": {"plt", "flkrplt"}, "ph": {"cn", "c", "phase_c"}},
+    # IFL is the instantaneous flicker level -- the IEC 61000-4-15 signal Pst
+    # and Plt are computed from. PMI's ProView records it; the rest of the
+    # fleet does not, so absence here is normal and never a finding. Listed
+    # explicitly rather than left to fuzzy name matching, which paired "Flicker
+    # IFL" with a canonical name by string similarity alone and dropped the
+    # per-phase variants whose labels were less alike.
+    "flicker_ifl":   {"qt": {"flicker", "voltage"}, "qm": {"ifl", "flkrpinst", "pinst"}, "ph": {"an", "a", "phase_a", "total", "net", ""}},
+    "flicker_ifl_b": {"qt": {"flicker", "voltage"}, "qm": {"ifl", "flkrpinst", "pinst"}, "ph": {"bn", "b", "phase_b"}},
+    "flicker_ifl_c": {"qt": {"flicker", "voltage"}, "qm": {"ifl", "flkrpinst", "pinst"}, "ph": {"cn", "c", "phase_c"}},
 }
 
 # ── Fuzzy name patterns (fallback when tags are absent or non-standard) ───────
@@ -655,6 +668,12 @@ class ProntoAdapter:
         self.sessions: List[dict] = []
         #: Which of them this run read (index into ``sessions``).
         self.session_index: int = 0
+        #: Channel groups in the file that no canonical column claims. Kept as
+        #: data, not only as a log line: an engineer still learning what these
+        #: meters record cannot answer "what is in these files that we never
+        #: read?" from a console pane that scrolls away, and the customer's
+        #: .pqd cannot leave site to be inspected later. See ``unmapped_channels``.
+        self.unmapped_channels: List[dict] = []
         self._session_request = session
         self._load()
 
@@ -897,6 +916,17 @@ class ProntoAdapter:
                                         'flicker', 'pst', 'cn'),
         ('voltage', 'FLKR_PLT', 'cn'): ('Flicker PLT Vcn', 'flicker_plt_c',
                                         'flicker', 'plt', 'cn'),
+        # PMI's ProView writes the instantaneous flicker level with no PQDIF
+        # characteristic of its own -- the standard has FLKR_PINST, the exporter
+        # does not use it -- so the only thing identifying these is the channel
+        # name. ('voltage', 'NONE', phase) is far too generic a key to claim on
+        # its own; _SPEC_NAME_REQUIRED below is what makes it safe.
+        ('voltage', 'NONE', 'an'): ('Flicker IFL', 'flicker_ifl',
+                                    'flicker', 'ifl', 'an'),
+        ('voltage', 'NONE', 'bn'): ('Flicker IFL Vbn', 'flicker_ifl_b',
+                                    'flicker', 'ifl', 'bn'),
+        ('voltage', 'NONE', 'cn'): ('Flicker IFL Vcn', 'flicker_ifl_c',
+                                    'flicker', 'ifl', 'cn'),
         # ── Line-to-line and neutral-to-earth voltage ─────────────────────
         ('voltage', 'RMS', 'ab'): ('Vab RMS', 'voltage_ab', 'voltage', 'rms', 'ab'),
         ('voltage', 'RMS', 'bc'): ('Vbc RMS', 'voltage_bc', 'voltage', 'rms', 'bc'),
@@ -1007,6 +1037,19 @@ class ProntoAdapter:
     #: HRMS_TRIPLEN).  Requiring a name prefix keeps the subtotals from being
     #: silently picked up as the total, which file ordering alone decided.
     _SPEC_NAME_PREFIX = {'HRMS': 'hrms'}
+
+    #: Entries whose PQDIF triple is too generic to identify a quantity on its
+    #: own, and the pattern the channel's own name must match before the entry
+    #: is used. Keyed by the full triple, unlike _SPEC_NAME_PREFIX which is
+    #: keyed by characteristic and so cannot discriminate within one of them.
+    #:
+    #: A channel that fails its guard stays unmapped rather than being claimed
+    #: wrongly -- an unread channel is inventory, a misread one is bad numbers.
+    _SPEC_NAME_REQUIRED: Dict[Tuple[str, str, str], "re.Pattern[str]"] = {
+        ('voltage', 'NONE', 'an'): re.compile(r'\bifl\s*a?$', re.I),
+        ('voltage', 'NONE', 'bn'): re.compile(r'\bifl\s*b$',  re.I),
+        ('voltage', 'NONE', 'cn'): re.compile(r'\bifl\s*c$',  re.I),
+    }
 
     #: Harmonic channel names, e.g. 'Harm 13 of Van'.  The order lives only in
     #: the name -- Pronto gives each order its own channel definition rather
@@ -1380,6 +1423,12 @@ class ProntoAdapter:
             if entry is not None and prefix is not None \
                     and not channel.name.lower().startswith(prefix):
                 entry = None
+            # A triple that cannot identify a quantity by itself only counts
+            # when the channel's own name confirms it.
+            required = self._SPEC_NAME_REQUIRED.get(key)
+            if entry is not None and required is not None \
+                    and not required.search(channel.name or ""):
+                entry = None
             if entry is not None:
                 if key in seen:
                     continue
@@ -1499,6 +1548,7 @@ class ProntoAdapter:
         for key in consumed:
             unmapped.pop(key, None)
 
+        self._record_unmapped(unmapped, "interval", "_SPEC_CHANNELS")
         if unmapped:
             log.info(
                 "ProntoAdapter (spec): %d channel group(s) in this file have no "
@@ -1648,6 +1698,7 @@ class ProntoAdapter:
             "%.1f h span",
             len(df), len(df.columns), span_hours,
         )
+        self._record_unmapped(unmapped, "variable-rate", "_SPEC_ADAPTIVE")
         if unmapped:
             log.info(
                 "ProntoAdapter (spec): %d variable-rate channel group(s) have no "
@@ -1659,6 +1710,27 @@ class ProntoAdapter:
                     for k, names in sorted(unmapped.items())
                 ),
             )
+
+    def _record_unmapped(self, unmapped: Dict[Tuple[str, str, str], List[str]],
+                         source: str, registry: str) -> None:
+        """Keep the unmapped channel groups as data, not only as a log line.
+
+        The PQDIF triple plus the meter's own name for the channel is the most
+        useful thing in the file for learning what a meter actually records:
+        the triple is what a new entry in ``registry`` would be keyed on, and
+        the name is what the engineer sees in the meter's software. Both are
+        already computed to write the log message; this keeps them so the
+        report and the sidecar can show them after the run window is closed.
+        """
+        for (quantity, characteristic, phase), names in sorted(unmapped.items()):
+            self.unmapped_channels.append({
+                "quantity":       quantity,
+                "characteristic": characteristic,
+                "phase":          phase,
+                "names":          sorted(set(names)),
+                "source":         source,
+                "registry":       registry,
+            })
 
     def _load_spec_waveforms(self, waveform_obs: List) -> None:
         """Decode point-on-wave captures.
@@ -3037,6 +3109,9 @@ def extract_dataset(
         "end_time":         df.index[-1].isoformat() if len(df) else None,
         "channel_map":      df.attrs.get("channel_map", {}),
         "device_channels":  df.attrs.get("device_channel_count", 0),
+        # What the file holds that this tool has no column for. Named, not
+        # counted: a count says a gap exists, the triple says what to add.
+        "unmapped_channels": list(getattr(adapter, "unmapped_channels", []) or []),
         # A file can hold more than one recording session; this run read one of
         # them. Both documents say so, because a report that silently covers
         # half a download is a report nobody can check.

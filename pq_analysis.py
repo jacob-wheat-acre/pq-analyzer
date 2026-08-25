@@ -610,9 +610,17 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
     command-line argument, then snapped to a standard nominal when it is close.
     """
     ll_cols = [c for c in LL_COLS if c in df.columns and df[c].notna().any()]
+    # A pair whose channel is in the file but carried no samples is not a pair
+    # that passed -- it is a pair nobody looked at. Dropping it here without
+    # saying so let a two-of-three-pair recording report a clean pass on the
+    # whole service; the names are carried out so the verdict can say which
+    # pairs it actually rests on. Mirrors phases_missing_data on the L-N check.
+    pairs_missing = [LL_COLS[c] for c in LL_COLS
+                     if c in df.columns and c not in ll_cols]
     if not ll_cols:
         return {"available": False, "error": "No line-to-line voltage channels found.",
-                "pairs": {}, "total_pct_out_of_bounds": None}
+                "pairs": {}, "pairs_missing_data": pairs_missing,
+                "total_pct_out_of_bounds": None}
 
     ln_cols = [c for c in ("voltage_a", "voltage_b", "voltage_c")
                if c in df.columns and df[c].notna().any()]
@@ -620,7 +628,8 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
         return {"available": False,
                 "error": "Line-to-line channels present but no line-to-neutral "
                          "reference to infer the nominal from.",
-                "pairs": {}, "total_pct_out_of_bounds": None}
+                "pairs": {}, "pairs_missing_data": pairs_missing,
+                "total_pct_out_of_bounds": None}
 
     ln_median = float(np.nanmedian(df[ln_cols].to_numpy()))
     ll_median = float(np.nanmedian(df[ll_cols].to_numpy()))
@@ -635,7 +644,8 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
                 "error": (f"Measured L-L/L-N ratio {ratio:.2f} matches neither a "
                           "wye (1.73) nor a split-phase (2.00) service; cannot "
                           "infer the line-to-line nominal."),
-                "pairs": {}, "total_pct_out_of_bounds": None}
+                "pairs": {}, "pairs_missing_data": pairs_missing,
+                "total_pct_out_of_bounds": None}
 
     # An entered primary nominal wins outright. Inference recovers the topology
     # -- whether the legs are 120 or 180 degrees apart -- but not the nominal
@@ -656,7 +666,8 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
     bands = ansi_bands(nominal)
     if not bands["range_a_evaluated"]:
         return {"available": False, "error": bands["range_b_note"],
-                "pairs": {}, "total_pct_out_of_bounds": None}
+                "pairs": {}, "pairs_missing_data": pairs_missing,
+                "total_pct_out_of_bounds": None}
     vmin, vmax = bands["a_min"], bands["a_max"]
     result: dict = {
         "available":     True,
@@ -674,6 +685,7 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "configuration": configuration,
         "ln_ll_ratio":   round(ratio, 3),
         "pairs":         {},
+        "pairs_missing_data": pairs_missing,
         "violation_timestamps": pd.DatetimeIndex([]),
     }
 
@@ -686,9 +698,11 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
         under, over = s < vmin, s > vmax
         viol = under | over
         if bands["range_b_evaluated"]:
-            out_b = (s < bands["b_min"]) | (s > bands["b_max"])
+            under_b = s < bands["b_min"]
+            over_b  = s > bands["b_max"]
         else:
-            out_b = pd.Series(False, index=s.index)
+            under_b = over_b = pd.Series(False, index=s.index)
+        out_b = under_b | over_b
         in_b = viol & ~out_b
 
         if out_b.any():
@@ -706,6 +720,11 @@ def check_line_to_line_voltage(df: pd.DataFrame, thresh: Thresholds) -> dict:
             "pct_over":          float(over.mean() * 100),
             "pct_range_b":       float(in_b.mean() * 100),
             "pct_outside_b":     float(out_b.mean() * 100),
+            # Split against the Range B edges too. The report's Measured cell is
+            # shared with the line-to-neutral row, and where the band is
+            # outside_b it quotes the low/high split against the edge it named.
+            "pct_under_b":       float(under_b.mean() * 100),
+            "pct_over_b":        float(over_b.mean() * 100),
             "band":              band,
             "min_v":             float(s.min()),
             "max_v":             float(s.max()),

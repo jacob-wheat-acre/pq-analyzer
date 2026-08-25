@@ -3034,6 +3034,102 @@ class TestBothDocumentsBuildForEveryFixture:
         assert list(tmp_path.glob("*.csv")), pqd
 
 
+class TestChannelCoverageIsVisible:
+    """What the run did not read is recorded, not silently dropped.
+
+    A meter records far more than any compliance check needs, and the tool is
+    still learning what these files hold. A channel group with no column, and a
+    check that wanted a channel the file did not carry, are different facts and
+    both have to survive the run -- the customer's .pqd cannot be reopened later
+    to answer the question.
+    """
+
+    def test_a_missing_pair_is_named_not_dropped(self):
+        """Two of three pairs measured is not a pass on the service."""
+        import numpy as np
+        from pq_analysis import check_line_to_line_voltage
+        from pq_report import _grade_voltage_band
+        df = _frame(voltage_a=[120.0] * 20, voltage_b=[120.0] * 20,
+                    voltage_c=[120.0] * 20,
+                    voltage_ab=[207.8] * 20, voltage_bc=[207.8] * 20,
+                    voltage_ca=[float("nan")] * 20)
+        r = check_line_to_line_voltage(df, Thresholds(nominal_voltage=120.0))
+        assert r["pairs_missing_data"] == ["C-A"]
+        assert set(r["pairs"]) == {"A-B", "B-C"}
+        # The verdict still passes, but it says what it rests on.
+        sev = _grade_voltage_band(r, r["pairs_missing_data"])
+        assert "C-A" in sev["reason"]
+
+    def test_unmapped_groups_reach_the_report(self):
+        ds, _rep, _th = _build_report("test_commercial_large", "sg", 277.0,
+                                      isc_amps=40000.0)
+        assert isinstance(ds.meta.get("unmapped_channels"), list)
+        for g in ds.meta["unmapped_channels"]:
+            # The triple is the key a registry entry would be written against;
+            # without all three the entry cannot be written from this record.
+            assert {"quantity", "characteristic", "phase", "names"} <= set(g)
+
+    def test_the_inventory_sidecar_is_written(self, tmp_path):
+        import json
+        from pq_report import export_results
+        ds, rep, th = _build_report("test_commercial_large", "sg", 277.0,
+                                    isc_amps=40000.0)
+        export_results(ds, rep, tmp_path, "site")
+        path = tmp_path / "site_channel_inventory.json"
+        assert path.exists()
+        inv = json.loads(path.read_text())
+        assert {"read", "skipped", "unmapped"} <= set(inv)
+        assert inv["read"], "no channels recorded as read"
+        assert all("column" in r for r in inv["read"])
+
+
+class TestInstantaneousFlickerLevel:
+    """IFL, which only part of the fleet records.
+
+    PMI's ProView writes the IEC 61000-4-15 instantaneous flicker level with no
+    PQDIF characteristic of its own -- ('voltage', 'NONE', phase) -- so the only
+    thing telling it apart from any other untagged voltage channel is its name.
+    Claiming that triple without checking the name would silently mislabel a
+    different vendor's channel, which is worse than not reading it at all.
+    """
+
+    def test_all_three_phases_map(self):
+        ds, _rep, _th = _build_report("test_proview_per_phase", "sg", 277.0)
+        cols = [c for c in ds.df.columns if c.startswith("flicker_ifl")]
+        assert sorted(cols) == ["flicker_ifl", "flicker_ifl_b", "flicker_ifl_c"]
+        # Dimensionless; a value in the volts range would mean the generic
+        # ('voltage', 'NONE') key had claimed an RMS channel by mistake.
+        assert ds.df["flicker_ifl"].max() < 20
+
+    def test_a_foreign_none_channel_is_not_claimed(self):
+        """The guard is the whole reason that generic triple is safe."""
+        from pq_adapter import ProntoAdapter
+        for key, name in (
+            (("voltage", "NONE", "an"), "Stripchart RMS SomethingElseA"),
+            (("voltage", "NONE", "bn"), "Neutral Current"),
+            (("voltage", "NONE", "cn"), "Vcn RMS"),
+        ):
+            pattern = ProntoAdapter._SPEC_NAME_REQUIRED[key]
+            assert not pattern.search(name), f"{name} wrongly claimed as IFL"
+
+    def test_absence_is_normal_not_a_skipped_check(self, tmp_path):
+        """Meters that record no IFL must produce no finding and no gap.
+
+        Part of the fleet is PMI, part is not. An absent IFL is a meter that
+        does not measure it, which is different from a check that wanted data
+        and did not get it -- only the latter belongs in "skipped".
+        """
+        import json
+        from pq_report import export_results
+        ds, rep, th = _build_report("test_commercial_large", "sg", 277.0,
+                                    isc_amps=40000.0)
+        assert not [c for c in ds.df.columns if c.startswith("flicker_ifl")]
+        export_results(ds, rep, tmp_path, "site")
+        inv = json.loads((tmp_path / "site_channel_inventory.json").read_text())
+        assert not any("ifl" in str(k.get("expected", "")).lower()
+                       for k in inv["skipped"])
+
+
 class TestAnalysisModeIsVisible:
     """Which mode produced these numbers, stated on the documents.
 
@@ -4805,6 +4901,24 @@ class TestLineToLineVoltage:
         r = check_line_to_line_voltage(df, Thresholds(nominal_voltage=120.0))
         assert r["overall_pass"] is False
         assert r["pairs"]["A-B"]["pct_under"] == pytest.approx(10.0)
+
+    def test_outside_range_b_splits_against_the_range_b_edges(self):
+        """The Measured cell is shared with the line-to-neutral row, and where
+        the band is outside_b it quotes the split against the Range B edge. A
+        pair dict without those keys crashed the Word report on any service
+        whose worst pair left Range B."""
+        from pq_analysis import check_line_to_line_voltage
+        from pq_report import _voltage_band_cell
+        ll = [207.8] * 18 + [180.0, 180.0]     # past Range B on the last two
+        df = _frame(voltage_a=[120.0] * 20, voltage_b=[120.0] * 20,
+                    voltage_c=[120.0] * 20, voltage_ab=ll)
+        r = check_line_to_line_voltage(df, Thresholds(nominal_voltage=120.0))
+        pair = r["pairs"]["A-B"]
+        assert pair["band"] == "outside_b"
+        assert pair["pct_under_b"] == pytest.approx(10.0)
+        assert pair["pct_over_b"] == 0.0
+        cell = _voltage_band_cell(pair, r, "Worst pair A-B: ")
+        assert "outside Range B" in cell and "all below" in cell
 
     def test_ambiguous_ratio_is_refused_not_guessed(self):
         from pq_analysis import check_line_to_line_voltage
