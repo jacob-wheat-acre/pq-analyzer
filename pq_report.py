@@ -5673,18 +5673,31 @@ def _unmapped_channel_table(doc, fs: dict) -> None:
         r.font.size = Pt(9)
 
     for g in groups:
-        names = g.get("names") or []
-        shown = names[0] if names else "—"
-        if len(names) > 1:
-            shown += f"  (+{len(names) - 1} more)"
+        names = g.get("names") or ["—"]
         cells = table.add_row().cells
         for cell, text in zip(cells, (
             g.get("quantity") or "—",
             g.get("characteristic") or "—",
             g.get("phase") or "—",
-            shown,
+            None,
             g.get("source") or "—",
         )):
+            if text is None:
+                # Every name in the group, not the first one and a count.
+                # One PQDIF triple can cover channels of quite different
+                # worth: Pronto files the odd, even and triplen harmonic
+                # subtotals under the same (quantity, HRMS, phase) key as
+                # the aggregate itself, so 'Hrms Vne' sits in a group whose
+                # alphabetically first member is 'Evens Vne'.  Showing one
+                # name and a count hid the one entry a reader would act on,
+                # which is the opposite of what this table is for.
+                para = cell.paragraphs[0]
+                for i, name in enumerate(names):
+                    if i:
+                        para.add_run().add_break()
+                    r = para.add_run(name)
+                    r.font.size = Pt(8)
+                continue
             r = cell.paragraphs[0].add_run(text)
             r.font.size = Pt(8)
     doc.add_paragraph()
