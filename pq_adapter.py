@@ -691,7 +691,7 @@ class ProntoAdapter:
         self.filepath = Path(filepath)
         self._session_request = None
         self._spec = pqdif.PQDIFFile(self.filepath)
-        interval_obs, _adaptive, _waveforms = self._classify_observations()
+        interval_obs, _adaptive, _waveforms, _magdur = self._classify_observations()
         if not interval_obs:
             return []
         groups = self._group_sessions(interval_obs)
@@ -1114,7 +1114,7 @@ class ProntoAdapter:
         """Load a standards-compliant PQDIF file by structural traversal."""
         spec = self._spec
         assert spec is not None
-        interval_obs, adaptive_obs, waveform_obs = self._classify_observations()
+        interval_obs, adaptive_obs, waveform_obs, magdur_obs = self._classify_observations()
 
         if not interval_obs:
             raise ValueError(
@@ -1126,15 +1126,16 @@ class ProntoAdapter:
 
         log.info(
             "ProntoAdapter (spec): PQDIF %d.%d, %d channel definitions, "
-            "%d interval / %d adaptive / %d waveform observations",
+            "%d interval / %d adaptive / %d waveform / %d magdur observations",
             spec.version[0], spec.version[1], len(spec.definitions),
-            len(interval_obs), 1 if adaptive_obs else 0, len(waveform_obs),
+            len(interval_obs), 1 if adaptive_obs else 0, len(waveform_obs), len(magdur_obs),
         )
 
         self._load_spec_interval(interval_obs)
         if adaptive_obs is not None:
             self._load_spec_adaptive(adaptive_obs)
         self._load_spec_waveforms(waveform_obs)
+        self.magdur_events = self._load_magdur_events(magdur_obs)
 
     def _classify_observations(self):
         """Split observations by structure rather than by label text.
@@ -1142,19 +1143,23 @@ class ProntoAdapter:
         Three kinds occur, distinguished by what the file itself says:
 
         * waveform captures  -- channels of quantity type WAVEFORM
+        * magdur records     -- channels of quantity type MAGDUR/MAGDURTIME/MAGDURCOUNT
         * interval trends    -- every channel shares one common time base
         * variable adaptive  -- each channel carries its own time base
 
         Naming ('Interval (avg)', 'Variable Adaptive') is a Pronto convention,
         not part of the standard, so it is used only for logging.
         """
-        interval, waveform = [], []
+        _MAGDUR_TYPES = frozenset(('MAGDUR', 'MAGDURTIME', 'MAGDURCOUNT'))
+        interval, waveform, magdur = [], [], []
         adaptive = None
         for obs in self._spec.observations:
             if not obs.channels:
                 continue
             if any(c.quantity_type == 'WAVEFORM' for c in obs.channels):
                 waveform.append(obs)
+            elif any(c.quantity_type in _MAGDUR_TYPES for c in obs.channels):
+                magdur.append(obs)
             elif self._shares_one_time_base(obs):
                 interval.append(obs)
             elif adaptive is None or len(obs.channels) > len(adaptive.channels):
@@ -1167,7 +1172,7 @@ class ProntoAdapter:
                         adaptive.name, len(adaptive.channels),
                     )
                 adaptive = obs
-        return interval, adaptive, waveform
+        return interval, adaptive, waveform, magdur
 
     @staticmethod
     def _shares_one_time_base(obs) -> bool:
@@ -1783,6 +1788,49 @@ class ProntoAdapter:
                 len(first["currents"]), (first["fs_hz"] or 0) / 1000,
                 (first["fs_hz"] or 0) / 60.0,
             )
+
+    def _load_magdur_events(self, magdur_obs: list) -> list:
+        """Extract (magnitude, duration) pairs from MAGDUR/MAGDURTIME observations.
+
+        The PQDIF standard defines three MAGDUR QuantityTypes (Annex B):
+          MAGDUR      — VAL, DURATION  (no per-event timestamp)
+          MAGDURTIME  — TIME, VAL, DURATION
+          MAGDURCOUNT — TIME, VAL, DURATION, COUNT
+
+        VAL is in the channel's declared units (typically V for voltage channels).
+        DURATION is in seconds.  Only voltage channels are extracted here; the
+        ITIC analysis layer converts V → % nominal using the service threshold.
+        """
+        from datetime import timedelta as _td
+        events = []
+        for obs in magdur_obs:
+            for ch in obs.channels:
+                if ch.quantity_type not in ('MAGDUR', 'MAGDURTIME', 'MAGDURCOUNT'):
+                    continue
+                if ch.quantity_measured != 'voltage':
+                    continue
+                val = ch.series.get("VAL")
+                dur = ch.series.get("DURATION")
+                if val is None or dur is None or len(val) == 0:
+                    continue
+                time_arr = ch.series.get("TIME")
+                phase = ch.phase[:1].upper() if ch.phase and ch.phase not in ("none", "") else "?"
+                n = min(len(val), len(dur))
+                for i in range(n):
+                    ts = None
+                    if time_arr is not None and i < len(time_arr) and obs.start_time is not None:
+                        ts = obs.start_time + _td(seconds=float(time_arr[i]))
+                    events.append({
+                        "type":        "voltage_transient",
+                        "phase":       phase,
+                        "value_v":     round(float(val[i]), 2),
+                        "duration_ms": round(float(dur[i]) * 1000, 4),
+                        "timestamp":   ts,
+                        "source":      "magdur",
+                    })
+        if events:
+            log.info("ProntoAdapter: extracted %d MAGDUR voltage events", len(events))
+        return events
 
     def _build_timestamps(
         self, obs1_body: bytes, base_date: datetime
@@ -2960,6 +3008,11 @@ class PQDataset:
     adaptive_df: Optional[pd.DataFrame]
     meta:        dict
     waveforms:   List[dict] = field(default_factory=list)
+    events:      List[dict] = field(default_factory=list)
+
+    @property
+    def has_events(self) -> bool:
+        return bool(self.events)
 
     @property
     def duration_hours(self) -> float:
@@ -3120,7 +3173,8 @@ def extract_dataset(
     }
 
     ds = PQDataset(df=df, adaptive_df=adaptive_df, meta=meta,
-                   waveforms=getattr(adapter, "waveforms", []) or [])
+                   waveforms=getattr(adapter, "waveforms", []) or [],
+                   events=getattr(adapter, "magdur_events", []) or [])
     log.info("\n%s", ds.catalog())
     return ds
 

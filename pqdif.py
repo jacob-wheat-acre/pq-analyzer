@@ -195,6 +195,8 @@ VALUE_TYPE_NAMES = {
     _u("67f6af9a-f753-11cf-9d89-0080c72e70a3"): "AVG",
     _u("67f6af9b-f753-11cf-9d89-0080c72e70a3"): "INSTANTANEOUS",
     _u("3d786f9b-f76e-11cf-9d89-0080c72e70a3"): "PHASEANGLE",
+    _u("c690e863-f755-11cf-9d89-0080c72e70a3"): "DURATION",  # Annex B, ID_SERIES_VALUE_TYPE_DURATION
+    _u("c690e870-f755-11cf-9d89-0080c72e70a3"): "COUNT",     # Annex B, ID_SERIES_VALUE_TYPE_COUNT
 }
 
 #: tagQuantityTypeID → short name (Annex B, ID_QT_*).

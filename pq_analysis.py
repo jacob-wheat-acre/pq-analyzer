@@ -4168,6 +4168,19 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
             return False
         events.extend(w for w in wf_events if not _is_dup(w))
 
+    # ── Meter-logged MAGDUR transient/notch events (sub-cycle resolution) ─────
+    # These come from the PQDIF MAGDUR observation records that the meter writes
+    # directly, giving durations down to ~0.1 ms — below adaptive resolution.
+    magdur = getattr(ds, "events", None) or []
+    if magdur:
+        tzinfo = next((getattr(e.get("timestamp"), "tzinfo", None) for e in events
+                       if getattr(e.get("timestamp"), "tzinfo", None) is not None), None)
+        for ev_item in magdur:
+            item = dict(ev_item)
+            if tzinfo is not None and item.get("timestamp") is not None:
+                item["timestamp"] = pd.Timestamp(item["timestamp"]).tz_localize(tzinfo)
+            events.append(item)
+
     events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True) \
         if events else pd.DataFrame(columns=["timestamp", "type", "phase"])
     return {
@@ -5158,7 +5171,7 @@ def check_itic(event_result: dict, thresh: Thresholds) -> dict:
             "violations":   [],
         }
 
-    vs = ev[ev["type"].isin(["voltage_sag", "voltage_swell"])].copy()
+    vs = ev[ev["type"].isin(["voltage_sag", "voltage_swell", "voltage_transient"])].copy()
     if (vs.empty or "duration_ms" not in vs.columns
             or not vs["duration_ms"].notna().any()):
         if vs.empty:
@@ -5167,7 +5180,7 @@ def check_itic(event_result: dict, thresh: Thresholds) -> dict:
                 "n_events":     0,
                 "n_violations": 0,
                 "overall_pass": True,
-                "note":         "No voltage sag/swell events detected during the recording.",
+                "note":         "No voltage sag/swell/transient events detected during the recording.",
                 "violations":   [],
             }
         return {

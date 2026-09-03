@@ -26,3 +26,6 @@ Thumbs.db
 venv/
 .venv/
 env/
+
+# Screenshots (local reference only)
+Screenshots/

@@ -548,8 +548,9 @@ def plot_itic(
     Requires event records with duration_ms populated — available from adaptive
     (cycle-level) data but not from 5-minute interval averages.
     """
+    _ITIC_TYPES = ["voltage_sag", "voltage_swell", "voltage_transient"]
     vol_events = (
-        events[events["type"].isin(["voltage_sag", "voltage_swell"])].copy()
+        events[events["type"].isin(_ITIC_TYPES)].copy()
         if events is not None and not events.empty
         else pd.DataFrame()
     )
@@ -597,6 +598,11 @@ def plot_itic(
             ax.scatter(sw["duration_ms"], sw["pct"], marker="^", color=color, s=60,
                        zorder=5, edgecolors="white", linewidths=0.5,
                        label=f"Swell Ph-{phase} (n={len(sw)})")
+        tr = vol_events[(vol_events["type"] == "voltage_transient") & (vol_events["phase"] == phase)]
+        if not tr.empty:
+            ax.scatter(tr["duration_ms"], tr["pct"], marker="x", color=color, s=50,
+                       zorder=5, linewidths=1.2,
+                       label=f"Transient Ph-{phase} (n={len(tr)})")
 
     ax.set_xscale("log")
     ax.set_xlim(0.001, 1e5)
