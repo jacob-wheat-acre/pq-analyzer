@@ -4168,6 +4168,19 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
             return False
         events.extend(w for w in wf_events if not _is_dup(w))
 
+    # ── Sub-cycle transient events from waveform instantaneous peaks ──────────
+    # Detect spans where |V_inst| > V_nom × √2 inside each point-on-wave
+    # capture.  These are overvoltage impulses too brief for the ½-cycle RMS
+    # method to resolve; they appear as X markers on the ITIC curve.
+    wf_transient_events = _waveform_transient_events(ds, thresh)
+    if wf_transient_events:
+        tzinfo = next((getattr(e.get("timestamp"), "tzinfo", None) for e in events
+                       if getattr(e.get("timestamp"), "tzinfo", None) is not None), None)
+        if tzinfo is not None:
+            for w in wf_transient_events:
+                w["timestamp"] = pd.Timestamp(w["timestamp"]).tz_localize(tzinfo)
+        events.extend(wf_transient_events)
+
     # ── Meter-logged MAGDUR transient/notch events (sub-cycle resolution) ─────
     # These come from the PQDIF MAGDUR observation records that the meter writes
     # directly, giving durations down to ~0.1 ms — below adaptive resolution.
@@ -4234,6 +4247,73 @@ def _waveform_sag_swell_events(ds: PQDataset, thresh: Thresholds) -> List[dict]:
                         "duration_ms": round(float(dur_ms), 1),
                         "source":      "waveform",
                     })
+    return out
+
+
+def _waveform_transient_events(ds: PQDataset, thresh: Thresholds) -> List[dict]:
+    """Detect instantaneous overvoltage transients from point-on-wave captures.
+
+    An event is reported for each continuous span where |V_inst| exceeds the
+    nominal peak (V_nom_rms × √2).  Gaps of ≤ 3 samples are bridged so that a
+    sine-wave crest crossing the threshold several times in quick succession
+    counts as a single event rather than many one-sample artefacts.
+
+    Duration and magnitude feed directly into ITIC characterisation:
+    value_v is the peak instantaneous voltage; duration_ms is how long the
+    instantaneous stayed above the nominal peak envelope.
+    """
+    import datetime as _dt
+    MERGE_GAP_SAMP = 3    # bridge gaps this short (avoids threshold chatter)
+    MIN_DUR_MS = 0.1      # discard sub-100 µs artefacts (< 2 samples at 19 kHz)
+
+    nominal = thresh.nominal_voltage
+    nominal_peak = nominal * np.sqrt(2.0)
+    out: List[dict] = []
+    for wf in getattr(ds, "waveforms", None) or []:
+        t  = wf.get("t")
+        fs = wf.get("fs_hz")
+        if t is None or not fs or fs <= 0:
+            continue
+        dt_ms = 1000.0 / fs
+        t = np.asarray(t, dtype=float)
+
+        for ph, x in wf.get("voltages", {}).items():
+            n = min(len(x), len(t))
+            if n < 4:
+                continue
+            x   = np.asarray(x[:n], dtype=float)
+            t_s = t[:n]
+
+            mask = np.abs(x) > nominal_peak
+            if not mask.any():
+                continue
+
+            # Bridge short gaps so the sine crest doesn't split into many runs
+            edges = np.flatnonzero(
+                np.diff(np.concatenate(([0], mask.view(np.int8), [0])))
+            )
+            starts, ends = edges[::2], edges[1::2]
+            merged = mask.copy()
+            for k in range(len(starts) - 1):
+                if 0 < starts[k + 1] - ends[k] <= MERGE_GAP_SAMP:
+                    merged[ends[k]:starts[k + 1]] = True
+
+            edges2 = np.flatnonzero(
+                np.diff(np.concatenate(([0], merged.view(np.int8), [0])))
+            )
+            for s_i, e_i in zip(edges2[::2], edges2[1::2]):
+                dur_ms = (t_s[e_i - 1] - t_s[s_i]) * 1000.0 + dt_ms
+                if dur_ms < MIN_DUR_MS:
+                    continue
+                peak_v = float(np.max(np.abs(x[s_i:e_i])))
+                out.append({
+                    "timestamp":   wf["timestamp"] + _dt.timedelta(seconds=float(t_s[s_i])),
+                    "type":        "voltage_transient",
+                    "phase":       ph.upper(),
+                    "value_v":     round(peak_v, 2),
+                    "duration_ms": round(dur_ms, 4),
+                    "source":      "waveform_transient",
+                })
     return out
 
 
