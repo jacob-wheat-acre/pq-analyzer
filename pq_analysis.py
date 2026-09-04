@@ -4125,12 +4125,15 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
                 end = loc
                 while end + 1 < len(s_vals) and s_vals[end + 1] < sag_thresh:
                     end += 1
+                val_v = float(np.min(s_vals[loc: end + 1]))
                 events.append({
                     "timestamp":   ts,
                     "type":        "voltage_sag",
                     "phase":       phase,
-                    "value_v":     float(np.min(s_vals[loc: end + 1])),
+                    "value_v":     val_v,
+                    "pct_nominal": round(val_v / nominal * 100, 2),
                     "duration_ms": (s_idx[end] - ts).total_seconds() * 1000 + sample_ms,
+                    "data_source": "adaptive",
                 })
 
             for ts in swell_starts:
@@ -4138,17 +4141,20 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
                 end = loc
                 while end + 1 < len(s_vals) and s_vals[end + 1] > swell_thresh:
                     end += 1
+                val_v = float(np.max(s_vals[loc: end + 1]))
                 events.append({
                     "timestamp":   ts,
                     "type":        "voltage_swell",
                     "phase":       phase,
-                    "value_v":     float(np.max(s_vals[loc: end + 1])),
+                    "value_v":     val_v,
+                    "pct_nominal": round(val_v / nominal * 100, 2),
                     "duration_ms": (s_idx[end] - ts).total_seconds() * 1000 + sample_ms,
+                    "data_source": "adaptive",
                 })
             diffs = s.diff().abs()
             for ts in diffs[diffs > delta_v].index:
                 events.append({"timestamp": ts, "type": "voltage_spike", "phase": phase,
-                               "delta_v": float(diffs.loc[ts])})
+                               "delta_v": float(diffs.loc[ts]), "data_source": "adaptive"})
 
         # ── Flicker events (IEC 61000-3-3) ────────────────────────────────────
         if "adap_pst" in adf.columns:
@@ -4192,11 +4198,17 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
             sag_starts   = s_low[(s_low < sag_thresh)   & (s_low.shift(1) >= sag_thresh)].index
             swell_starts = s_hi[ (s_hi  > swell_thresh)  & (s_hi.shift(1)  <= swell_thresh)].index
             for ts in sag_starts:
-                events.append({"timestamp": ts, "type": "voltage_sag",   "phase": phase,
-                               "value_v": float(s_low.loc[ts])})
+                val_v = float(s_low.loc[ts])
+                events.append({"timestamp": ts, "type": "voltage_sag", "phase": phase,
+                               "value_v": val_v,
+                               "pct_nominal": round(val_v / nominal * 100, 2),
+                               "data_source": "interval"})
             for ts in swell_starts:
+                val_v = float(s_hi.loc[ts])
                 events.append({"timestamp": ts, "type": "voltage_swell", "phase": phase,
-                               "value_v": float(s_hi.loc[ts])})
+                               "value_v": val_v,
+                               "pct_nominal": round(val_v / nominal * 100, 2),
+                               "data_source": "interval"})
 
             diffs = s.diff().abs()
             for ts in diffs[diffs > delta_v].index:
@@ -4238,7 +4250,12 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
                 if close and e["type"] == w["type"] and e.get("phase") == w["phase"]:
                     return True
             return False
-        events.extend(w for w in wf_events if not _is_dup(w))
+        for w in wf_events:
+            if not _is_dup(w):
+                w.setdefault("data_source", "waveform")
+                if "value_v" in w and "pct_nominal" not in w:
+                    w["pct_nominal"] = round(w["value_v"] / nominal * 100, 2)
+                events.append(w)
 
     # ── Sub-cycle transient events from waveform instantaneous peaks ──────────
     # Detect spans where |V_inst| > V_nom × √2 inside each point-on-wave
@@ -4251,7 +4268,11 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
         if tzinfo is not None:
             for w in wf_transient_events:
                 w["timestamp"] = pd.Timestamp(w["timestamp"]).tz_localize(tzinfo)
-        events.extend(wf_transient_events)
+        for w in wf_transient_events:
+            w.setdefault("data_source", "waveform")
+            if "value_v" in w and "pct_nominal" not in w:
+                w["pct_nominal"] = round(w["value_v"] / nominal * 100, 2)
+            events.append(w)
 
     # ── Meter-logged MAGDUR transient/notch events (sub-cycle resolution) ─────
     # These come from the PQDIF MAGDUR observation records that the meter writes
@@ -4281,6 +4302,9 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
             if tzinfo is not None and item.get("timestamp") is not None:
                 item["timestamp"] = pd.Timestamp(item["timestamp"]).tz_localize(tzinfo)
             if not _is_dup_transient(item):
+                item.setdefault("data_source", "magdur")
+                if "value_v" in item and "pct_nominal" not in item:
+                    item["pct_nominal"] = round(item["value_v"] / nominal * 100, 2)
                 events.append(item)
 
     events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True) \
@@ -4342,14 +4366,15 @@ def _waveform_sag_swell_events(ds: PQDataset, thresh: Thresholds) -> List[dict]:
 def _waveform_transient_events(ds: PQDataset, thresh: Thresholds) -> List[dict]:
     """Detect instantaneous overvoltage transients from point-on-wave captures.
 
-    An event is reported for each continuous span where |V_inst| exceeds the
-    nominal peak (V_nom_rms × √2).  Gaps of ≤ 3 samples are bridged so that a
-    sine-wave crest crossing the threshold several times in quick succession
-    counts as a single event rather than many one-sample artefacts.
+    Reports the single highest-magnitude transient per phase per capture —
+    the same granularity Pronto uses when building its event table.  Reporting
+    every AC crest that marginally exceeds nominal_peak (due to slight voltage
+    elevation or harmonic distortion) inflates the ITIC plot with 20-40 phantom
+    events per capture rather than the 1-2 real transients the capture contains.
 
     Duration and magnitude feed directly into ITIC characterisation:
     value_v is the peak instantaneous voltage; duration_ms is how long the
-    instantaneous stayed above the nominal peak envelope.
+    instantaneous stayed above the nominal peak envelope for that span.
     """
     import datetime as _dt
     MERGE_GAP_SAMP = 3    # bridge gaps this short (avoids threshold chatter)
@@ -4390,19 +4415,31 @@ def _waveform_transient_events(ds: PQDataset, thresh: Thresholds) -> List[dict]:
             edges2 = np.flatnonzero(
                 np.diff(np.concatenate(([0], merged.view(np.int8), [0])))
             )
+
+            # Collect all candidate spans, then keep only the highest-magnitude
+            # one per (capture, phase).  Normal AC crests that marginally exceed
+            # nominal_peak produce O(20) spans per capture; reporting all of them
+            # floods the ITIC plot.  Pronto reports the dominant transient per
+            # capture, so we match that behaviour.
+            best_peak_v = 0.0
+            best_event: Optional[dict] = None
             for s_i, e_i in zip(edges2[::2], edges2[1::2]):
                 dur_ms = (t_s[e_i - 1] - t_s[s_i]) * 1000.0 + dt_ms
                 if dur_ms < MIN_DUR_MS:
                     continue
                 peak_v = float(np.max(np.abs(x[s_i:e_i])))
-                out.append({
-                    "timestamp":   wf["timestamp"] + _dt.timedelta(seconds=float(t_s[s_i])),
-                    "type":        "voltage_transient",
-                    "phase":       ph.upper(),
-                    "value_v":     round(peak_v, 2),
-                    "duration_ms": round(dur_ms, 4),
-                    "source":      "waveform_transient",
-                })
+                if peak_v > best_peak_v:
+                    best_peak_v = peak_v
+                    best_event = {
+                        "timestamp":   wf["timestamp"] + _dt.timedelta(seconds=float(t_s[s_i])),
+                        "type":        "voltage_transient",
+                        "phase":       ph.upper(),
+                        "value_v":     round(peak_v, 2),
+                        "duration_ms": round(float(dur_ms), 4),
+                        "source":      "waveform_transient",
+                    }
+            if best_event is not None:
+                out.append(best_event)
     return out
 
 

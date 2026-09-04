@@ -292,8 +292,10 @@ def plot_voltage(
         labels = {f"voltage_{ph}": label for ph, label, _ in phases}
         topo_title = "Three-Phase Voltage"
 
+    gaps = _gap_spans(df.index)
     for col in v_cols:
-        ax.plot(df.index, df[col], color=colors.get(col, "gray"),
+        series = _break_at_gaps(df[col].dropna(), gaps)
+        ax.plot(series.index, series.values, color=colors.get(col, "gray"),
                 lw=0.8, label=labels.get(col, col))
 
     # The bands come from the result rather than being recomputed here, so the
@@ -315,16 +317,11 @@ def plot_voltage(
     ax.axhline(vmax, color="orange", ls="--", lw=1.0, label=f"Range A upper ({vmax:.1f} V)")
     ax.axhline(thresh.nominal_voltage, color="gray", ls=":", lw=0.8, alpha=0.6)
 
+    for start, end in gaps:
+        ax.axvspan(start, end, color=_NEUTRAL_CLR, alpha=0.12, linewidth=0)
+
     viol_ts = volt_result.get("violation_timestamps", pd.DatetimeIndex([]))
     _shade_violations(ax, viol_ts, df.index)
-
-    if not viol_ts.empty:
-        ax.legend(handles=ax.lines[:], loc="upper right")
-        ax.legend(
-            [Patch(facecolor="red", alpha=0.3)],
-            ["Voltage violation"],
-            loc="upper left",
-        )
 
     _fmt_time_axis(ax, df.index)
     fig.autofmt_xdate()
@@ -931,14 +928,20 @@ def plot_imbalance(
         log.warning("plot_imbalance: no imbalance data to plot.")
         return
 
+    gaps = _gap_spans(df.index)
     fig, axes = plt.subplots(len(panels), 1, figsize=(14, 3 * len(panels)), sharex=True)
     if len(panels) == 1:
         axes = [axes]
     for ax, (ylabel, series, limit, color) in zip(axes, panels):
-        ax.plot(series.index, series, color=color, lw=0.8)
+        broken = _break_at_gaps(series, gaps)
+        ax.plot(broken.index, broken.values, color=color, lw=0.8)
         if limit is not None:
             ax.axhline(limit, color="red", ls="--", lw=1.0, label=f"Limit ({limit:.0f}%)")
+            viol_ts = series.index[series > limit]
+            _shade_violations(ax, viol_ts, df.index)
             ax.legend()
+        for start, end in gaps:
+            ax.axvspan(start, end, color=_NEUTRAL_CLR, alpha=0.12, linewidth=0)
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
