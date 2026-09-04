@@ -2542,6 +2542,8 @@ def check_neutral_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
         "triplen_pct":          0.0,
         "triplen_dominant":     False,
         "accumulation_factor":  None,
+        "triplen_hrms_mean_a":  None,
+        "triplen_hrms_max_a":   None,
     }
 
     triplen_sum     = pd.Series(0.0, index=df.index)
@@ -2585,7 +2587,63 @@ def check_neutral_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
         if h3_ph_mean > 0.01:
             result["accumulation_factor"] = round(h3_n_mean / h3_ph_mean, 2)
 
+    # Triplen HRMS: quadrature sum of the zero-sequence orders we measure.
+    # H3 and H9 cover the dominant triplens; H15, H21 are negligible on
+    # commercial services and are not individually reported.
+    triplen_rms_sq = None
+    for h in (3, 9):
+        col = f"h{h}_current_neutral"
+        if col not in df.columns:
+            continue
+        sq = df[col].reindex(df.index).fillna(0.0) ** 2
+        triplen_rms_sq = sq if triplen_rms_sq is None else triplen_rms_sq + sq
+    if triplen_rms_sq is not None:
+        triplen_rms = np.sqrt(triplen_rms_sq)
+        result["triplen_hrms_mean_a"] = round(float(triplen_rms.mean()), 3)
+        result["triplen_hrms_max_a"]  = round(float(triplen_rms.max()),  3)
+
     return result
+
+
+def check_even_harmonics(df: pd.DataFrame, thresh: Thresholds) -> dict:
+    """Even-order current HRMS per phase: √(H2² + H4² + H6²).
+
+    Even harmonics are normally negligible on balanced three-phase systems.
+    An elevated value indicates an asymmetric load — half-wave rectification,
+    failing rectifier diodes, or DC injection.  No standard sets a limit;
+    this is a screening diagnostic.
+    """
+    phases = [p for p in ("a", "b", "c")
+              if any(f"h{h}_current_{p}" in df.columns for h in (2, 4, 6))]
+    if not phases:
+        return {"available": False,
+                "note": "No even-order harmonic current channels in dataset"}
+
+    per_phase: dict = {}
+    for p in phases:
+        rms_sq = None
+        orders_used = []
+        for h in (2, 4, 6):
+            col = f"h{h}_current_{p}"
+            if col not in df.columns:
+                continue
+            sq = df[col].reindex(df.index).fillna(0.0) ** 2
+            rms_sq = sq if rms_sq is None else rms_sq + sq
+            orders_used.append(h)
+        if rms_sq is None:
+            continue
+        series = np.sqrt(rms_sq)
+        per_phase[p] = {
+            "median_a":    round(float(series.median()), 3),
+            "max_a":       round(float(series.max()),    3),
+            "orders_used": orders_used,
+        }
+
+    if not per_phase:
+        return {"available": False,
+                "note": "Even-order columns present but contained no data"}
+
+    return {"available": True, "per_phase": per_phase}
 
 
 _SOURCE_ORDERS       = (3, 5, 7, 11, 13)   # orders where both V_h and I_h exist in Pronto
@@ -2838,8 +2896,8 @@ def check_spectral_shape(df: pd.DataFrame, thresh: Thresholds, source_harm: dict
 #
 # Neither is proof.  The power-direction sign is a screening indicator whose
 # validity depends on the relative impedances either side of the PCC (Xu, Liu
-# & Liu, "On the validity of the power direction method for harmonic source
-# determination", IEEE Trans. Power Delivery 18(1), 2003), and the regression
+# & Liu, "An investigation on the validity of the power direction method for
+# harmonic source determination", IEEE Trans. Power Delivery 18(1), 2003), and the regression
 # infers direction from covariance rather than measuring it.  Both are
 # reported as evidence of where distortion appears to originate, never as an
 # attribution of responsibility.
@@ -3306,7 +3364,9 @@ def harmonic_direction_from_waveforms(ds: PQDataset, thresh: Thresholds) -> dict
             "whole recording. The sign is a screening indicator: it identifies "
             "the side whose harmonic source dominates at the meter, and is "
             "least reliable when the impedances either side of the meter are "
-            "comparable (Xu, Liu & Liu, IEEE T-PWRD 18(1), 2003)."
+            "comparable (Xu, Liu & Liu, 'An investigation on the validity of the "
+            "power direction method for harmonic source determination,' "
+            "IEEE T-PWRD 18(1), 2003)."
         ),
     })
     if is_generation_only(thresh):
@@ -3551,7 +3611,19 @@ def check_harmonic_statistics(df: pd.DataFrame, thresh: Thresholds) -> dict:
         return result
 
     isc_il = thresh.isc_amps / il_amps
-    period_days = (df.index[-1] - df.index[0]).total_seconds() / 86400
+    # Measure recorded time directly from the index rather than taking the
+    # full timestamp span.  Merged multi-session DataFrames have a gap between
+    # sessions that is *not* recorded time; counting it would overstate the
+    # period and shift percentile windows to wrong date ranges.
+    if len(df.index) >= 2:
+        deltas      = np.diff(df.index.asi8)                 # nanoseconds
+        interval_ns = int(np.median(deltas))
+        # Consecutive steps ≤ 2× the nominal step are continuous recording;
+        # larger steps are inter-session gaps.
+        continuous  = int(np.sum(deltas <= 2 * interval_ns))
+        period_days = (continuous + 1) * interval_ns / (86400 * 1e9)
+    else:
+        period_days = 0.0
 
     result.update({
         "available": True,
@@ -4184,15 +4256,32 @@ def detect_events(ds: PQDataset, thresh: Thresholds) -> dict:
     # ── Meter-logged MAGDUR transient/notch events (sub-cycle resolution) ─────
     # These come from the PQDIF MAGDUR observation records that the meter writes
     # directly, giving durations down to ~0.1 ms — below adaptive resolution.
+    # Dedup against waveform-transient events already in the list: a physical
+    # overvoltage impulse that triggers a capture AND is logged as a MAGDUR
+    # record would otherwise plot twice as two X-markers for the same event.
     magdur = getattr(ds, "events", None) or []
     if magdur:
         tzinfo = next((getattr(e.get("timestamp"), "tzinfo", None) for e in events
                        if getattr(e.get("timestamp"), "tzinfo", None) is not None), None)
+
+        def _is_dup_transient(item):
+            for e in events:
+                if e.get("type") != "voltage_transient":
+                    continue
+                try:
+                    close = abs((e["timestamp"] - item["timestamp"]).total_seconds()) <= 2.0
+                except TypeError:
+                    close = False
+                if close:
+                    return True
+            return False
+
         for ev_item in magdur:
             item = dict(ev_item)
             if tzinfo is not None and item.get("timestamp") is not None:
                 item["timestamp"] = pd.Timestamp(item["timestamp"]).tz_localize(tzinfo)
-            events.append(item)
+            if not _is_dup_transient(item):
+                events.append(item)
 
     events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True) \
         if events else pd.DataFrame(columns=["timestamp", "type", "phase"])
@@ -5966,7 +6055,8 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                     )
                     rec_text = (
                         "Conduct a harmonic impedance scan to identify the resonant frequency. "
-                        "Detune existing capacitor banks or add series reactors to shift resonance. "
+                        "Review feeder capacitor bank locations — relocating a bank is typically "
+                        "the most practical mitigation available. "
                         "Verify neutral conductor sizing can withstand resonance-amplified currents."
                     )
                 elif nh_avail:
@@ -5981,7 +6071,9 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                     rec_text = (
                         "Verify neutral conductor sizing handles full triplen harmonic current "
                         f"(mean {nc['mean_amps']:.1f} A, peak {nc['max_amps']:.1f} A). "
-                        "Consider a K-rated or harmonic-mitigating transformer. "
+                        "A K-rated or harmonic-mitigating transformer would reduce neutral harmonic "
+                        "heating, though Xcel Energy does not supply K-rated units — primary metering "
+                        "conversion would be required for the customer to source their own. "
                         "Inventory single-phase nonlinear loads by phase to identify dominant sources."
                     )
                 else:
@@ -6060,9 +6152,13 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
 
     # ── Harmonic source attribution — resonance detection ────────────────────
     source_harm = report.get("harmonic_sources", {})
+    harm_volt_violation = (
+        pf_flags.get("thd_voltage") is False
+        or pf_flags.get("individual_voltage_harmonics") is False
+    )
     if source_harm.get("available"):
         resonant = source_harm.get("resonant_orders", [])
-        if resonant:
+        if resonant and harm_volt_violation:
             h_res_str = ", ".join(f"H{h} ({h * 60} Hz)" for h in sorted(resonant))
             z_evidence = {
                 f"H{h}_z_ratio": source_harm["orders"][h].get("z_ratio")
@@ -6104,9 +6200,9 @@ def analyze_root_causes(report: dict, ds: PQDataset, thresh: Thresholds) -> List
                 res_rec = (
                     "Commission a harmonic impedance frequency sweep to confirm the resonant "
                     f"frequency (target: {', '.join(str(h * 60) for h in sorted(resonant))} Hz). "
-                    "Detune existing capacitor banks by adding series reactors (typically 5–7% "
-                    "of bank kVAR), or switch to a harmonic filter bank tuned below H5 (282 Hz). "
-                    "Until resolved, do not add more capacitors without a harmonic study."
+                    "Review feeder capacitor bank locations — relocating or temporarily switching "
+                    "out a bank near this service is typically the most practical mitigation "
+                    "available. Until resolved, do not add more capacitors without a harmonic study."
                 )
 
             findings.append({

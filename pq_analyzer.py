@@ -52,6 +52,7 @@ from pq_analysis import (
     check_individual_harmonics,
     check_individual_voltage_harmonics,
     check_neutral_harmonics,
+    check_even_harmonics,
     check_harmonic_direction,
     check_source_impedance,
     check_harmonic_sources,
@@ -249,6 +250,9 @@ EXAMPLES
     p.add_argument("--session", type=int, default=None, metavar="N",
                    help="Analyse session N (1-based) of a file holding several; "
                         "default is the longest")
+    p.add_argument("--sessions", default=None, metavar="SPEC",
+                   help="Sessions to merge: 'all', '1,2', or '1-3' (1-based). "
+                        "Overrides --session. Default is the longest single session.")
     p.add_argument("--nominal",   type=float, default=120.0,  help="Nominal voltage V (default 120)")
     p.add_argument("--volt-tol",  type=float, default=0.05,   help="Voltage tolerance ±fraction (default 0.05)")
     p.add_argument("--thd-limit", type=float, default=8.0,    help="Voltage THD %% limit (default 8.0)")
@@ -389,6 +393,35 @@ EXAMPLES
     return args
 
 
+def _parse_session_spec(spec):
+    """Convert a --sessions value to the form ProntoAdapter expects.
+
+    Returns ``"all"``, a sorted list of 0-based indices, or ``None``.
+    The user supplies 1-based session numbers; they are converted here.
+
+    Accepted forms:
+      all        → "all"
+      2          → [1]       (session 2 → index 1)
+      1,3        → [0, 2]
+      1-3        → [0, 1, 2]
+      1,2-4      → [0, 1, 2, 3]
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if spec.lower() == "all":
+        return "all"
+    indices = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            indices.extend(range(int(a) - 1, int(b)))  # 1-based → 0-based
+        else:
+            indices.append(int(part) - 1)
+    return sorted(set(indices))
+
+
 def main():
     args = parse_args()
 
@@ -479,9 +512,13 @@ def main():
             sys.exit(1)
         log.info("Opening %s  (%.1f MB)", fp, fp.stat().st_size / 1e6)
         if fp.suffix.lower() == ".pqd":
-            # --session is 1-based for the user, 0-based inside.
-            adapter = ProntoAdapter(
-                fp, session=None if args.session is None else args.session - 1)
+            # --sessions overrides --session; both are 1-based for the user.
+            sessions_spec = _parse_session_spec(getattr(args, "sessions", None))
+            if sessions_spec is not None:
+                adapter = ProntoAdapter(fp, sessions=sessions_spec)
+            else:
+                adapter = ProntoAdapter(
+                    fp, session=None if args.session is None else args.session - 1)
         elif _PQDIF_AVAILABLE:
             adapter = PQDIFAdapter(fp)
         else:
@@ -501,15 +538,22 @@ def main():
         if not sessions:
             print("\nThis file holds one recording session.\n")
             return
-        current = getattr(adapter, "session_index", 0)
+        loaded = set(getattr(adapter, "session_indices", None)
+                     or [getattr(adapter, "session_index", 0)])
         print(f"\n{len(sessions)} recording sessions:\n")
         for s in sessions:
-            mark = "→" if s["index"] == current else " "
+            mark = "→" if s["index"] in loaded else " "
             print(f"  {mark} --session {s['index'] + 1}   "
                   f"{(s['start_time'] or '')[:16].replace('T', ' ')} → "
                   f"{(s['end_time'] or '')[:16].replace('T', ' ')}   "
                   f"{s['hours']:.1f} h, {s['intervals']} intervals")
-        print("\n(→ marks the one analysed by default: the longest.)\n")
+        if len(loaded) > 1:
+            print(f"\n(→ marks the {len(loaded)} sessions being merged in this run.)\n"
+                  f"  Pass --sessions all to merge every session, or "
+                  f"--session N to analyse one.\n")
+        else:
+            print("\n(→ marks the one analysed by default: the longest.  "
+                  "Pass --sessions all to merge all sessions.)\n")
         return
 
     # ── List-channels debug mode ──────────────────────────────────────────────
@@ -544,6 +588,7 @@ def main():
     harm_result         = check_individual_harmonics(df, thresh)
     volt_harm_result    = check_individual_voltage_harmonics(df, thresh)
     neutral_harm_result = check_neutral_harmonics(df, thresh)
+    even_harm_result    = check_even_harmonics(df, thresh)
     source_harm_result   = check_harmonic_sources(df, thresh)
     spectral_shape_result = check_spectral_shape(df, thresh, source_harm_result)
     direction_result      = check_harmonic_direction(ds, thresh)
@@ -564,6 +609,7 @@ def main():
         harm_result, volt_harm_result, neutral_harm_result,
         source_harm_result, stat_result, event_result, thresh,
         neutral_health_result=neutral_health_result,
+        even_harm_result=even_harm_result,
         spectral_shape_result=spectral_shape_result,
         direction_result=direction_result,
         impedance_result=impedance_result,

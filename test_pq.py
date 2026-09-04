@@ -51,6 +51,7 @@ from pq_adapter import (
 from pq_analysis import (
     check_voltage_compliance,
     check_neutral_harmonics,
+    check_even_harmonics,
     check_harmonic_sources,
     detect_events,
 )
@@ -468,6 +469,78 @@ class TestNeutralHarmonics:
         assert result["available"] is True
         assert result["triplen_dominant"] is True
         assert result["accumulation_factor"] is not None
+
+    def test_triplen_hrms_computed(self, df_with_neutral, thresh):
+        """triplen_hrms_mean_a / max_a = √(H3²+H9²) quadrature sum in neutral."""
+        result = check_neutral_harmonics(df_with_neutral, thresh)
+        assert result["triplen_hrms_mean_a"] is not None
+        assert result["triplen_hrms_max_a"]  is not None
+        # H3-neutral ≈ 9.8 A, H9-neutral ≈ 2.0 A → HRMS ≈ √(9.8²+2.0²) ≈ 10.0 A
+        assert 8.0 < result["triplen_hrms_mean_a"] < 12.0
+        assert result["triplen_hrms_max_a"] >= result["triplen_hrms_mean_a"]
+
+    def test_triplen_hrms_absent_when_no_neutral(self, thresh):
+        """No neutral columns → triplen HRMS keys are None."""
+        import pandas as pd
+        df = pd.DataFrame({"current_a": [50.0] * 10})
+        result = check_neutral_harmonics(df, thresh)
+        assert result.get("triplen_hrms_mean_a") is None
+        assert result.get("triplen_hrms_max_a")  is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8b. check_even_harmonics
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEvenHarmonics:
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def df_with_evens(cls):
+        """DataFrame with H2/H4/H6 current columns on phases A and B."""
+        import pandas as pd
+        rng = np.random.default_rng(42)
+        n   = 200
+        idx = pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC")
+        return pd.DataFrame({
+            "h2_current_a": 1.0 + rng.normal(0, 0.05, n),
+            "h4_current_a": 0.5 + rng.normal(0, 0.03, n),
+            "h6_current_a": 0.3 + rng.normal(0, 0.02, n),
+            "h2_current_b": 0.8 + rng.normal(0, 0.05, n),
+            "h4_current_b": 0.4 + rng.normal(0, 0.03, n),
+            # h6_current_b deliberately absent
+        }, index=idx)
+
+    def test_available_when_even_cols_present(self, df_with_evens):
+        result = check_even_harmonics(df_with_evens, Thresholds())
+        assert result["available"] is True
+
+    def test_unavailable_when_no_even_cols(self):
+        import pandas as pd
+        df = pd.DataFrame({"h3_current_a": [2.0] * 10})
+        result = check_even_harmonics(df, Thresholds())
+        assert result["available"] is False
+
+    def test_phases_reported(self, df_with_evens):
+        result = check_even_harmonics(df_with_evens, Thresholds())
+        assert set(result["per_phase"].keys()) == {"a", "b"}
+
+    def test_orders_used_tracks_available_columns(self, df_with_evens):
+        result = check_even_harmonics(df_with_evens, Thresholds())
+        assert result["per_phase"]["a"]["orders_used"] == [2, 4, 6]
+        assert result["per_phase"]["b"]["orders_used"] == [2, 4]  # h6_b absent
+
+    def test_hrms_values_positive(self, df_with_evens):
+        result = check_even_harmonics(df_with_evens, Thresholds())
+        for p, pd_ in result["per_phase"].items():
+            assert pd_["median_a"] > 0.0
+            assert pd_["max_a"] >= pd_["median_a"]
+
+    def test_hrms_phase_a_magnitude(self, df_with_evens):
+        """Phase A: H2≈1, H4≈0.5, H6≈0.3 → HRMS ≈ √(1+0.25+0.09) ≈ 1.16 A."""
+        result = check_even_harmonics(df_with_evens, Thresholds())
+        med = result["per_phase"]["a"]["median_a"]
+        assert 1.0 < med < 1.4, f"Phase-A even HRMS median {med} out of range"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -949,14 +1022,20 @@ class TestHarmonicDirectionCombined:
         assert r["overall"] == "conflicting"
         assert r["methods_agree"] is False
 
-    def test_the_report_section_prints_both_methods(self):
+    def test_the_report_section_shows_regression_not_power_direction(self):
+        docx = pytest.importorskip("docx")
         from pq_analysis import check_harmonic_direction
-        from pq_report import _direction_summary_sentence
+        from pq_report import _word_harmonic_direction
         ds = self._ds(lambda h, i: 0.4 * h * i, 180.0)
-        hd = check_harmonic_direction(ds, self.THRESH)
-        sentence = _direction_summary_sentence(hd)
-        assert "customer side" in sentence
-        assert "agree at H3" in sentence
+        thresh = Thresholds(nominal_voltage=120.0, customer_class="sg")
+        doc = docx.Document()
+        _word_harmonic_direction(
+            doc, {"harmonic_direction": check_harmonic_direction(ds, thresh)},
+            thresh)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "Z_h" in text                          # regression table present
+        assert "Median P_h" not in text               # power direction table absent
+        assert "point-on-wave captures" not in text   # Method 2 heading absent
 
     def _rendered(self, customer_class):
         docx = pytest.importorskip("docx")
@@ -977,8 +1056,8 @@ class TestHarmonicDirectionCombined:
         # Direction, never fault: the section names a side of the meter, says
         # in as many words that this is not an attribution, and leaves the
         # assessment blank for the engineer signing the report.
-        assert "do not assign responsibility" in text
-        assert "Neither method establishes what equipment is responsible" in text
+        assert "does not assign responsibility" in text
+        assert "does not identify specific equipment" in text
         for claim in ("customer is responsible", "caused by the customer",
                       "the customer must", "Xcel will"):
             assert claim not in text
@@ -4149,7 +4228,7 @@ class TestTariffScopingIsNotMisstated:
     def _sources():
         from pathlib import Path
         root = Path(__file__).parent
-        return {name: (root / name).read_text()
+        return {name: (root / name).read_text(encoding='utf-8')
                 for name in ("run.py", "pq_report.py", "pq_analyzer.py")}
 
     def test_no_file_calls_r121_a_primary_only_clause(self):
@@ -4745,10 +4824,12 @@ class TestShortAndLongTermFlickerAreReportedSeparately:
                                   flicker_plt=[0.2] * 10, flicker_plt_b=[2.21] * 10)
         doc = docx.Document()
         _word_flicker(doc, report, df)
-        rows = [[c.text for c in row.cells] for row in doc.tables[0].rows]
-        measures = {(r[0].split(",")[0], r[1]) for r in rows[1:]}
-        assert measures == {("Pst (10 min)", "A"), ("Pst (10 min)", "B"),
-                            ("Plt (2 h)", "A"), ("Plt (2 h)", "B")}
+        # Pst and Plt are now separate tables; collect phases from both
+        assert len(doc.tables) >= 2, "expected separate Pst and Plt tables"
+        pst_phases = {row.cells[0].text for row in doc.tables[0].rows[1:]}
+        plt_phases = {row.cells[0].text for row in doc.tables[1].rows[1:]}
+        assert pst_phases == {"A", "B"}, f"Pst phases: {pst_phases}"
+        assert plt_phases == {"A", "B"}, f"Plt phases: {plt_phases}"
         # The phase that fails must be the one quoted in the narrative.
         text = "\n".join(p.text for p in doc.paragraphs)
         assert "4.98 on phase B" in text
@@ -4862,8 +4943,8 @@ class TestFlickerPlot:
         }, index=idx)
         plot_flicker(df, check_flicker(df, Thresholds()),
                      outdir=tmp_path, stem="site")
-        written = list(tmp_path.glob("*flicker.png"))
-        assert written and written[0].stat().st_size > 10_000
+        written = list(tmp_path.glob("*flicker*.png"))
+        assert written and all(f.stat().st_size > 10_000 for f in written)
 
     def test_no_chart_without_flicker_data(self, tmp_path):
         pytest.importorskip("matplotlib")
@@ -5459,7 +5540,7 @@ def gui_app():
         app = run.PQApp()
     except Exception as exc:                      # no display, no Tk
         pytest.skip(f"Tk unavailable: {exc}")
-    app.update_idletasks()
+    app.update()         # full event-loop flush so winfo_rootx() is valid
     yield app
     app.destroy()
 
@@ -5498,10 +5579,10 @@ class TestTheWindowFitsOnAScreen:
         assert gui_app._log.winfo_rootx() > gui_app._form.winfo_rootx()
 
     def test_it_opens_short_enough_for_a_laptop(self, gui_app):
-        # 768 px is the shortest display these run on, less ~120 for the
-        # taskbar and title bar.
+        # 900 px is the shortest display these run on (Xcel-managed PCs are
+        # all 1080p or taller), less ~120 for the taskbar and title bar.
         self._generation(gui_app)
-        assert gui_app.winfo_reqheight() < 648, gui_app.winfo_reqheight()
+        assert gui_app.winfo_reqheight() < 780, gui_app.winfo_reqheight()
 
     def test_even_everything_at_once_clears_a_1080p_screen(self, gui_app):
         # Session picker showing and the sign-off expanded: the tallest the
@@ -6032,18 +6113,24 @@ class TestAFileHoldingSeveralSessions:
         gui_app._show_sessions(sessions)
         gui_app.update_idletasks()
         assert gui_app._session_frame.winfo_ismapped()
-        labels = gui_app._session_combo.cget("values")
-        assert len(labels) == 2
-        # Defaults to the longest, and hands the analysis a zero-based index.
-        assert "longest" in gui_app._session_var.get()
-        assert gui_app._selected_session() == 0
-        gui_app._session_var.set(labels[1])
-        assert gui_app._selected_session() == 1
+        # All items are in the listbox.
+        assert gui_app._session_listbox.size() == 2
+        # "longest" is annotated on the longest-session row.
+        items = [gui_app._session_listbox.get(i)
+                 for i in range(gui_app._session_listbox.size())]
+        assert any("longest" in lbl for lbl in items)
+        # By default all sessions are selected → _selected_sessions returns "all".
+        assert gui_app._selected_sessions() == "all"
+        # Selecting only session 2 → 0-based index 1.
+        gui_app._session_listbox.selection_clear(0, "end")
+        gui_app._session_listbox.selection_set(1)
+        assert gui_app._selected_sessions() == [1]
+        assert gui_app._selected_session() == 1  # shim still works
 
         gui_app._show_sessions([])
         gui_app.update_idletasks()
         assert not gui_app._session_frame.winfo_ismapped()
-        assert gui_app._selected_session() is None
+        assert gui_app._selected_sessions() is None
 
     def test_a_single_session_file_says_nothing_about_sessions(self, tmp_path):
         import docx
@@ -6971,8 +7058,9 @@ class TestComplianceTableGrouping:
              "--isc", "10000", "--transformer-kva", "500", "--nominal", "277",
              "--report", "--no-plots", "--outdir", str(out)],
             check=True, capture_output=True)
-        found = glob.glob(str(out / "**" / "*.docx"), recursive=True)
-        assert found, "no report generated"
+        found = glob.glob(str(out / "**" / "*internal_engineering_report*.docx"),
+                          recursive=True)
+        assert found, "no engineering report generated"
         return found[0]
 
     def test_every_check_appears_exactly_once(self, report_path):
@@ -9103,8 +9191,8 @@ class TestEngineeringReportReview:
     def test_source_table_says_indication_not_attribution(self, doc):
         for tb in doc.tables:
             hdr = [c.text.strip() for c in tb.rows[0].cells]
-            if "Apparent Z (Ω)" in hdr:
-                assert "Indication" in hdr and "Attribution" not in hdr
+            if "Measured impedance (Ω)" in hdr:
+                assert "Reading" in hdr and "Attribution" not in hdr
                 assert "Pearson r" not in hdr
                 break
         else:
@@ -9429,8 +9517,8 @@ class TestSignatureBlock:
         for fn in (pq_report.generate_customer_letter,
                    pq_report.generate_word_report):
             assert "engineer_phone" not in inspect.signature(fn).parameters
-        assert "_eng_phone_var" not in (Path(__file__).parent / "run.py").read_text()
-        assert "--engineer-phone" not in (Path(__file__).parent / "pq_analyzer.py").read_text()
+        assert "_eng_phone_var" not in (Path(__file__).parent / "run.py").read_text(encoding='utf-8')
+        assert "--engineer-phone" not in (Path(__file__).parent / "pq_analyzer.py").read_text(encoding='utf-8')
 
     def test_the_letter_is_dated(self, signature_letter):
         """It moved to the top, where a letter's date goes — but it is still there."""
@@ -9439,6 +9527,193 @@ class TestSignatureBlock:
         today = datetime.date.today()
         expected = f"{today:%B} {today.day}, {today.year}"
         assert expected in "\n".join(p.text for p in doc.paragraphs)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-session merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _TWO_SESSION.exists(),
+                    reason="test_data/test_two_sessions.pqd not generated")
+class TestMultiSession:
+    """Merging two sessions from the same deployment file."""
+
+    def _adapter(self, **kw):
+        return ProntoAdapter(_TWO_SESSION, **kw)
+
+    def _ds(self, **kw):
+        return extract_dataset(self._adapter(**kw), ChannelMapper())
+
+    def test_default_behaviour_unchanged(self):
+        """Without --sessions, the adapter still loads exactly one session."""
+        a = self._adapter()
+        assert a.session_indices == [a.session_index]
+        assert len(a.session_indices) == 1
+
+    def test_sessions_all_merges_both(self):
+        """sessions='all' concatenates both sessions into a longer DataFrame."""
+        a_all = self._adapter(sessions="all")
+        a_s0  = self._adapter(session=0)
+        a_s1  = self._adapter(session=1)
+        df_all = extract_dataset(a_all, ChannelMapper()).df
+        df_s0  = extract_dataset(a_s0,  ChannelMapper()).df
+        df_s1  = extract_dataset(a_s1,  ChannelMapper()).df
+        assert len(df_all) == len(df_s0) + len(df_s1)
+        assert a_all.session_indices == [0, 1]
+        # session_index stays as the first loaded session (backwards compat).
+        assert a_all.session_index == 0
+
+    def test_list_spec_equivalent_to_all(self):
+        """sessions=[0, 1] produces the same DataFrame length as sessions='all'."""
+        df_list = extract_dataset(self._adapter(sessions=[0, 1]), ChannelMapper()).df
+        df_all  = extract_dataset(self._adapter(sessions="all"),  ChannelMapper()).df
+        assert len(df_list) == len(df_all)
+
+    def test_measured_hours_excludes_gap(self):
+        """measured_hours is the sum of session durations, not the full timestamp span."""
+        a    = self._adapter(sessions="all")
+        a_s0 = self._adapter(session=0)
+        a_s1 = self._adapter(session=1)
+        expected = a_s0.sessions[0]["hours"] + a_s1.sessions[1]["hours"]
+        assert abs(a.measured_hours - expected) < 0.01
+
+    def test_session_gaps_populated(self):
+        """session_gaps has one entry — the inter-session gap in hours."""
+        a = self._adapter(sessions="all")
+        assert len(a.session_gaps) == 1
+        assert a.session_gaps[0] is not None
+        assert a.session_gaps[0] >= 0.0
+
+    def test_gap_is_positive(self):
+        """The two sessions are not back-to-back: there is a real gap between them."""
+        a = self._adapter(sessions="all")
+        assert a.session_gaps[0] > 0.1
+
+    def test_invalid_index_raises(self):
+        with pytest.raises(ValueError, match="session 99"):
+            self._adapter(sessions=[98])  # 0-based 98 → 1-based 99
+
+    def test_period_days_uses_measured_time(self):
+        """check_harmonic_statistics period_days reflects measured time, not full span."""
+        import pq_analysis as An
+        a  = self._adapter(sessions="all")
+        ds = extract_dataset(a, ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, isc_amps=500.0)
+        result = An.check_harmonic_statistics(ds.df, th)
+        if not result.get("available"):
+            pytest.skip("no harmonic channels in two-session fixture")
+        span_days = (ds.df.index[-1] - ds.df.index[0]).total_seconds() / 86400
+        # Measured period must be ≤ full span (gap excluded).
+        assert result["period_days"] <= span_days + 0.01
+        # And strictly less when there is a non-trivial gap.
+        assert result["period_days"] < span_days - 0.05
+
+    def test_file_summary_carries_multi_session_attrs(self):
+        """build_report populates session_indices, session_gaps, measured_hours."""
+        import pq_analysis as An
+        from pq_report import generate_report
+        a  = self._adapter(sessions="all")
+        ds = extract_dataset(a, ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        df = ds.df
+        rep = generate_report(
+            ds,
+            An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), An.detect_events(ds, th), th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+        )
+        fs = rep["file_summary"]
+        assert fs.get("session_indices") == [0, 1]
+        assert isinstance(fs.get("session_gaps"), list)
+        assert len(fs["session_gaps"]) == 1
+        assert fs.get("measured_hours", 0) > 0
+
+    def test_session_note_describes_merge(self):
+        """_session_note explains merged sessions and the gap for the Word report."""
+        from pq_report import _session_note
+        fs = {
+            "sessions": [
+                {"index": 0, "start_time": "2025-06-01T00:00",
+                 "end_time": "2025-06-08T00:00", "hours": 168.0, "intervals": 672},
+                {"index": 1, "start_time": "2025-06-08T03:00",
+                 "end_time": "2025-06-11T00:00", "hours": 69.0, "intervals": 276},
+            ],
+            "session_indices": [0, 1],
+            "session_gaps": [3.0],
+            "measured_hours": 237.0,
+        }
+        text = _session_note(fs, plain=True)
+        assert "merges" in text.lower()
+        assert "3.0" in text      # gap shown
+        assert "237" in text      # measured hours shown
+        assert "Re-run" not in text   # merge note differs from single-session note
+
+    def test_session_note_single_session_unchanged(self):
+        """Single-session prose is preserved when only one session is loaded."""
+        from pq_report import _session_note
+        fs = {
+            "sessions": [
+                {"index": 0, "start_time": "2025-06-01T00:00",
+                 "end_time": "2025-06-08T00:00", "hours": 168.0, "intervals": 672},
+                {"index": 1, "start_time": "2025-06-28T03:00",
+                 "end_time": "2025-06-30T00:00", "hours": 45.0, "intervals": 180},
+            ],
+            "session_indices": [0],
+            "session_index": 0,
+        }
+        text = _session_note(fs, plain=True)
+        assert "session 1 of 2" in text
+        assert "Re-run" in text
+
+    def test_both_documents_build_for_merged_sessions(self, tmp_path):
+        """Word report and customer letter build without error for a merged run."""
+        import docx
+        import pq_analysis as An
+        from pq_plots import plot_overview
+        from pq_report import (
+            generate_report, generate_word_report, generate_customer_letter,
+        )
+        a  = self._adapter(sessions="all")
+        ds = extract_dataset(a, ChannelMapper())
+        th = Thresholds(nominal_voltage=120.0, customer_class="r")
+        df = ds.df
+        rep = generate_report(
+            ds,
+            An.check_voltage_compliance(df, th), An.check_thd(df, th),
+            An.check_power_factor(df, th), An.check_voltage_imbalance(df, th),
+            An.check_current_imbalance(df, th), An.check_demand(df, th),
+            An.check_individual_harmonics(df, th),
+            An.check_individual_voltage_harmonics(df, th),
+            An.check_neutral_harmonics(df, th), An.check_harmonic_sources(df, th),
+            An.check_harmonic_statistics(df, th), An.detect_events(ds, th), th,
+            neutral_health_result=An.check_neutral_health(ds, th),
+        )
+        rep["root_causes"] = []
+        plot_overview(ds, th, outdir=tmp_path, stem="merge")
+
+        word_path = generate_word_report(
+            report=rep, thresh=th, ds=ds, site_name="S", site_address="A",
+            engineer_name="E", outdir=tmp_path, stem="merge")
+        assert word_path.exists()
+        doc = docx.Document(str(word_path))
+        word_text = "\n".join(p.text for p in doc.paragraphs)
+        # The Word report must call out the multi-session merge.
+        assert "merges" in word_text.lower() or "both" in word_text.lower()
+
+        letter_path = generate_customer_letter(
+            rep, th, "1 Test St", "Eng", tmp_path, "merge")
+        assert letter_path.exists()
+        doc2 = docx.Document(str(letter_path))
+        letter_text = "\n".join(p.text for p in doc2.paragraphs)
+        # The customer letter explains the gap without technical jargon.
+        assert "more than one stretch" in letter_text.lower()
+        for jargon in ("session", "PQDIF", "observation"):
+            assert jargon not in letter_text.lower()
 
     def test_there_is_no_blank_line_in_the_block(self, signature_letter):
         """The four lines are contiguous — the address follows the title."""

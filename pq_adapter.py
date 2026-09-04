@@ -62,7 +62,7 @@ CANONICAL = [
     "power_apparent", "frequency",
     # Total harmonic RMS per phase, as computed by the meter at full precision
     # (more accurate than summing the rounded per-order magnitudes)
-    "hrms_voltage_a", "hrms_voltage_b", "hrms_voltage_c",
+    "hrms_voltage_a", "hrms_voltage_b", "hrms_voltage_c", "hrms_voltage_neutral",
     "hrms_current_a", "hrms_current_b", "hrms_current_c", "hrms_current_neutral",
     # Neutral distortion
     "thd_current_neutral", "thd_voltage_neutral",
@@ -157,7 +157,23 @@ _TAG_MAP: Dict[str, Dict[str, Set[str]]] = {
     "hrms_current_a": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"an", "a", "phase_a"}},
     "hrms_current_b": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"bn", "b", "phase_b"}},
     "hrms_current_c": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"cn", "c", "phase_c"}},
+    "hrms_voltage_neutral": {"qt": {"voltageharmonics"}, "qm": {"hrms"}, "ph": {"ng", "neutral", "n"}},
     "hrms_current_neutral": {"qt": {"currentharmonics"}, "qm": {"hrms"}, "ph": {"ng", "neutral", "n"}},
+    # Odd/even/triplen harmonic RMS sub-totals.  These must have _TAG_MAP entries
+    # so they resolve by exact tag match.  Without them they fall through to regex,
+    # where "Odds Van" matches the voltage_a pattern and overwrites the true RMS.
+    **{f"hrms_odds_voltage_{p}":     {"qt": {"voltageharmonics"}, "qm": {"hrms_odds"},     "ph": {ph}}
+       for p, ph in (("a","an"),("b","bn"),("c","cn"),("neutral","neutral"))},
+    **{f"hrms_evens_voltage_{p}":    {"qt": {"voltageharmonics"}, "qm": {"hrms_evens"},    "ph": {ph}}
+       for p, ph in (("a","an"),("b","bn"),("c","cn"),("neutral","neutral"))},
+    **{f"hrms_triplens_voltage_{p}": {"qt": {"voltageharmonics"}, "qm": {"hrms_triplens"}, "ph": {ph}}
+       for p, ph in (("a","an"),("b","bn"),("c","cn"),("neutral","neutral"))},
+    **{f"hrms_odds_current_{p}":     {"qt": {"currentharmonics"}, "qm": {"hrms_odds"},     "ph": {ph}}
+       for p, ph in (("a","an"),("b","bn"),("c","cn"),("neutral","neutral"))},
+    **{f"hrms_evens_current_{p}":    {"qt": {"currentharmonics"}, "qm": {"hrms_evens"},    "ph": {ph}}
+       for p, ph in (("a","an"),("b","bn"),("c","cn"),("neutral","neutral"))},
+    **{f"hrms_triplens_current_{p}": {"qt": {"currentharmonics"}, "qm": {"hrms_triplens"}, "ph": {ph}}
+       for p, ph in (("a","an"),("b","bn"),("c","cn"),("neutral","neutral"))},
     # Neutral distortion
     "thd_current_neutral": {"qt": {"currentharmonics"}, "qm": {"thd", "totalthd"}, "ph": {"ng", "neutral", "n"}},
     "thd_voltage_neutral": {"qt": {"voltageharmonics"}, "qm": {"thd", "totalthd"}, "ph": {"ng", "neutral", "n"}},
@@ -655,7 +671,7 @@ class ProntoAdapter:
     # per file at load time: _scan_entry_table locates the table by pattern,
     # and _identify_adaptive_channels assigns names by signature.
 
-    def __init__(self, filepath, session: Optional[int] = None):
+    def __init__(self, filepath, session: Optional[int] = None, sessions=None):
         self.filepath = Path(filepath)
         self._raw_channels: List[RawChannelInfo] = []
         self._obs_ts: Optional[np.ndarray] = None
@@ -664,17 +680,34 @@ class ProntoAdapter:
         self._waveforms: List[dict] = []
         #: Every recording session the file holds, in time order. A "download
         #: all data" export carries more than one when the meter was reset or
-        #: re-armed in the field; only one is analysed per run.
+        #: re-armed in the field.
         self.sessions: List[dict] = []
-        #: Which of them this run read (index into ``sessions``).
+        #: Which of them this run read (index into ``sessions``). When more
+        #: than one session was merged this is the first one — kept for
+        #: backwards compatibility; prefer ``session_indices``.
         self.session_index: int = 0
+        #: All sessions that were loaded and (when more than one) merged.
+        self.session_indices: List[int] = []
+        #: Sum of loaded session durations in hours, excluding inter-session
+        #: gaps.  Use this rather than the timestamp span when computing
+        #: "percentage of the recording" figures across merged sessions.
+        self.measured_hours: float = 0.0
+        #: Gap in hours between each consecutive pair of loaded sessions.
+        #: A ``None`` entry means the boundary timestamps were unavailable.
+        self.session_gaps: List = []
         #: Channel groups in the file that no canonical column claims. Kept as
         #: data, not only as a log line: an engineer still learning what these
         #: meters record cannot answer "what is in these files that we never
         #: read?" from a console pane that scrolls away, and the customer's
         #: .pqd cannot leave site to be inspected later. See ``unmapped_channels``.
         self.unmapped_channels: List[dict] = []
-        self._session_request = session
+        # ``sessions`` overrides ``session`` when provided.
+        if sessions is not None:
+            self._session_request = sessions
+        elif session is not None:
+            self._session_request = session
+        else:
+            self._session_request = None
         self._load()
 
     # ── Public interface (same contract as PQDIFAdapter) ──────────────────────
@@ -960,6 +993,8 @@ class ProntoAdapter:
                                     'currentharmonics', 'hrms', 'bn'),
         ('current', 'HRMS', 'cn'): ('Hrms Ic', 'hrms_current_c',
                                     'currentharmonics', 'hrms', 'cn'),
+        ('voltage', 'HRMS', 'ng'): ('Hrms Vne', 'hrms_voltage_neutral',
+                                    'voltageharmonics', 'hrms', 'neutral'),
         ('current', 'HRMS', 'ng'): ('Hrms In', 'hrms_current_neutral',
                                     'currentharmonics', 'hrms', 'neutral'),
         # ── Neutral distortion ────────────────────────────────────────────
@@ -1049,6 +1084,68 @@ class ProntoAdapter:
         ('voltage', 'NONE', 'an'): re.compile(r'\bifl\s*a?$', re.I),
         ('voltage', 'NONE', 'bn'): re.compile(r'\bifl\s*b$',  re.I),
         ('voltage', 'NONE', 'cn'): re.compile(r'\bifl\s*c$',  re.I),
+    }
+
+    #: Channels that share a PQDIF triple with an already-mapped quantity and are
+    #: distinguished only by the first word of their name.  Pronto uses
+    #: ID_QC_HRMS for the total harmonic RMS *and* for odd, even and triplen
+    #: sub-totals; _SPEC_NAME_PREFIX keeps the sub-totals from being claimed as
+    #: the total, and this dict maps them explicitly to their own canonicals.
+    #:
+    #: Key: (quantity_measured, characteristic, phase, first_word_of_name_lower).
+    _SPEC_NAME_CHANNELS: Dict[Tuple[str, str, str, str],
+                               Tuple[str, str, str, str, str]] = {
+        # ── Odd-harmonic RMS sub-totals ───────────────────────────────────
+        ('voltage', 'HRMS', 'an', 'odds'): (
+            'Odds Van',  'hrms_odds_voltage_a',       'voltageharmonics', 'hrms_odds', 'an'),
+        ('voltage', 'HRMS', 'bn', 'odds'): (
+            'Odds Vbn',  'hrms_odds_voltage_b',       'voltageharmonics', 'hrms_odds', 'bn'),
+        ('voltage', 'HRMS', 'cn', 'odds'): (
+            'Odds Vcn',  'hrms_odds_voltage_c',       'voltageharmonics', 'hrms_odds', 'cn'),
+        ('voltage', 'HRMS', 'ng', 'odds'): (
+            'Odds Vne',  'hrms_odds_voltage_neutral', 'voltageharmonics', 'hrms_odds', 'neutral'),
+        ('current', 'HRMS', 'an', 'odds'): (
+            'Odds Ia',   'hrms_odds_current_a',       'currentharmonics', 'hrms_odds', 'an'),
+        ('current', 'HRMS', 'bn', 'odds'): (
+            'Odds Ib',   'hrms_odds_current_b',       'currentharmonics', 'hrms_odds', 'bn'),
+        ('current', 'HRMS', 'cn', 'odds'): (
+            'Odds Ic',   'hrms_odds_current_c',       'currentharmonics', 'hrms_odds', 'cn'),
+        ('current', 'HRMS', 'ng', 'odds'): (
+            'Odds In',   'hrms_odds_current_neutral', 'currentharmonics', 'hrms_odds', 'neutral'),
+        # ── Even-harmonic RMS sub-totals ──────────────────────────────────
+        ('voltage', 'HRMS', 'an', 'evens'): (
+            'Evens Van', 'hrms_evens_voltage_a',       'voltageharmonics', 'hrms_evens', 'an'),
+        ('voltage', 'HRMS', 'bn', 'evens'): (
+            'Evens Vbn', 'hrms_evens_voltage_b',       'voltageharmonics', 'hrms_evens', 'bn'),
+        ('voltage', 'HRMS', 'cn', 'evens'): (
+            'Evens Vcn', 'hrms_evens_voltage_c',       'voltageharmonics', 'hrms_evens', 'cn'),
+        ('voltage', 'HRMS', 'ng', 'evens'): (
+            'Evens Vne', 'hrms_evens_voltage_neutral', 'voltageharmonics', 'hrms_evens', 'neutral'),
+        ('current', 'HRMS', 'an', 'evens'): (
+            'Evens Ia',  'hrms_evens_current_a',       'currentharmonics', 'hrms_evens', 'an'),
+        ('current', 'HRMS', 'bn', 'evens'): (
+            'Evens Ib',  'hrms_evens_current_b',       'currentharmonics', 'hrms_evens', 'bn'),
+        ('current', 'HRMS', 'cn', 'evens'): (
+            'Evens Ic',  'hrms_evens_current_c',       'currentharmonics', 'hrms_evens', 'cn'),
+        ('current', 'HRMS', 'ng', 'evens'): (
+            'Evens In',  'hrms_evens_current_neutral', 'currentharmonics', 'hrms_evens', 'neutral'),
+        # ── Triplen-harmonic RMS sub-totals ───────────────────────────────
+        ('voltage', 'HRMS', 'an', 'triplens'): (
+            'Triplens Van', 'hrms_triplens_voltage_a',       'voltageharmonics', 'hrms_triplens', 'an'),
+        ('voltage', 'HRMS', 'bn', 'triplens'): (
+            'Triplens Vbn', 'hrms_triplens_voltage_b',       'voltageharmonics', 'hrms_triplens', 'bn'),
+        ('voltage', 'HRMS', 'cn', 'triplens'): (
+            'Triplens Vcn', 'hrms_triplens_voltage_c',       'voltageharmonics', 'hrms_triplens', 'cn'),
+        ('voltage', 'HRMS', 'ng', 'triplens'): (
+            'Triplens Vne', 'hrms_triplens_voltage_neutral', 'voltageharmonics', 'hrms_triplens', 'neutral'),
+        ('current', 'HRMS', 'an', 'triplens'): (
+            'Triplens Ia',  'hrms_triplens_current_a',       'currentharmonics', 'hrms_triplens', 'an'),
+        ('current', 'HRMS', 'bn', 'triplens'): (
+            'Triplens Ib',  'hrms_triplens_current_b',       'currentharmonics', 'hrms_triplens', 'bn'),
+        ('current', 'HRMS', 'cn', 'triplens'): (
+            'Triplens Ic',  'hrms_triplens_current_c',       'currentharmonics', 'hrms_triplens', 'cn'),
+        ('current', 'HRMS', 'ng', 'triplens'): (
+            'Triplens In',  'hrms_triplens_current_neutral', 'currentharmonics', 'hrms_triplens', 'neutral'),
     }
 
     #: Harmonic channel names, e.g. 'Harm 13 of Van'.  The order lives only in
@@ -1308,7 +1405,7 @@ class ProntoAdapter:
         }
 
     def _load_spec_interval(self, interval_obs: List) -> None:
-        """Build the interval channel set from one recording session.
+        """Build the interval channel set from one or more recording sessions.
 
         Pronto splits a session's interval data across two records that share
         one time base: 'Interval (avg)' holds the derived quantities (THD,
@@ -1316,35 +1413,77 @@ class ProntoAdapter:
         voltages and currents with their per-interval MAX and MIN. Both are
         needed, so channels are pooled across them.
 
-        A file may hold several sessions. Analysing one is deliberate -- the
-        gap between two sessions is not recorded time, so pooling them would
-        make every "% of the recording" figure, the rolling demand window and
-        the event detector read across a hole as though it were data. Which
-        session was read, and which were not, is carried out to both documents
-        rather than left in the log.
+        A file may hold several sessions. When a single session is requested
+        (the default), it is analysed alone and the others are listed in the
+        report. When multiple sessions are requested they are merged: channel
+        arrays are concatenated in time order, with NaN filling any channel
+        absent from one session. The gap between sessions is not recorded time
+        and must not count toward any percentage or duration figure; callers
+        that need the measured duration should use ``measured_hours`` rather
+        than the full timestamp span.
         """
         groups = self._group_sessions(interval_obs)
         self.sessions = [self._describe_session(g, i)
                          for i, g in enumerate(groups)]
 
-        # Default to the longest session -- the one most likely to be the
-        # deployment of interest, and the one the report can say most about.
-        default = max(range(len(groups)),
-                      key=lambda i: (self.sessions[i]["intervals"],
-                                     self.sessions[i]["channels"]))
-        wanted = self._session_request
-        if wanted is None:
-            self.session_index = default
-        elif 0 <= wanted < len(groups):
-            self.session_index = wanted
-        else:
-            raise ValueError(
-                f"{self.filepath.name}: session {wanted + 1} was requested but "
-                f"the file holds {len(groups)} "
-                f"session{'s' if len(groups) != 1 else ''}."
-            )
+        # Resolve which session(s) to load.
+        req = self._session_request
+        default_idx = max(range(len(groups)),
+                          key=lambda i: (self.sessions[i]["intervals"],
+                                         self.sessions[i]["channels"]))
 
-        if len(groups) > 1:
+        if req is None:
+            session_indices = [default_idx]
+        elif req == "all":
+            session_indices = list(range(len(groups)))
+        elif isinstance(req, int):
+            if not (0 <= req < len(groups)):
+                raise ValueError(
+                    f"{self.filepath.name}: session {req + 1} was requested "
+                    f"but the file holds {len(groups)} "
+                    f"session{'s' if len(groups) != 1 else ''}."
+                )
+            session_indices = [req]
+        else:
+            # List of 0-based indices.
+            for idx in req:
+                if not (0 <= idx < len(groups)):
+                    raise ValueError(
+                        f"{self.filepath.name}: session {idx + 1} was requested "
+                        f"but the file holds {len(groups)} "
+                        f"session{'s' if len(groups) != 1 else ''}."
+                    )
+            session_indices = sorted(set(req))
+
+        self.session_indices = session_indices
+        self.session_index = session_indices[0]  # backwards compat
+
+        # Gap in hours between each consecutive pair of loaded sessions.
+        self.session_gaps = []
+        for j in range(len(session_indices) - 1):
+            i1, i2 = session_indices[j], session_indices[j + 1]
+            end1   = self.sessions[i1].get("end_time")
+            start2 = self.sessions[i2].get("start_time")
+            if end1 and start2:
+                gap_h = (pd.Timestamp(start2) - pd.Timestamp(end1)).total_seconds() / 3600
+                self.session_gaps.append(round(max(gap_h, 0.0), 2))
+            else:
+                self.session_gaps.append(None)
+
+        self.measured_hours = sum(self.sessions[i]["hours"] for i in session_indices)
+
+        if len(session_indices) > 1:
+            gap_str = (", ".join(f"{g:.1f} h" if g is not None else "?"
+                                 for g in self.session_gaps)
+                       if self.session_gaps else "none")
+            log.info(
+                "ProntoAdapter (spec): %s — merging %d sessions (%s). "
+                "Measured time: %.1f h; gap(s) between them: %s.",
+                self.filepath.name, len(session_indices),
+                ", ".join(f"session {i + 1}" for i in session_indices),
+                self.measured_hours, gap_str,
+            )
+        elif len(groups) > 1:
             log.warning(
                 "ProntoAdapter (spec): %s holds %d recording sessions; "
                 "analysing session %d of %d (%s, %.1f h). The others are "
@@ -1355,14 +1494,66 @@ class ProntoAdapter:
                 self.sessions[self.session_index]["hours"],
             )
 
-        session = groups[self.session_index]
-        primary = max(session, key=lambda o: len(o.channels))
+        session_data = [self._process_one_session(groups[i])
+                        for i in session_indices]
+        merged = self._merge_session_data(session_data)
+
+        self._raw_channels = [
+            RawChannelInfo(index, label, qt, qm, phase, unit)
+            for (index, label, qt, qm, phase, unit) in merged["ch_defs"]
+        ]
+        self._obs_data   = {cd[0]: arr
+                            for cd, arr in zip(merged["ch_defs"], merged["arrays"])}
+        self._obs_ts         = merged["obs_ts"]
+        self._interval_peaks = merged["peaks"]
+        self._interval_mins  = merged["mins"]
+
+        self._record_unmapped(merged["unmapped"], "interval", "_SPEC_CHANNELS")
+        if merged["unmapped"]:
+            log.info(
+                "ProntoAdapter (spec): %d channel group(s) in this file have no "
+                "canonical column and are not analysed. Add to _SPEC_CHANNELS "
+                "to expose them: %s",
+                len(merged["unmapped"]),
+                "; ".join(
+                    f"{k[0]}/{k[1]}/phase={k[2]} ({names[0]!r}"
+                    + (f" +{len(names) - 1} more)" if len(names) > 1 else ")")
+                    for k, names in sorted(merged["unmapped"].items())
+                ),
+            )
+
+        n          = merged["n"]
+        obs_times  = merged["obs_ts"]
+        log.info(
+            "ProntoAdapter (spec): %d channels, %d intervals of %.1f min "
+            "(%s → %s), %d peak / %d min series",
+            len(self._raw_channels), n, merged["interval_minutes"],
+            pd.Timestamp(obs_times[0]).strftime('%Y-%m-%d %H:%M') if n else '–',
+            pd.Timestamp(obs_times[-1]).strftime('%Y-%m-%d %H:%M') if n else '–',
+            len(merged["peaks"]), len(merged["mins"]),
+        )
+
+    def _process_one_session(self, session_group: List) -> dict:
+        """Extract channel arrays from one recording session group.
+
+        Processes all interval channels: scalar quantities keyed by PQDIF
+        metadata, name-disambiguated sub-totals (Odds/Evens/Triplens HRMS),
+        individual harmonic orders, derived three-phase totals, computed power
+        factor, and computed THD fallback where the meter did not report it.
+
+        Returns a dict with keys ``obs_ts``, ``ch_defs``, ``arrays``,
+        ``canonical_index``, ``peaks``, ``mins``, ``unmapped``, ``n``, and
+        ``interval_minutes``.  The caller is responsible for calling
+        ``_record_unmapped`` on the returned ``unmapped`` dict so that it is
+        only logged once even when multiple sessions are merged.
+        """
+        session = session_group
+        primary   = max(session, key=lambda o: len(o.channels))
         reference = primary.channels[0].time
-        stride = self._step_pair_stride(reference)
+        stride    = self._step_pair_stride(reference)
 
         obs_times = self._spec_times(primary, reference[0::stride],
                                      primary.channels[0].time_units_id)
-        self._obs_ts = obs_times
         n = len(obs_times)
 
         pooled: List = []
@@ -1385,7 +1576,7 @@ class ProntoAdapter:
         )
 
         def measured(channel) -> Optional[np.ndarray]:
-            """The channel's average value series, deduplicated and padded.
+            """Average value series, deduplicated and padded to length n.
 
             Only AVG and VAL are accepted: a channel carrying just MAX and MIN
             has no average, and substituting an extreme for one would silently
@@ -1414,10 +1605,10 @@ class ProntoAdapter:
 
         # ── Scalar quantities, keyed on the file's own series metadata ────
         seen: Set[Tuple[str, str, str]] = set()
+        seen_named: Set[Tuple[str, str, str, str]] = set()
         harmonics: Dict[Tuple[str, int], np.ndarray] = {}
         peaks: Dict[str, np.ndarray] = {}
         mins: Dict[str, np.ndarray] = {}
-
         unmapped: Dict[Tuple[str, str, str], List[str]] = {}
 
         for channel in pooled:
@@ -1454,6 +1645,20 @@ class ProntoAdapter:
                         extreme = np.pad(extreme, (0, n - len(extreme)),
                                          constant_values=np.nan)
                     sink[canonical] = extreme[:n]
+                continue
+
+            # ── Name-disambiguated sub-totals (Odds/Evens/Triplens HRMS) ──
+            first = channel.name.split()[0].lower() if channel.name else ''
+            name_key = (channel.quantity_measured, channel.characteristic,
+                        channel.phase, first)
+            named = self._SPEC_NAME_CHANNELS.get(name_key)
+            if named is not None:
+                if name_key not in seen_named:
+                    values = measured(channel)
+                    if values is not None:
+                        seen_named.add(name_key)
+                        label, canonical, qt, qm, phase = named
+                        add(label, canonical, qt, qm, phase, channel.units, values)
                 continue
 
             # ── Individual harmonic orders ────────────────────────────────
@@ -1520,8 +1725,7 @@ class ProntoAdapter:
             # An interval every phase left blank is unmeasured, not zero.
             total[np.all(np.isnan(stack), axis=0)] = np.nan
             qt, qm, phase = tags
-            add(label, canonical, qt, qm, phase,
-                want_unit, total)
+            add(label, canonical, qt, qm, phase, want_unit, total)
             log.info(
                 "ProntoAdapter (spec): %s summed from %d per-phase element(s); "
                 "this meter reports no three-phase total.",
@@ -1552,20 +1756,6 @@ class ProntoAdapter:
 
         for key in consumed:
             unmapped.pop(key, None)
-
-        self._record_unmapped(unmapped, "interval", "_SPEC_CHANNELS")
-        if unmapped:
-            log.info(
-                "ProntoAdapter (spec): %d channel group(s) in this file have no "
-                "canonical column and are not analysed. Add to _SPEC_CHANNELS "
-                "to expose them: %s",
-                len(unmapped),
-                "; ".join(
-                    f"{k[0]}/{k[1]}/phase={k[2]} ({names[0]!r}"
-                    + (f" +{len(names) - 1} more)" if len(names) > 1 else ")")
-                    for k, names in sorted(unmapped.items())
-                ),
-            )
 
         # Emit the reported harmonic orders in a stable order.
         for group, orders in self._HARM_REPORT.items():
@@ -1623,26 +1813,97 @@ class ProntoAdapter:
             add(label, canonical, qt, 'thd', phase, '%',
                 numerator / denominator * 100.0)
 
-        self._raw_channels = [
-            RawChannelInfo(index, label, qt, qm, phase, unit)
-            for (index, label, qt, qm, phase, unit) in ch_defs
-        ]
-        self._obs_data = {cd[0]: arr for cd, arr in zip(ch_defs, arrays)}
-        self._interval_peaks = peaks
-        self._interval_mins = mins
-
         interval_minutes = (
             float(np.median(np.diff(obs_times).astype('int64'))) / 60e9
             if n >= 2 else 0.0
         )
-        log.info(
-            "ProntoAdapter (spec): %d channels, %d intervals of %.1f min "
-            "(%s → %s), %d peak / %d min series",
-            len(self._raw_channels), n, interval_minutes,
-            pd.Timestamp(obs_times[0]).strftime('%Y-%m-%d %H:%M') if n else '–',
-            pd.Timestamp(obs_times[-1]).strftime('%Y-%m-%d %H:%M') if n else '–',
-            len(peaks), len(mins),
-        )
+        return {
+            "obs_ts":           obs_times,
+            "ch_defs":          ch_defs,
+            "arrays":           arrays,
+            "canonical_index":  canonical_index,
+            "peaks":            peaks,
+            "mins":             mins,
+            "unmapped":         unmapped,
+            "n":                n,
+            "interval_minutes": interval_minutes,
+        }
+
+    def _merge_session_data(self, session_data_list: List[dict]) -> dict:
+        """Merge processed data from multiple sessions into one contiguous set.
+
+        Time arrays are concatenated in session order. Channel arrays are
+        aligned by canonical name: sessions that do not record a given channel
+        contribute NaN rows for that channel's time range, so downstream
+        statistics treat those intervals as unmeasured rather than zero.
+
+        When only one session was requested this is a no-op (returns the input
+        unchanged) so callers do not need a special case.
+        """
+        if len(session_data_list) == 1:
+            return session_data_list[0]
+
+        # Union of all canonical names, preserving first-occurrence order so
+        # the merged channel list is deterministic regardless of which sessions
+        # happen to carry which channels.
+        unified: Dict[str, Tuple] = {}
+        for sd in session_data_list:
+            for canon, idx in sd["canonical_index"].items():
+                if canon not in unified:
+                    _, label, qt, qm, phase, unit = sd["ch_defs"][idx]
+                    unified[canon] = (label, qt, qm, phase, unit)
+
+        merged_ts = np.concatenate([sd["obs_ts"] for sd in session_data_list])
+
+        new_ch_defs: List[Tuple] = []
+        merged_arrays: List[np.ndarray] = []
+        new_canonical_index: Dict[str, int] = {}
+
+        for new_idx, (canon, (label, qt, qm, phase, unit)) in \
+                enumerate(unified.items()):
+            new_ch_defs.append((new_idx, label, qt, qm, phase, unit))
+            new_canonical_index[canon] = new_idx
+            parts = []
+            for sd in session_data_list:
+                if canon in sd["canonical_index"]:
+                    parts.append(sd["arrays"][sd["canonical_index"][canon]])
+                else:
+                    parts.append(np.full(sd["n"], np.nan))
+            merged_arrays.append(np.concatenate(parts))
+
+        def _merge_extremes(
+            dicts: List[Dict[str, np.ndarray]],
+        ) -> Dict[str, np.ndarray]:
+            all_keys: set = set().union(*[d.keys() for d in dicts])
+            result: Dict[str, np.ndarray] = {}
+            for key in all_keys:
+                result[key] = np.concatenate(
+                    [d[key] if key in d else np.full(sd["n"], np.nan)
+                     for sd, d in zip(session_data_list, dicts)]
+                )
+            return result
+
+        return {
+            "obs_ts":           merged_ts,
+            "ch_defs":          new_ch_defs,
+            "arrays":           merged_arrays,
+            "canonical_index":  new_canonical_index,
+            "peaks":            _merge_extremes([sd["peaks"] for sd in session_data_list]),
+            "mins":             _merge_extremes([sd["mins"]  for sd in session_data_list]),
+            "unmapped":         self._merge_unmapped(session_data_list),
+            "n":                sum(sd["n"] for sd in session_data_list),
+            "interval_minutes": session_data_list[0]["interval_minutes"],
+        }
+
+    @staticmethod
+    def _merge_unmapped(
+        session_data_list: List[dict],
+    ) -> Dict[Tuple, List[str]]:
+        result: Dict[Tuple, List[str]] = {}
+        for sd in session_data_list:
+            for k, names in sd["unmapped"].items():
+                result.setdefault(k, []).extend(names)
+        return result
 
     def _load_spec_adaptive(self, obs) -> None:
         """Build the variable-rate DataFrame.
@@ -3165,11 +3426,17 @@ def extract_dataset(
         # What the file holds that this tool has no column for. Named, not
         # counted: a count says a gap exists, the triple says what to add.
         "unmapped_channels": list(getattr(adapter, "unmapped_channels", []) or []),
-        # A file can hold more than one recording session; this run read one of
-        # them. Both documents say so, because a report that silently covers
-        # half a download is a report nobody can check.
-        "sessions":         list(getattr(adapter, "sessions", []) or []),
-        "session_index":    getattr(adapter, "session_index", 0),
+        # A file can hold more than one recording session. Both documents say
+        # so, because a report that silently covers half a download is a report
+        # nobody can check.
+        "sessions":        list(getattr(adapter, "sessions", []) or []),
+        "session_index":   getattr(adapter, "session_index", 0),
+        # Multi-session merge attributes.  Fall back gracefully for adapters
+        # that do not expose them (PQDIFAdapter, MockAdapter).
+        "session_indices": list(getattr(adapter, "session_indices", None)
+                                or [getattr(adapter, "session_index", 0)]),
+        "session_gaps":    list(getattr(adapter, "session_gaps", []) or []),
+        "measured_hours":  float(getattr(adapter, "measured_hours", 0.0) or 0.0),
     }
 
     ds = PQDataset(df=df, adaptive_df=adaptive_df, meta=meta,

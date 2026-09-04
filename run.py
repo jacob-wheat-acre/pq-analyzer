@@ -561,21 +561,28 @@ class PQApp(tk.Tk):
 
         # ── Session row ───────────────────────────────────────────────────────
         # A "download all data" export holds every session the meter still had.
-        # Only one is analysed per run, so which one has to be the engineer's
-        # choice rather than ours; the row stays hidden for the ordinary
-        # single-session file so it is not one more thing to read past.
+        # An engineer can select one or more; selecting all merges them.  The
+        # row stays hidden for ordinary single-session files.
         self._session_frame = tk.Frame(form, bg=_BG)
-        tk.Label(self._session_frame, text="Session", width=16, anchor="w",
+        tk.Label(self._session_frame, text="Sessions", width=16, anchor="w",
                  bg=_BG, fg=_LABEL_FG, font=_FONT_UI).pack(side="left")
-        self._session_var = tk.StringVar()
-        self._session_combo = ttk.Combobox(
-            self._session_frame, textvariable=self._session_var,
-            values=[], width=48, font=_FONT_UI, state="readonly",
+        _listbox_frame = tk.Frame(self._session_frame, bg=_BG)
+        _listbox_frame.pack(side="left")
+        self._session_listbox = tk.Listbox(
+            _listbox_frame, selectmode=tk.MULTIPLE,
+            height=3, width=56, font=_FONT_MONO,
+            bg="#1e1e1e", fg="#d4d4d4",
+            selectbackground="#264f78", selectforeground="#ffffff",
+            activestyle="none", exportselection=False,
         )
-        self._session_combo.pack(side="left")
+        _sb = ttk.Scrollbar(_listbox_frame, orient="vertical",
+                             command=self._session_listbox.yview)
+        self._session_listbox.config(yscrollcommand=_sb.set)
+        self._session_listbox.pack(side="left")
+        _sb.pack(side="left", fill="y")
         self._session_note = tk.Label(
             self._session_frame, text="", bg=_BG, fg="#c08a3e", font=_FONT_UI_S)
-        self._session_note.pack(side="left", padx=(6, 0))
+        self._session_note.pack(side="left", padx=(8, 0))
         self._sessions: list = []
 
         # ── Customer name row ─────────────────────────────────────────────────
@@ -1465,36 +1472,54 @@ class PQApp(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _show_sessions(self, sessions):
-        """Show the picker only when there is a choice to make."""
+        """Show the multi-select picker only when there is a choice to make."""
         self._sessions = sessions
+        self._session_listbox.delete(0, tk.END)
         if len(sessions) < 2:
             self._session_frame.pack_forget()
-            self._session_var.set("")
             return
 
-        labels = []
         longest = max(sessions, key=lambda s: s["intervals"])
         for s in sessions:
             start = (s["start_time"] or "")[:16].replace("T", " ")
-            end = (s["end_time"] or "")[11:16]
-            labels.append(f"{s['index'] + 1}:  {start} → {end}   "
-                          f"({s['hours']:.1f} h, {s['intervals']} intervals)"
-                          + ("   — longest" if s is longest else ""))
-        self._session_combo.config(values=labels)
-        self._session_var.set(labels[longest["index"]])
+            end   = (s["end_time"]   or "")[11:16]
+            label = (f"{s['index'] + 1}:  {start} → {end}   "
+                     f"({s['hours']:.1f} h, {s['intervals']} intervals)"
+                     + ("   — longest" if s is longest else ""))
+            self._session_listbox.insert(tk.END, label)
+
+        # Select all sessions by default — the usual case is a single
+        # deployment with a technician-reset in the middle.
+        self._session_listbox.select_set(0, tk.END)
+
+        # Shrink the listbox for files with only two sessions.
+        self._session_listbox.config(height=min(len(sessions), 4))
+
         self._session_note.config(
-            text=f"{len(sessions)} sessions in this file — one is analysed")
+            text=f"{len(sessions)} sessions — select one or more to merge")
         self._session_frame.pack(fill="x", padx=12, pady=6,
                                  after=self._file_frame)
 
-    def _selected_session(self):
-        """Zero-based index of the chosen session, or None for a plain file."""
+    def _selected_sessions(self):
+        """Session spec for ProntoAdapter, or None when there is only one session.
+
+        Returns ``"all"`` when every session in the file is selected, a list
+        of 0-based indices when a subset is chosen, or ``None`` when the file
+        holds only one session and no picker was shown.
+        """
         if len(self._sessions) < 2:
             return None
-        try:
-            return int(self._session_var.get().split(":", 1)[0]) - 1
-        except (ValueError, AttributeError):
+        selected = list(self._session_listbox.curselection())
+        if not selected or len(selected) == len(self._sessions):
+            return "all"
+        return selected  # already 0-based (listbox row == session index)
+
+    def _selected_session(self):
+        """Deprecated shim — callers that still pass ``session=`` can use this."""
+        ss = self._selected_sessions()
+        if ss is None or ss == "all":
             return None
+        return ss[0] if len(ss) == 1 else None
 
     def _build_import_error_banner(self):
         """Red banner shown when pq_analyzer failed to import.
@@ -1711,7 +1736,7 @@ class PQApp(tk.Tk):
 
         params = {
             "filepath":       filepath,
-            "session":        self._selected_session(),
+            "sessions":       self._selected_sessions(),
             "nominal":        nominal,
             "cclass_key":     _SCHEDULE_KEY.get(self._cclass_var.get(), "sg"),
             "state":          (self._state_var.get() or "").strip() or None,
@@ -1886,7 +1911,7 @@ class PQApp(tk.Tk):
         # ── Adapter ───────────────────────────────────────────────────────────
         fp = Path(filepath)
         if fp.suffix.lower() == ".pqd":
-            adapter = ProntoAdapter(fp, session=params.get("session"))
+            adapter = ProntoAdapter(fp, sessions=params.get("sessions"))
         elif _PQDIF_AVAILABLE:
             adapter = PQDIFAdapter(fp)
         else:
