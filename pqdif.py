@@ -666,11 +666,22 @@ class Record:
           it as it stands;
         * the stream is damaged -- inflate whatever prefix zlib will give.
 
+        A fifth non-failure: some Pronto firmware versions write 0-byte
+        end-of-session marker records with the compression flag set.  There is
+        no stream to inflate; an empty collection (4-byte zero count) is the
+        right answer and nothing to warn about.
+
         Only when none of those yields anything does the record fail, and it
         fails carrying the evidence for why: these files are customer data
         that often cannot be sent anywhere for a second opinion, so the message
         has to be enough to diagnose the file in its absence.
         """
+        if not self.raw_body and not self.span_body:
+            log.debug(
+                "record at %d (%s) has a 0-byte body with compression flag set; "
+                "treating as empty", self.position, self.tag,
+            )
+            return b"\x00\x00\x00\x00"
         try:
             return zlib.decompress(self.raw_body)
         except zlib.error as exc:
