@@ -577,6 +577,15 @@ def plot_itic(
     nominal = thresh.nominal_voltage
     vol_events["pct"] = vol_events["value_v"] / nominal * 100.0
 
+    # Tag each event by whether it comes from meter-confirmed monitoring
+    # (adaptive sub-cycle or MAGDUR records — same source as Pronto's event
+    # table) vs. our own half-cycle RMS analysis of the raw waveform captures.
+    _CONFIRMED_SOURCES = {"adaptive", "magdur"}
+    if "data_source" not in vol_events.columns:
+        vol_events["data_source"] = "waveform"
+    has_confirmed = vol_events["data_source"].isin(_CONFIRMED_SOURCES).any()
+    has_waveform  = (~vol_events["data_source"].isin(_CONFIRMED_SOURCES)).any()
+
     fig, ax = plt.subplots(figsize=(10, 7))
 
     x_fill = np.logspace(-3, 5, 2000)
@@ -594,22 +603,39 @@ def plot_itic(
     ax.axhline(100, color="#666666", ls=":", lw=0.8, alpha=0.7, label="100% nominal")
 
     phase_colors = {"A": _PH_A, "B": _PH_B, "C": _PH_C}
-    for phase, color in phase_colors.items():
-        s = vol_events[(vol_events["type"] == "voltage_sag")    & (vol_events["phase"] == phase)]
-        if not s.empty:
-            ax.scatter(s["duration_ms"], s["pct"], marker="v", color=color, s=60,
-                       zorder=5, edgecolors="white", linewidths=0.5,
-                       label=f"Sag Ph-{phase} (n={len(s)})")
-        sw = vol_events[(vol_events["type"] == "voltage_swell") & (vol_events["phase"] == phase)]
-        if not sw.empty:
-            ax.scatter(sw["duration_ms"], sw["pct"], marker="^", color=color, s=60,
-                       zorder=5, edgecolors="white", linewidths=0.5,
-                       label=f"Swell Ph-{phase} (n={len(sw)})")
-        tr = vol_events[(vol_events["type"] == "voltage_transient") & (vol_events["phase"] == phase)]
-        if not tr.empty:
-            ax.scatter(tr["duration_ms"], tr["pct"], marker="x", color=color, s=50,
-                       zorder=5, linewidths=1.2,
-                       label=f"Transient Ph-{phase} (n={len(tr)})")
+
+    def _scatter_events(subset, marker, suffix, filled):
+        """Plot one event group; filled=True uses solid markers, False uses open."""
+        for phase, color in phase_colors.items():
+            grp = subset[subset["phase"] == phase]
+            if grp.empty:
+                continue
+            label = f"{suffix} Ph-{phase} (n={len(grp)})"
+            if filled:
+                ax.scatter(grp["duration_ms"], grp["pct"], marker=marker, color=color,
+                           s=60, zorder=5, edgecolors="white", linewidths=0.5, label=label)
+            else:
+                # Open markers — facecolor transparent, edge in phase color
+                ax.scatter(grp["duration_ms"], grp["pct"], marker=marker,
+                           facecolors="none", edgecolors=color,
+                           s=60, zorder=4, linewidths=1.0, alpha=0.75, label=label)
+
+    # Meter-confirmed events (adaptive/MAGDUR): filled markers — same data
+    # source as Pronto's event table.
+    confirmed = vol_events[vol_events["data_source"].isin(_CONFIRMED_SOURCES)]
+    _scatter_events(confirmed[confirmed["type"] == "voltage_sag"],   "v", "Sag",   True)
+    _scatter_events(confirmed[confirmed["type"] == "voltage_swell"],  "^", "Swell", True)
+    _scatter_events(confirmed[confirmed["type"] == "voltage_transient"], "x", "Transient", True)
+
+    # Waveform-analysis events: open markers — derived from half-cycle RMS of
+    # raw captures; includes events Pronto's RMS monitoring may not have logged.
+    wf_sfx = "Sag (wf)"   if has_confirmed else "Sag"
+    sw_sfx = "Swell (wf)" if has_confirmed else "Swell"
+    tr_sfx = "Transient (wf)" if has_confirmed else "Transient"
+    wf = vol_events[~vol_events["data_source"].isin(_CONFIRMED_SOURCES)]
+    _scatter_events(wf[wf["type"] == "voltage_sag"],          "v", wf_sfx, not has_confirmed)
+    _scatter_events(wf[wf["type"] == "voltage_swell"],         "^", sw_sfx, not has_confirmed)
+    _scatter_events(wf[wf["type"] == "voltage_transient"],     "x", tr_sfx, not has_confirmed)
 
     ax.set_xscale("log")
     ax.set_xlim(0.001, 1e5)
@@ -621,6 +647,21 @@ def plot_itic(
         "ITI (CBEMA) Curve Application Note, ITIC 2000  ·  Referenced in IEEE 1159-2019"
     )
     ax.legend(loc="upper left", ncol=2, framealpha=0.85)
+
+    # Explain data sources so engineers comparing to Pronto understand the
+    # difference: Pronto's ITIC uses only its RMS monitoring events; our wf
+    # analysis of the raw captures detects additional events not in Pronto's
+    # event table.
+    if has_waveform:
+        src_note = (
+            "Open markers: half-cycle RMS analysis of waveform captures (may exceed Pronto event count)."
+            if has_confirmed
+            else
+            "Events from half-cycle RMS analysis of waveform captures  ·  "
+            "Pronto's ITIC uses only its RMS monitoring events"
+        )
+        fig.text(0.5, 0.01, src_note, ha="center", va="bottom",
+                 fontsize=7, color="#555555", style="italic")
     ax.grid(True, which="both", ls=":", alpha=0.35)
 
     x_ticks = [0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000, 100000]
