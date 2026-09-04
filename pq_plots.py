@@ -27,6 +27,16 @@ from pq_constants import (
 
 log = logging.getLogger(__name__)
 
+plt.rcParams.update({
+    "font.size": 10,
+    "axes.titlesize": 13,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "figure.titlesize": 13,
+})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. VISUALIZATION
@@ -238,7 +248,7 @@ def plot_overview(
             ax.axvspan(start, end, color=_NEUTRAL_CLR, alpha=0.12, linewidth=0)
         ax.grid(True, alpha=0.3)
         if len(ax.get_legend_handles_labels()[0]) > 1:
-            ax.legend(fontsize=8, loc="upper right", ncol=4)
+            ax.legend(loc="upper right", ncol=4)
 
     axes[-1].set_xlabel("Time")
     _fmt_time_axis(axes[-1], df.index)
@@ -253,7 +263,7 @@ def plot_overview(
                 f"{len(df):,} intervals of {interval:g} min")
     if gaps:
         subtitle += f"   ·   {len(gaps)} recording gap(s), shaded"
-    fig.text(0.5, 0.005, subtitle, ha="center", fontsize=8, color="#444444")
+    fig.text(0.5, 0.005, subtitle, ha="center", color="#444444")
 
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     _save(fig, outdir, stem, "overview.png")
@@ -309,11 +319,11 @@ def plot_voltage(
     _shade_violations(ax, viol_ts, df.index)
 
     if not viol_ts.empty:
-        ax.legend(handles=ax.lines[:], loc="upper right", fontsize=8)
+        ax.legend(handles=ax.lines[:], loc="upper right")
         ax.legend(
             [Patch(facecolor="red", alpha=0.3)],
             ["Voltage violation"],
-            loc="upper left", fontsize=8,
+            loc="upper left",
         )
 
     _fmt_time_axis(ax, df.index)
@@ -321,7 +331,7 @@ def plot_voltage(
     ax.set_xlabel("Time")
     ax.set_ylabel("RMS Voltage (V)")
     ax.set_title(f"{topo_title} — ANSI C84.1 Compliance")
-    ax.legend(fontsize=8)
+    ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -397,7 +407,7 @@ def plot_thd(
             _shade_violations(ax, viol_idx, df.index)
 
         ax.set_ylabel(label)
-        ax.legend(fontsize=8)
+        ax.legend()
         ax.grid(True, alpha=0.3)
         metric_word = label.split(" ")[1]
         ax.set_title(f"{label.split(' ')[0]} {metric_word} — IEEE 519 Compliance")
@@ -439,14 +449,14 @@ def plot_summary(
         ax.plot(series.index, series.values, color=color, lw=0.8)
         if limit is not None:
             ax.axhline(limit, color="red", ls="--", lw=1.0, label=f"Limit ({limit})")
-            ax.legend(fontsize=8)
-        ax.set_ylabel(ylabel, fontsize=8)
+            ax.legend()
+        ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
     _fmt_time_axis(axes[-1], df.index)
     fig.autofmt_xdate()
     axes[-1].set_xlabel("Time")
-    fig.suptitle("Power Quality Summary", fontsize=11)
+    fig.suptitle("Power Quality Summary")
     fig.tight_layout()
 
     _save(fig, outdir, stem, "summary.png")
@@ -521,7 +531,7 @@ def plot_harmonic_spectrum(
     ax.set_xticklabels([f"H{h}" for h in orders])
     ax.set_ylabel("% of IL (max demand current)")
     ax.set_title("Current Harmonic Spectrum — Median Over Recording Period")
-    ax.legend(fontsize=9)
+    ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
 
@@ -613,7 +623,7 @@ def plot_itic(
         "ITIC Voltage Tolerance Curve\n"
         "ITI (CBEMA) Curve Application Note, ITIC 2000  ·  Referenced in IEEE 1159-2019"
     )
-    ax.legend(loc="upper left", fontsize=8, ncol=2, framealpha=0.85)
+    ax.legend(loc="upper left", ncol=2, framealpha=0.85)
     ax.grid(True, which="both", ls=":", alpha=0.35)
 
     x_ticks = [0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000, 100000]
@@ -672,7 +682,7 @@ def plot_neutral_health(
     ax.axhline(vmax, color="red", ls="--", lw=0.8, alpha=0.7, label=f"ANSI upper ({vmax:.1f} V)")
     ax.set_ylabel("Voltage (V)")
     ax.set_title("L1-N and L2-N Voltages")
-    ax.legend(fontsize=8, loc="upper right")
+    ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
     _fmt_time_axis(ax, aligned.index)
 
@@ -687,7 +697,7 @@ def plot_neutral_health(
     sum_std = neutral_result.get("sum_std_v", 0.0)
     ax.set_ylabel("L1 + L2 (V)")
     ax.set_title(f"Voltage Sum Stability  [std = {sum_std:.2f} V]")
-    ax.legend(fontsize=8, loc="upper right")
+    ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
     _fmt_time_axis(ax, aligned.index)
 
@@ -705,7 +715,7 @@ def plot_neutral_health(
         f"Leg Asymmetry  "
         f"[mean = {neutral_result.get('asym_mean_v', 0):.1f} V  ({asym_pct:.1f}% of nominal)]"
     )
-    ax.legend(fontsize=8, loc="upper right")
+    ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
     _fmt_time_axis(ax, aligned.index)
 
@@ -722,7 +732,7 @@ def plot_neutral_health(
             f"Neutral-to-Earth Voltage  "
             f"[max = {neutral_result.get('vne_max_v', 0):.2f} V]"
         )
-        ax.legend(fontsize=8, loc="upper right")
+        ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
         _fmt_time_axis(ax, vne.index)
 
@@ -731,7 +741,7 @@ def plot_neutral_health(
     sev = neutral_result.get("severity", "unknown")
     fig.suptitle(
         f"Neutral Health Assessment — Severity: {sev.upper()}",
-        fontsize=11, fontweight="bold",
+        fontsize=13, fontweight="bold",
         color=sev_colors.get(sev, "black"),
     )
     fig.autofmt_xdate()
@@ -804,10 +814,10 @@ def plot_demand_profile(
             im = ax.imshow(grid.values, aspect="auto", cmap=cmap,
                            origin="lower", interpolation="nearest")
             ax.set_yticks(range(0, 24, 3))
-            ax.set_yticklabels([f"{h:02d}:00" for h in range(0, 24, 3)], fontsize=8)
+            ax.set_yticklabels([f"{h:02d}:00" for h in range(0, 24, 3)])
             ax.set_xticks(range(len(grid.columns)))
             ax.set_xticklabels([d.strftime("%m/%d") for d in grid.columns],
-                               fontsize=8, rotation=45)
+                               rotation=45)
             ax.set_ylabel("Hour of day")
             ax.set_title(f"{title} by Hour and Day")
             fig.colorbar(im, ax=ax, label=cbar_label, shrink=0.85)
@@ -826,7 +836,7 @@ def plot_demand_profile(
         ax.set_xlabel("Hour of day")
         ax.set_ylabel(d_label)
         ax.set_title("Demand Profile by Hour of Day")
-        ax.legend(fontsize=8)
+        ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
 
@@ -874,7 +884,7 @@ def plot_harmonic_trend(
     ax.set_xlabel("Time")
     ax.set_ylabel("Current (A)")
     ax.set_title("Harmonic Current Magnitudes vs Load (worst phase per order)")
-    ax.legend(fontsize=8)
+    ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -928,14 +938,14 @@ def plot_imbalance(
         ax.plot(series.index, series, color=color, lw=0.8)
         if limit is not None:
             ax.axhline(limit, color="red", ls="--", lw=1.0, label=f"Limit ({limit:.0f}%)")
-            ax.legend(fontsize=8)
-        ax.set_ylabel(ylabel, fontsize=9)
+            ax.legend()
+        ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
     _fmt_time_axis(axes[-1], df.index)
     fig.autofmt_xdate()
     axes[-1].set_xlabel("Time")
-    fig.suptitle("Voltage / Current Imbalance and Neutral Current", fontsize=11)
+    fig.suptitle("Voltage / Current Imbalance and Neutral Current")
     fig.tight_layout()
 
     _save(fig, outdir, stem, "imbalance.png")
@@ -987,7 +997,7 @@ def plot_pf_load(
     ax.set_ylabel("Power factor")
     ax.set_ylim(min(0.5, float(aligned["pf"].min()) - 0.02), 1.02)
     ax.set_title("Power Factor vs Load")
-    ax.legend(fontsize=8)
+    ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -1056,12 +1066,12 @@ def plot_real_reactive(
                     xycoords=("axes fraction", "data"),
                     xytext=(0.004, 0.02 * (hi - lo)),
                     textcoords=("axes fraction", "data"),
-                    fontsize=8, color="#555555", va="bottom")
+                    color="#555555", va="bottom")
         ax.annotate(f"− {below}", xy=(0.004, 0.0),
                     xycoords=("axes fraction", "data"),
                     xytext=(0.004, -0.02 * (hi - lo)),
                     textcoords=("axes fraction", "data"),
-                    fontsize=8, color="#555555", va="top")
+                    color="#555555", va="top")
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
@@ -1083,7 +1093,7 @@ def plot_real_reactive(
                      f"{quad['dominant_pct']:.0f}% of assessed intervals: "
                      f"{quad['dominant_label']}",
                      transform=axes[0].transAxes, ha="center", va="bottom",
-                     fontsize=8, color="#555555")
+                     color="#555555")
     fig.tight_layout()
 
     _save(fig, outdir, stem, "real_reactive.png")
@@ -1097,32 +1107,31 @@ def plot_flicker(
 ) -> None:
     """Short- and long-term flicker severity over time, and how long each lasted.
 
-    Three panels because the two timelines alone cannot answer the question a
-    reader actually has. A Pst trace with one spike at 5.0 and a trace that
-    sits over the limit all week look similarly alarming at a glance, and they
-    are not the same finding. The third panel sorts every reading from worst
-    to best against the share of the recording at or above it, so the width of
-    the exceedance is visible: a curve that crosses the limit line near the
-    left edge is an anomaly, one that crosses far to the right is a condition.
-    The 95th-percentile mark is drawn on it because that is the point both
-    IEC 61000-3-3 and IEEE 1453 actually assess, and the severity band in the
-    report is graded there rather than at the maximum.
+    Saves three separate files so the report can interleave tables and charts:
+      flicker_pst.png        — Pst timeseries
+      flicker_plt.png        — Plt timeseries (if Plt is available)
+      flicker_exceedance.png — combined exceedance curve for all kinds/phases
+
+    The exceedance panel sorts every reading from worst to best against the
+    share of the recording at or above it, so the width of the exceedance is
+    visible: a curve that crosses the limit line near the left edge is an
+    anomaly, one that crosses far to the right is a condition.  The
+    95th-percentile mark is drawn because that is the point both IEC 61000-3-3
+    and IEEE 1453 actually assess.
     """
     if not flicker_result.get("available"):
         return
 
     panels = [(kind, label, flicker_result[f"{kind}_limit"])
-              for kind, label in (("pst", "Pst — short-term (10 min)"),
-                                  ("plt", "Plt — long-term (2 h)"))
+              for kind, label in (("pst", "Pst — short-term flicker (10 min intervals)"),
+                                  ("plt", "Plt — long-term flicker (2 h intervals)"))
               if flicker_result.get(kind)]
     if not panels:
         return
 
-    fig, axes = plt.subplots(len(panels) + 1, 1,
-                             figsize=(14, 3.6 * (len(panels) + 1)))
-    axes = np.atleast_1d(axes)
-
-    for ax, (kind, label, limit) in zip(axes, panels):
+    # ── per-kind timeseries, one file each ───────────────────────────────────
+    for kind, label, limit in panels:
+        fig, ax = plt.subplots(1, 1, figsize=(14, 4))
         for phase, stats in sorted(flicker_result[kind].items()):
             col = stats["column"]
             if col not in df.columns:
@@ -1145,12 +1154,14 @@ def plot_flicker(
                        label="IEEE 1453 LV compatibility level (0.80)")
         ax.set_ylabel(label)
         ax.set_title(label)
-        ax.legend(fontsize=8)
+        ax.legend()
         ax.grid(True, alpha=0.3)
         _fmt_time_axis(ax, df.index)
+        fig.tight_layout()
+        _save(fig, outdir, stem, f"flicker_{kind}.png")
 
-    # ── how much of the recording each level occupied ────────────────────────
-    ax = axes[-1]
+    # ── exceedance curve — share of recording at or above each severity ───────
+    fig, ax = plt.subplots(1, 1, figsize=(14, 4))
     for kind, label, limit in panels:
         for phase, stats in sorted(flicker_result[kind].items()):
             col = stats["column"]
@@ -1164,26 +1175,23 @@ def plot_flicker(
                     ls="-" if kind == "pst" else "--",
                     color=_PHASE_CLR.get(phase.lower(), "gray"),
                     label=f"{kind.title()} {phase}")
-        # Two limit lines share this panel, so each is named at the right edge
-        # rather than leaving the reader to infer which is which.
         ax.axhline(limit, color="red", ls="--", lw=0.8, alpha=0.7)
         ax.annotate(f"{kind.title()} limit {limit:.2f}", xy=(100, limit),
                     xytext=(-4, 3), textcoords="offset points",
-                    ha="right", va="bottom", fontsize=8, color="#CC0000")
+                    ha="right", va="bottom", color="#CC0000")
 
     ax.axvline(5.0, color="#333333", ls=":", lw=1.0)
     ax.annotate("95th percentile\n(what the standards assess)", xy=(5.0, ax.get_ylim()[1]),
-                xytext=(8.0, ax.get_ylim()[1] * 0.92), fontsize=8, color="#333333")
+                xytext=(8.0, ax.get_ylim()[1] * 0.92), color="#333333")
     ax.set_xlabel("Share of the recording at or above this severity (%)")
     ax.set_ylabel("Flicker severity")
     ax.set_title("How long each level lasted — narrow at the left is an anomaly, "
                  "wide to the right is a condition")
     ax.set_xlim(0, 100)
-    ax.legend(fontsize=8, ncol=2)
+    ax.legend(ncol=2)
     ax.grid(True, alpha=0.3)
-
     fig.tight_layout()
-    _save(fig, outdir, stem, "flicker.png")
+    _save(fig, outdir, stem, "flicker_exceedance.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1208,14 +1216,19 @@ def plot_waveform_capture(
         if fs <= 0:
             return 0.0
         w = max(int(round(fs / 60.0 / 2)), 8)
+        peak_nominal = nominal * 2.0 ** 0.5
         worst = 0.0
         for x in wf["voltages"].values():
             x = np.asarray(x, dtype=float)
             if len(x) < 2 * w:
                 continue
+            # ½-cycle RMS deviation — captures sags and swells
             c = np.cumsum(np.concatenate(([0.0], x * x)))
             rms = np.sqrt((c[w:] - c[:-w]) / w)
             worst = max(worst, float(np.max(np.abs(rms - nominal))))
+            # Instantaneous peak deviation — catches impulse transients that
+            # barely move the RMS but exceed the crest well above nominal×√2
+            worst = max(worst, float(np.max(np.abs(x)) - peak_nominal))
         return worst
 
     wf   = max(wfs, key=severity)
@@ -1241,7 +1254,7 @@ def plot_waveform_capture(
         f"Worst Waveform Capture — {wf['timestamp']:%Y-%m-%d %H:%M:%S.%f}"[:60]
         + f"  ({len(wfs)} captures in recording)"
     )
-    ax.legend(fontsize=8, ncol=4)
+    ax.legend(ncol=4)
     ax.grid(True, alpha=0.3)
 
     if has_i:
@@ -1252,7 +1265,7 @@ def plot_waveform_capture(
             clr = _NEUTRAL_CLR if ph == "n" else _PHASE_CLR.get(ph, "gray")
             ax.plot(t_ms[:n], x[:n], color=clr, lw=0.9, label=lbl)
         ax.set_ylabel("Current (A)")
-        ax.legend(fontsize=8, ncol=4)
+        ax.legend(ncol=4)
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel("Time from capture start (ms)")
